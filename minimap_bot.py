@@ -30,6 +30,9 @@ ATTACK_PERIOD_S = 0.40   # mash cycle, ignored while ATTACK_MASH is False
 ATTACK_HOLD_S = 0.15     # how long L1 stays down each mash cycle
 BUFF_PERIOD_S = 60.0     # recast the buff sequence this often
 BUFF_SEQUENCE = ("up", "left", "down", "right")
+SPAM_BUTTON = "y"        # tapped on a timer all the while the bot runs; None = off
+SPAM_PERIOD_S = 0.5
+SPAM_HOLD_S = 0.05
 WAKE_AMP = 0.5           # stick nudge that flips the game into controller mode
 WAKE_STEP_S = 0.15
 WAKE_SETTLE_S = 0.5      # grace after the nudge before the first button press
@@ -153,13 +156,25 @@ class VirtualPad:
                      "down": vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_DOWN,
                      "left": vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_LEFT,
                      "right": vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_RIGHT}
+        self.face = {"a": vg.XUSB_BUTTON.XUSB_GAMEPAD_A,
+                     "b": vg.XUSB_BUTTON.XUSB_GAMEPAD_B,
+                     "x": vg.XUSB_BUTTON.XUSB_GAMEPAD_X,
+                     "y": vg.XUSB_BUTTON.XUSB_GAMEPAD_Y}
 
-    def tap_dpad(self, name, hold):
-        self.pad.press_button(self.dpad[name])
+    def _tap(self, btn, hold):
+        # The stick keeps its last value across this: left_joystick_float persists
+        # between updates, so a tap never interrupts the chase.
+        self.pad.press_button(btn)
         self.pad.update()
         time.sleep(hold)
-        self.pad.release_button(self.dpad[name])
+        self.pad.release_button(btn)
         self.pad.update()
+
+    def tap_dpad(self, name, hold):
+        self._tap(self.dpad[name], hold)
+
+    def tap_button(self, name, hold=SPAM_HOLD_S):
+        self._tap(self.face[name], hold)
 
     def stick(self, sx, sy, attack=False):
         self.pad.left_joystick_float(sx, sy)
@@ -217,14 +232,16 @@ class ArduinoPad:
 
     ATTACK_BTN = 4  # LB in the usual XInput button order
     HAT = {"up": 0, "right": 2, "down": 4, "left": 6}  # sketch: 0..7 clockwise from N
+    FACE = {"a": 0, "b": 1, "x": 2, "y": 3}  # usual XInput button order
 
     def tap_dpad(self, name, hold):
         self._cmd(f"V{self.HAT[name]}")
         time.sleep(hold)
         self._cmd("V-1")  # -1 centres the hat
 
-    def tap_button(self, n):
-        self._cmd(f"B{n}")  # sketch taps it: press, 50ms, release
+    def tap_button(self, n, hold=None):
+        # hold is ignored: the sketch's own B command is press, 50ms, release.
+        self._cmd(f"B{self.FACE.get(n, n)}")
 
     def _cmd(self, line):
         self.ser.write(f"{line}\n".encode())
@@ -262,6 +279,7 @@ def main(port=None):
     next_buff = 0.0   # 0 = cast once at startup, then every BUFF_PERIOD_S
     buff_queue = []   # d-pad presses left in the current cast
     next_press = 0.0  # earliest time for the next one
+    next_spam = 0.0   # SPAM_BUTTON goes out on its own timer
 
     # Once, up front: the game ignores buttons until it has seen stick motion.
     # After this the chase keeps it awake, so the buff never has to stop to nudge.
@@ -334,6 +352,12 @@ def main(port=None):
                     key = buff_queue.pop(0)
                     pad.tap_dpad(key, BUFF_HOLD_S)
                     next_press = now + BUFF_GAP_S
+                elif SPAM_BUTTON and now >= next_spam:
+                    # Never in the same pass as a buff press: two taps back to back
+                    # land inside one another's animation and the game drops one.
+                    pad.tap_button(SPAM_BUTTON, SPAM_HOLD_S)
+                    key = SPAM_BUTTON
+                    next_spam = now + SPAM_PERIOD_S
 
                 print(f"{state:12} stick {sx:+.2f},{sy:+.2f} atk {'#' if atk else '.'}"
                       f" {key:5}  ", end="\r")
@@ -393,6 +417,11 @@ def demo():
         pad.tap_dpad(key, 0)
     assert sent == [b"V0\n", b"V-1\n", b"V6\n", b"V-1\n",
                     b"V4\n", b"V-1\n", b"V2\n", b"V-1\n"], sent
+
+    sent.clear()
+    pad.tap_button(SPAM_BUTTON)   # by name
+    pad.tap_button(3)             # same button by index
+    assert sent == [b"B3\n", b"B3\n"], sent
 
     print("demo ok")
 
@@ -475,7 +504,7 @@ def buff_test(port=None, hold=BUFF_HOLD_S, gap=BUFF_GAP_S):
     print("done -- if nothing cast, raise hold/gap")
 
 
-TAP_HELP = ("button 0-15, d-pad u/d/l/r, stick lx/ly/rx/ry "
+TAP_HELP = ("button 0-15 or a/b/x/y, d-pad u/d/l/r, stick lx/ly/rx/ry "
             "(prefix - for the other direction, e.g. -lx = left)")
 _DIRS = {"u": "up", "d": "down", "l": "left", "r": "right"}
 
@@ -496,6 +525,8 @@ def tap_one(pad, token):
         pad._cmd(f"{axis}{x},{y}")
         time.sleep(0.4)
         pad._cmd(f"{axis}0,0")
+    elif token in ArduinoPad.FACE:
+        pad.tap_button(token)
     elif token.isdigit():
         pad.tap_button(int(token))
     else:
