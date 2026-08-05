@@ -53,8 +53,16 @@ every frame and used as the real origin, the box only has to contain it.
 - **The game stays in keyboard mode until it sees stick motion**, and it drops the
   first button press while swapping modes. Every button sequence is preceded by a
   stick nudge plus a settle delay (`WAKE_*` constants).
-- **The game reads XInput, not generic HID.** The Arduino Leonardo path talks fine
-  over serial but the game ignores it. Use vgamepad for movement.
+- **The game reads XInput, not generic HID.** Confirmed the long way: flash
+  `arduino_joystick_leonardo_v1.ino`, and Windows enumerates a HID-compliant game
+  controller (VID 2341 PID 8036 MI_02) whose axes read back correctly through
+  `winmm.joyGetPosEx` — full deflection on all four directions. The character
+  still does not move. The Leonardo cannot drive this game without XInput
+  firmware (a different USB core and bootloader entirely). **Use vgamepad.**
+  Note the board ships answering `P` with `PONG` on *either* sketch, so a
+  handshake alone does not prove the joystick firmware is flashed. `L`/`V` are
+  the commands that tell them apart — the mouse/keyboard sketch rejects both
+  with `ERROR:UNKNOWN_CMD`.
 - Stick tilt is direction-only at full magnitude. Scaling tilt by minimap pixel
   distance made every approach a crawl the game's own deadzone swallowed.
 - Red blobs under the player arrow are never targeted — that is either "arrived"
