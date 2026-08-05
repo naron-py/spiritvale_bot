@@ -1,0 +1,88 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+A screen-reading combat bot for the game **SpiritVale** (Windows). It captures the
+game's minimap, finds red monster dots, and drives a gamepad left stick toward the
+nearest one while holding the attack button and recasting a d-pad buff on a timer.
+No game memory reading, no injection — pure screen capture + synthetic input.
+
+## Commands
+
+```
+python -m venv .venv && .venv\Scripts\activate
+pip install -r requirements.txt
+
+python minimap_bot.py              # run, vgamepad (virtual X360) backend
+python minimap_bot.py --port auto  # run, Arduino Leonardo serial backend
+python minimap_bot.py --demo       # the test suite (see below)
+python minimap_bot.py --snap       # dump minimap_snap.png with detections drawn
+python minimap_bot.py --test       # walk a blind circle: isolates pad vs vision
+python minimap_bot.py --buff [hold] [gap]   # fire buff sequence once
+python minimap_bot.py --probe      # press every X360 button in turn, named
+```
+
+There is no test framework. `demo()` in `minimap_bot.py` **is** the test suite: an
+assert-based self-check on synthetic images plus a mocked serial port, runnable
+with no game, no gamepad, no board. Extend it when adding vision or protocol logic;
+`python minimap_bot.py --demo` must stay green. Arg parsing is hand-rolled `sys.argv`
+scanning at the bottom of the file — no argparse in `minimap_bot.py`.
+
+## Architecture
+
+`minimap_bot.py` is the whole bot, single file, three layers:
+
+1. **Vision** — `find_red_dots` / `find_player` run HSV threshold + contour
+   centroids over an `mss` grab of `minimap_region(win)`. The capture box is
+   `MINIMAP = dict(cx, cy, r)` as *fractions* of the client area, so it survives
+   resolution changes. The white player arrow is re-detected every frame and used
+   as the origin — the box only has to contain it, not be centred on it.
+2. **Control** — `stick_vector` converts a screen delta to a stick vector. It is
+   **direction-only at full magnitude**; a minimap pixel is many world metres, so
+   proportional tilt lands inside the game's own deadzone. `main()` holds the last
+   heading for `LOST_HOLD_S` when a dot flickers out ("coasting"), and treats a
+   dot vanishing under the arrow as arrival ("concealed").
+3. **Pad backends** — `VirtualPad` (vgamepad/ViGEmBus, XInput) and `ArduinoPad`
+   (serial to a Leonardo). Duck-typed, same three methods: `stick(sx, sy, attack)`,
+   `tap_dpad(name, hold)`, `close()`. Pick a backend by adding a class with those
+   three methods; nothing else in the file knows the difference.
+
+Tuning constants all sit in one block at the top of `minimap_bot.py`. Prefer
+adjusting them over adding code paths.
+
+## Hard-won constraints — do not "simplify" these away
+
+- **The game only reads XInput, not generic HID.** The Arduino path works over
+  serial and the board enumerates fine, but the game ignores it. vgamepad is the
+  working path; the Arduino backend is kept as a fallback, not the default.
+- **The game sits in keyboard mode until it sees stick motion**, and it *drops the
+  first button press* during the mode swap. Every button sequence must be preceded
+  by `wake_controller(pad)` (stick nudge + `WAKE_SETTLE_S`). Removing it silently
+  eats the leading d-pad press.
+- **Red blobs within `CONCEAL_PX` of the player arrow are never targets** — that is
+  either "arrived" or a fixed red UI element, and chasing it freezes the bot.
+- `ArduinoPad.stick` deduplicates against `self.last` because the sketch is
+  synchronous (every command blocks on an `OK` reply). Keep it.
+
+## Serial protocol (`arduino_joystick_leonardo_v1.ino`)
+
+Line-oriented, one command per line, every command answers `OK` or `ERROR:...`.
+`L<x>,<y>` left stick (int16), `R` right stick, `T` triggers, `V<0-7|-1>` hat
+(clockwise from N, -1 centres), `B`/`D`/`U`/`H` button tap/down/up/hold, `G` full
+state, `Z` release all, `P` → `PONG`. The board prints `READY` on boot; opening the
+port resets it, so a fresh connection waits for `READY` and falls back to a `P`
+ping if the banner was already missed.
+
+## Other files
+
+`minimap_navigator.py` is an earlier, superseded navigation experiment (argparse,
+pywin32, proportional stick) kept for reference — new work goes in `minimap_bot.py`.
+
+## Style
+
+The codebase follows ponytail conventions: shortest thing that works, stdlib and
+already-installed deps before new ones, and `# ponytail:` comments marking
+deliberate simplifications and their upgrade path. Comments explain *why* a
+non-obvious constant or branch exists (usually a game quirk), not what the code does.

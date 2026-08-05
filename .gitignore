@@ -5,3 +5,4 @@ __pycache__/
 # capture artifacts
 minimap_snap.png
 calib_*.png
+image.png

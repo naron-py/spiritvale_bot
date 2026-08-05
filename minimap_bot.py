@@ -23,7 +23,7 @@ WINDOW_TITLE = "SpiritVale"
 MINIMAP = dict(cx=0.927, cy=0.152, r=0.055)
 SPEED = 1.0              # stick magnitude while chasing, 0..1
 DEADZONE_PX = 4          # blob this close to center = arrived
-CONCEAL_PX = 12          # white player arrow hides a dot inside this radius
+CONCEAL_PX = 20          # white player arrow hides a dot inside this radius
 LOST_HOLD_S = 1.0        # keep last heading this long after a dot vanishes
 ATTACK_MASH = False      # False = hold L1 down; True = tap it on the cycle below
 ATTACK_PERIOD_S = 0.40   # mash cycle, ignored while ATTACK_MASH is False
@@ -36,6 +36,12 @@ WAKE_SETTLE_S = 0.5      # grace after the nudge before the first button press
 BUFF_HOLD_S = 0.25       # each d-pad press
 BUFF_GAP_S = 0.80        # pause between presses -- must outlast the cast animation
 MIN_BLOB_AREA = 6        # px, filters compression speckle
+# Red mushroom caps painted on the terrain are what the bot kept walking to.
+# Size cannot separate them -- an occluded cap is a sliver the size of a dot, and
+# merged dots are the size of a cap. Colour can: monster dots are drawn pure red
+# (H 0, S 255), every mushroom pixel is desaturated pink (S 94-154). Anything
+# under this floor is terrain art. Sample a stray blob's HSV before touching it.
+RED_S_MIN = 200
 PLAYER_AREA = (25, 600)  # px area range for the white player arrow
 LOOP_HZ = 20
 
@@ -79,22 +85,24 @@ def minimap_region(win):
 
 
 def find_red_dots(bgr):
-    """Return [(x, y, area)] of red blobs, image coords."""
+    """Return [(x, y, width)] of monster dots, image coords. width = short side."""
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     # red wraps hue 0, so two bands
-    mask = cv2.inRange(hsv, (0, 120, 90), (10, 255, 255)) | \
-           cv2.inRange(hsv, (170, 120, 90), (180, 255, 255))
+    mask = cv2.inRange(hsv, (0, RED_S_MIN, 90), (10, 255, 255)) | \
+           cv2.inRange(hsv, (170, RED_S_MIN, 90), (180, 255, 255))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     out = []
     for c in cnts:
-        a = cv2.contourArea(c)
-        if a < MIN_BLOB_AREA:
+        if cv2.contourArea(c) < MIN_BLOB_AREA:
             continue
+        # reported for --snap only: dots merge when they cluster, so width is a
+        # diagnostic, not a filter -- rejecting fat blobs loses packed monsters.
+        width = min(cv2.minAreaRect(c)[1])
         m = cv2.moments(c)
         if m["m00"] == 0:
             continue
-        out.append((m["m10"] / m["m00"], m["m01"] / m["m00"], a))
+        out.append((m["m10"] / m["m00"], m["m01"] / m["m00"], width))
     return out
 
 
@@ -247,7 +255,13 @@ def main(port=None):
 
     last = None  # (t, dist, sx, sy) of last seen dot
     paused = False
-    next_buff = 0.0  # 0 = cast once at startup, then every BUFF_PERIOD_S
+    next_buff = 0.0   # 0 = cast once at startup, then every BUFF_PERIOD_S
+    buff_queue = []   # d-pad presses left in the current cast
+    next_press = 0.0  # earliest time for the next one
+
+    # Once, up front: the game ignores buttons until it has seen stick motion.
+    # After this the chase keeps it awake, so the buff never has to stop to nudge.
+    wake_controller(pad)
 
     with mss.mss() as sct:
         try:
@@ -262,16 +276,10 @@ def main(port=None):
                     time.sleep(0.05)
                     continue
 
-                if time.time() >= next_buff:
-                    # Stand still first, or the buff presses land mid-stride.
-                    pad.stick(0.0, 0.0, False)
-                    wake_controller(pad)
-                    print(f"\nbuffing: {' '.join(BUFF_SEQUENCE)}")
-                    for key in BUFF_SEQUENCE:
-                        pad.tap_dpad(key, BUFF_HOLD_S)
-                        time.sleep(BUFF_GAP_S)
+                if not buff_queue and time.time() >= next_buff:
+                    buff_queue = list(BUFF_SEQUENCE)
                     next_buff = time.time() + BUFF_PERIOD_S
-                    last = None  # stale heading after standing still
+                    print(f"\nbuffing: {' '.join(BUFF_SEQUENCE)}")
 
                 reg = minimap_region(win)
                 img = np.array(sct.grab(reg))[:, :, :3]
@@ -313,8 +321,18 @@ def main(port=None):
                 # L1 held down continuously. Set ATTACK_MASH to mash it instead.
                 atk = (now % ATTACK_PERIOD_S) < ATTACK_HOLD_S if ATTACK_MASH else True
                 pad.stick(sx, sy, atk)
-                print(f"{state:12} stick {sx:+.2f},{sy:+.2f} atk {'#' if atk else '.'}  ",
-                      end="\r")
+
+                # One d-pad press per pass, spaced by BUFF_GAP_S. The stick and L1
+                # keep their last value across a tap, so the buff casts mid-chase
+                # instead of parking the bot for a whole sequence.
+                key = ""
+                if buff_queue and now >= next_press:
+                    key = buff_queue.pop(0)
+                    pad.tap_dpad(key, BUFF_HOLD_S)
+                    next_press = now + BUFF_GAP_S
+
+                print(f"{state:12} stick {sx:+.2f},{sy:+.2f} atk {'#' if atk else '.'}"
+                      f" {key:5}  ", end="\r")
                 time.sleep(1 / LOOP_HZ)
         except KeyboardInterrupt:
             print("\nstopped")
@@ -328,12 +346,18 @@ def demo():
     cv2.circle(img, (150, 60), 4, (0, 0, 255), -1)   # far, up-right
     cv2.circle(img, (120, 100), 4, (0, 0, 255), -1)  # near, right
     cv2.circle(img, (40, 40), 4, (255, 0, 0), -1)    # blue, must be ignored
+    # Mushroom art, measured off a real minimap: desaturated pink, and an occluded
+    # cap is a dot-sized sliver -- only the colour tells these from a monster.
+    cv2.circle(img, (60, 150), 20, (82, 93, 176), -1)   # whole cap
+    cv2.circle(img, (30, 60), 4, (82, 93, 176), -1)     # sliver of one
+    cv2.circle(img, (150, 170), 4, (0, 0, 255), -1)  # two monsters touching -> one
+    cv2.circle(img, (157, 170), 4, (0, 0, 255), -1)  # fat contour, must still count
 
     cv2.circle(img, (105, 95), 6, (255, 255, 255), -1)  # player arrow, near centre
     cv2.circle(img, (10, 190), 9, (255, 255, 255), -1)  # other white UI, farther off
 
     dots = find_red_dots(img)
-    assert len(dots) == 2, dots
+    assert len(dots) == 3, dots       # 2 singles + the merged pair, no mushrooms
     px, py = find_player(img)
     assert abs(px - 105) < 3 and abs(py - 95) < 3, (px, py)
     x, y, _ = nearest(dots, 100, 100)
@@ -379,10 +403,12 @@ def snap(path="minimap_snap.png"):
     player = find_player(img)
     print(f"  player arrow: {player or 'NOT FOUND -- falling back to box centre'}")
     cx, cy = (int(player[0]), int(player[1])) if player else (w // 2, h // 2)
-    for x, y, a in find_red_dots(img):
-        cv2.circle(img, (int(x), int(y)), 8, (0, 255, 0), 1)
-        print(f"  red blob at ({x:6.1f},{y:6.1f}) area {a:5.1f} "
-              f"dist {((x - cx) ** 2 + (y - cy) ** 2) ** 0.5:6.1f}")
+    for x, y, wpx in find_red_dots(img):
+        d = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
+        hid = d <= CONCEAL_PX
+        cv2.circle(img, (int(x), int(y)), 8, (0, 0, 255) if hid else (0, 255, 0), 1)
+        print(f"  dot at ({x:6.1f},{y:6.1f}) width {wpx:5.1f} dist {d:6.1f}"
+              f"{'  REJECTED: under player arrow' if hid else ''}")
     cv2.drawMarker(img, (w // 2, h // 2), (255, 0, 255), cv2.MARKER_CROSS, 10, 1)
     cv2.drawMarker(img, (cx, cy), (255, 255, 0), cv2.MARKER_CROSS, 14, 1)
     cv2.circle(img, (cx, cy), CONCEAL_PX, (255, 255, 0), 1)

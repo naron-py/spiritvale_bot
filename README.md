@@ -33,10 +33,10 @@ python minimap_bot.py --snap
 ```
 
 Writes `minimap_snap.png`. Magenta cross = box centre, cyan cross = the detected
-white player arrow, green circles = monsters. Nudge `MINIMAP = dict(cx, cy, r)` —
-fractions of the client area — until the box is centred on the arrow. Exact
-centring is not critical: the arrow is re-detected every frame and used as the
-real origin, the box only has to contain it.
+white player arrow, green circles = monsters, red circles = rejected. Nudge
+`MINIMAP = dict(cx, cy, r)` — fractions of the client area — until the box is
+centred on the arrow. Exact centring is not critical: the arrow is re-detected
+every frame and used as the real origin, the box only has to contain it.
 
 ## Diagnostics
 
@@ -59,10 +59,16 @@ real origin, the box only has to contain it.
   distance made every approach a crawl the game's own deadzone swallowed.
 - Red blobs under the player arrow are never targeted — that is either "arrived"
   or a fixed red UI element, and treating it as a target froze the bot.
+- **Monsters are told from red mushroom terrain art by saturation, not by size.**
+  Dots render pure red (S 255), mushrooms are desaturated pink (S 94–154), hence
+  `RED_S_MIN`. Size cannot work: an occluded cap is a dot-sized sliver, and dots
+  that cluster merge into one cap-sized blob. `--snap` prints each blob's width
+  as a diagnostic only — do not filter on it or packed monsters vanish.
+- Buffs fire one d-pad press per loop pass while the chase continues. Standing
+  still for the whole sequence lost several seconds of uptime every minute.
 
 ## Files
 
 - `minimap_bot.py` — the bot.
 - `minimap_navigator.py` — earlier navigation experiment.
 - `arduino_joystick_leonardo_v1.ino` — HID gamepad sketch for a Leonardo/Pro Micro.
-- `arduino_control_leonardo_v3.ino` — companion mouse/keyboard sketch.
