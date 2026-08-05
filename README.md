@@ -63,6 +63,13 @@ every frame and used as the real origin, the box only has to contain it.
   handshake alone does not prove the joystick firmware is flashed. `L`/`V` are
   the commands that tell them apart — the mouse/keyboard sketch rejects both
   with `ERROR:UNKNOWN_CMD`.
+- **Steam's generic-gamepad mapping does not rescue the Arduino either.** Steam
+  detects the board as "LLC Arduino Leonardo" once Generic Gamepad Configuration
+  Support is on, and its setup wizard can be answered with `pad_press.py`. The
+  character still does not move. Measured, same focus and session, only the pad
+  differing: minimap frame-delta 10.1 for vgamepad, 2.1 for the Arduino against
+  a 2.35 idle floor. Enabling Steam Input to force a translation layer is the
+  one untried route, and it breaks the vgamepad path it would replace.
 - Stick tilt is direction-only at full magnitude. Scaling tilt by minimap pixel
   distance made every approach a crawl the game's own deadzone swallowed.
 - Red blobs under the player arrow are never targeted — that is either "arrived"

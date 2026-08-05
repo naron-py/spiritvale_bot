@@ -475,19 +475,24 @@ def buff_test(port=None, hold=BUFF_HOLD_S, gap=BUFF_GAP_S):
     print("done -- if nothing cast, raise hold/gap")
 
 
-TAP_HELP = "button 0-15, d-pad u/d/l/r, or stick lx/ly/rx/ry"
+TAP_HELP = ("button 0-15, d-pad u/d/l/r, stick lx/ly/rx/ry "
+            "(prefix - for the other direction, e.g. -lx = left)")
 _DIRS = {"u": "up", "d": "down", "l": "left", "r": "right"}
 
 
 def tap_one(pad, token):
     """Fire one control named the way TAP_HELP describes it. True if understood."""
     token = token.strip().lower()
+    sign = -1 if token.startswith("-") else 1
+    token = token.lstrip("-+")
     if token in _DIRS:
         pad.tap_dpad(_DIRS[token], 0.2)
     elif token in ("lx", "ly", "rx", "ry"):
-        # full deflection and back, for the wizard's stick steps
+        # Full deflection and back. The wizard asks for one direction at a time,
+        # so each axis needs both signs: -lx is left, lx is right.
         axis = "L" if token[0] == "l" else "R"
-        x, y = (32767, 0) if token[1] == "x" else (0, 32767)
+        v = 32767 * sign
+        x, y = (v, 0) if token[1] == "x" else (0, v)
         pad._cmd(f"{axis}{x},{y}")
         time.sleep(0.4)
         pad._cmd(f"{axis}0,0")
@@ -535,6 +540,8 @@ def stick_test(port=None, seconds=12):
             pad.stick(float(sx), float(sy), False)
             print(f"stick {sx:+.2f},{sy:+.2f}   ", end="\r")
             time.sleep(1 / LOOP_HZ)
+    except KeyboardInterrupt:
+        pass  # cutting the test short is normal, not a crash
     finally:
         pad.close()
         print("\ndone")
