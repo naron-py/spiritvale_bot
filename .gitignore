@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+
+# capture artifacts
+minimap_snap.png
+calib_*.png
