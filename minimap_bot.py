@@ -223,6 +223,9 @@ class ArduinoPad:
         time.sleep(hold)
         self._cmd("V-1")  # -1 centres the hat
 
+    def tap_button(self, n):
+        self._cmd(f"B{n}")  # sketch taps it: press, 50ms, release
+
     def _cmd(self, line):
         self.ser.write(f"{line}\n".encode())
         reply = self.ser.readline().strip()
@@ -472,6 +475,54 @@ def buff_test(port=None, hold=BUFF_HOLD_S, gap=BUFF_GAP_S):
     print("done -- if nothing cast, raise hold/gap")
 
 
+TAP_HELP = "button 0-15, d-pad u/d/l/r, or stick lx/ly/rx/ry"
+_DIRS = {"u": "up", "d": "down", "l": "left", "r": "right"}
+
+
+def tap_one(pad, token):
+    """Fire one control named the way TAP_HELP describes it. True if understood."""
+    token = token.strip().lower()
+    if token in _DIRS:
+        pad.tap_dpad(_DIRS[token], 0.2)
+    elif token in ("lx", "ly", "rx", "ry"):
+        # full deflection and back, for the wizard's stick steps
+        axis = "L" if token[0] == "l" else "R"
+        x, y = (32767, 0) if token[1] == "x" else (0, 32767)
+        pad._cmd(f"{axis}{x},{y}")
+        time.sleep(0.4)
+        pad._cmd(f"{axis}0,0")
+    elif token.isdigit():
+        pad.tap_button(int(token))
+    else:
+        return False
+    return True
+
+
+def press_repl(port="auto"):
+    """Tap one control at a time, on demand.
+
+    Steam has no mapping for an unknown HID pad, so it runs a setup wizard that
+    asks you to press each control in turn -- and nothing reaches the game until
+    that is done. Nobody can press a button on a board with no buttons, hence
+    this: type what the wizard is waiting for. One connection stays open for the
+    whole run, so the board never resets mid-wizard.
+    """
+    pad = ArduinoPad(port)
+    print(f"{TAP_HELP}\nblank line quits")
+    try:
+        while True:
+            s = input("> ").strip()
+            if not s:
+                break
+            if not tap_one(pad, s):
+                print(f"  ? expected {TAP_HELP}")
+    except (EOFError, KeyboardInterrupt):
+        pass
+    finally:
+        pad.close()
+        print("\nclosed")
+
+
 def stick_test(port=None, seconds=12):
     """Blind pad check: walk a circle. Character moves -> pad fine, vision is the bug."""
     pad = ArduinoPad(port) if port else VirtualPad()
@@ -496,6 +547,9 @@ if __name__ == "__main__":
         snap()
     elif "--probe" in sys.argv:
         probe()
+    elif "--press" in sys.argv:
+        i = sys.argv.index("--port") if "--port" in sys.argv else -1
+        press_repl(sys.argv[i + 1] if i >= 0 else "auto")
     elif "--buff" in sys.argv:
         i = sys.argv.index("--port") if "--port" in sys.argv else -1
         j = sys.argv.index("--buff")
