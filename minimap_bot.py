@@ -194,24 +194,25 @@ class ArduinoPad:
         if port in (None, "auto"):
             port = self.autodetect()
             print(f"auto-detected {port}")
-        # Opening the port resets the Leonardo; it prints READY when up.
         try:
-            self.ser = serial.Serial(port, baud, timeout=2)
+            self.ser = serial.Serial(port, baud, timeout=0.5)
         except serial.SerialException as e:
             from serial.tools import list_ports
             have = ", ".join(p.device for p in list_ports.comports()) or "(none)"
             raise RuntimeError(f"{port} not usable ({e}). ports present: {have}") from None
+        # Opening at 115200 does not reset a Leonardo, so waiting for its READY
+        # banner just burns the whole timeout on an already-booted board. Ping
+        # instead, and keep pinging: a board that IS mid-reset drops the first one.
         deadline = time.time() + 6
         while time.time() < deadline:
-            if self.ser.readline().strip() == b"READY":
+            self.ser.write(b"P\n")
+            if self.ser.readline().strip() in (b"PONG", b"READY"):
                 break
         else:
-            # Already booted, so the READY banner is long gone -- ping instead.
-            self.ser.reset_input_buffer()
-            self.ser.write(b"P\n")
-            if self.ser.readline().strip() != b"PONG":
-                raise RuntimeError(f"{port} opened but no READY/PONG -- "
-                                   f"wrong port, or sketch not flashed")
+            raise RuntimeError(f"{port} opened but no PONG -- "
+                               f"wrong port, or sketch not flashed")
+        self.ser.reset_input_buffer()  # drop READY/PONG backlog before commands
+        self.ser.timeout = 2
         self.last = None
 
     ATTACK_BTN = 4  # LB in the usual XInput button order
