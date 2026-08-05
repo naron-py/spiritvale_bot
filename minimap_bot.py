@@ -133,6 +133,23 @@ def nearest(dots, cx, cy):
     return min(dots, key=lambda d: (d[0] - cx) ** 2 + (d[1] - cy) ** 2, default=None)
 
 
+def pick_target(img):
+    """(origin, targetable dots, chosen dot) -- the whole targeting rule, once.
+
+    main() and --watch both call this, so the live view cannot drift out of step
+    with what the bot is actually chasing.
+    """
+    h, w = img.shape[:2]
+    # Arrow position beats the box centre: the box drifts with UI scale, the arrow
+    # is where the character actually is.
+    cx, cy = find_player(img) or (w / 2, h / 2)
+    # Blobs under the player arrow are never a target: either we already arrived,
+    # or it is a fixed red UI element sitting at the centre.
+    dots = [d for d in find_red_dots(img)
+            if (d[0] - cx) ** 2 + (d[1] - cy) ** 2 > CONCEAL_PX ** 2]
+    return (cx, cy), dots, nearest(dots, cx, cy)
+
+
 def stick_vector(dx, dy, radius):
     """Screen delta -> left-stick (x, y), y up positive.
 
@@ -306,15 +323,7 @@ def main(port=None):
                 reg = minimap_region(win)
                 img = np.array(sct.grab(reg))[:, :, :3]
                 h, w = img.shape[:2]
-                # Arrow position beats the box centre: the box drifts with UI scale,
-                # the arrow is where the character actually is.
-                cx, cy = find_player(img) or (w / 2, h / 2)
-
-                # Blobs under the player arrow are never a target: either we already
-                # arrived, or it is a fixed red UI element sitting at the centre.
-                dots = [d for d in find_red_dots(img)
-                        if (d[0] - cx) ** 2 + (d[1] - cy) ** 2 > CONCEAL_PX ** 2]
-                dot = nearest(dots, cx, cy)
+                (cx, cy), dots, dot = pick_target(img)
                 now = time.time()
 
                 if dot is not None:
@@ -391,6 +400,16 @@ def demo():
     x, y, _ = nearest(dots, 100, 100)
     assert abs(x - 120) < 3 and abs(y - 100) < 3, (x, y)
 
+    # pick_target: origin is the arrow, and a dot under it is never the target
+    cv2.circle(img, (108, 98), 4, (0, 0, 255), -1)     # right on the player arrow
+    (px2, py2), targetable, chosen = pick_target(img)
+    assert abs(px2 - 105) < 3 and abs(py2 - 95) < 3, (px2, py2)
+    assert all((d[0] - px2) ** 2 + (d[1] - py2) ** 2 > CONCEAL_PX ** 2
+               for d in targetable), targetable
+    # (120,100) and the dot on the arrow are both inside CONCEAL_PX of it, so the
+    # far up-right dot is the only thing left to chase.
+    assert abs(chosen[0] - 150) < 4 and abs(chosen[1] - 60) < 4, chosen
+
     sx, sy = stick_vector(x - 100, y - 100, 100)
     assert sx > 0.95 and abs(sy) < 0.05, (sx, sy)      # push right, full tilt
     sx, sy = stick_vector(0, -50, 100)
@@ -447,6 +466,60 @@ def snap(path="minimap_snap.png"):
     cv2.circle(img, (cx, cy), CONCEAL_PX, (255, 255, 0), 1)
     cv2.imwrite(path, img)
     print(f"{w}x{h} region -> {path}")
+
+
+def draw_tracking(img):
+    """Annotate a minimap grab in place with what the bot would do. Returns a label.
+
+    green = targetable, red = ignored under the arrow, cyan = the chosen target,
+    magenta arrow = the stick vector that would be sent.
+    """
+    (cx, cy), dots, dot = pick_target(img)
+    ipx = (int(cx), int(cy))
+    for x, y, _ in find_red_dots(img):
+        hidden = (x - cx) ** 2 + (y - cy) ** 2 <= CONCEAL_PX ** 2
+        cv2.circle(img, (int(x), int(y)), 7,
+                   (0, 0, 255) if hidden else (0, 255, 0), 1)
+    cv2.circle(img, ipx, CONCEAL_PX, (255, 255, 0), 1)
+    cv2.drawMarker(img, ipx, (255, 255, 0), cv2.MARKER_CROSS, 12, 1)
+    if dot is None:
+        return f"{len(dots)} dots  no target"
+    tgt = (int(dot[0]), int(dot[1]))
+    cv2.line(img, ipx, tgt, (0, 255, 255), 1)
+    cv2.circle(img, tgt, 10, (0, 255, 255), 2)
+    sx, sy = stick_vector(dot[0] - cx, dot[1] - cy, 1)
+    # stick vector as an arrow from the player, y flipped back to screen sense
+    cv2.arrowedLine(img, ipx, (int(cx + sx * 30), int(cy - sy * 30)),
+                    (255, 0, 255), 2, tipLength=0.3)
+    return f"{len(dots)} dots  dist {((dot[0] - cx) ** 2 + (dot[1] - cy) ** 2) ** 0.5:.0f}"
+
+
+def watch(scale=2):
+    """Live view of what the vision layer sees. Read-only -- drives nothing.
+
+    Safe to run in a second terminal while the bot works: two mss grabs of the
+    same region do not collide. q or ESC quits.
+    """
+    import mss
+    win = find_window()
+    title = "spiritvale tracking -- q to quit"
+    print(f"watching {minimap_region(win)}  (q or ESC in the window to quit)")
+    last, fps = time.time(), 0.0
+    with mss.mss() as sct:
+        while True:
+            img = np.array(sct.grab(minimap_region(win)))[:, :, :3].copy()
+            label = draw_tracking(img)
+            view = cv2.resize(img, None, fx=scale, fy=scale,
+                              interpolation=cv2.INTER_NEAREST)
+            now = time.time()
+            fps = 0.9 * fps + 0.1 / max(now - last, 1e-6)
+            last = now
+            cv2.putText(view, f"{label}  {fps:.0f}fps", (6, 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.imshow(title, view)
+            if cv2.waitKey(max(1, int(1000 / LOOP_HZ))) in (27, ord("q")):
+                break
+    cv2.destroyAllWindows()
 
 
 def probe(hold=0.4, gap=2.0):
@@ -583,6 +656,8 @@ if __name__ == "__main__":
         demo()
     elif "--snap" in sys.argv:
         snap()
+    elif "--watch" in sys.argv:
+        watch()
     elif "--probe" in sys.argv:
         probe()
     elif "--press" in sys.argv:

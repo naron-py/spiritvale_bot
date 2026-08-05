@@ -24,6 +24,16 @@ python minimap_bot.py --port auto        # Arduino Leonardo over serial instead
 
 **End** toggles pause. Ctrl+C stops and centres the stick.
 
+Watch what it is tracking, live, in a second terminal:
+
+```
+python minimap_bot.py --watch
+```
+
+Green circles are targetable dots, red ones are ignored under the player arrow,
+cyan is the chosen target, and the magenta arrow is the stick vector being sent.
+It only reads the screen, so it drives nothing and is safe beside a running bot.
+
 ## Calibration
 
 The only thing that needs tuning per machine is the minimap box:
@@ -44,6 +54,7 @@ every frame and used as the real origin, the box only has to contain it.
 |---|---|
 | `--demo` | Offline self-check. No game, no gamepad. |
 | `--snap` | What the vision code sees. Minimap alignment. |
+| `--watch` | Live tracking view. Read-only, safe to run beside the bot. |
 | `--test` | Walks a circle blind. Isolates pad problems from vision problems. |
 | `--buff [hold] [gap]` | Fires the buff sequence once, for timing tuning. |
 | `--probe` | Presses every X360 button in turn, named, to find a mapping. |
