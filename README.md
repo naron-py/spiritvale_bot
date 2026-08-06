@@ -109,5 +109,6 @@ every frame and used as the real origin, the box only has to contain it.
 ## Files
 
 - `minimap_bot.py` — the bot.
+- `pad_press.py` — press one control on the Leonardo, for Steam's setup wizard.
 - `minimap_navigator.py` — earlier navigation experiment.
 - `arduino_joystick_leonardo_v1.ino` — HID gamepad sketch for a Leonardo/Pro Micro.
