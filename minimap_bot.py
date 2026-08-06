@@ -39,13 +39,14 @@ WAKE_SETTLE_S = 0.5      # grace after the nudge before the first button press
 BUFF_HOLD_S = 0.25       # each d-pad press
 BUFF_GAP_S = 0.80        # pause between presses -- must outlast the cast animation
 MIN_BLOB_AREA = 6        # px, filters compression speckle
+# ponytail: the box centre is the player, so MINIMAP cx/cy is now load-bearing --
+# it used to only have to contain the marker. Run --snap after any UI change.
 # Red mushroom caps painted on the terrain are what the bot kept walking to.
 # Size cannot separate them -- an occluded cap is a sliver the size of a dot, and
 # merged dots are the size of a cap. Colour can: monster dots are drawn pure red
 # (H 0, S 255), every mushroom pixel is desaturated pink (S 94-154). Anything
 # under this floor is terrain art. Sample a stray blob's HSV before touching it.
 RED_S_MIN = 200
-PLAYER_AREA = (25, 600)  # px area range for the white player arrow
 LOOP_HZ = 20
 
 
@@ -109,26 +110,6 @@ def find_red_dots(bgr):
     return out
 
 
-def find_player(bgr):
-    """Centroid of the white player arrow, or None. Nearest white blob to centre."""
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, (0, 0, 200), (180, 45, 255))  # white: bright, unsaturated
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    h, w = bgr.shape[:2]
-    best, best_d = None, 1e9
-    for c in cnts:
-        if not (PLAYER_AREA[0] <= cv2.contourArea(c) <= PLAYER_AREA[1]):
-            continue
-        m = cv2.moments(c)
-        if m["m00"] == 0:
-            continue
-        x, y = m["m10"] / m["m00"], m["m01"] / m["m00"]
-        d = (x - w / 2) ** 2 + (y - h / 2) ** 2
-        if d < best_d:
-            best, best_d = (x, y), d
-    return best
-
-
 def nearest(dots, cx, cy):
     return min(dots, key=lambda d: (d[0] - cx) ** 2 + (d[1] - cy) ** 2, default=None)
 
@@ -140,10 +121,11 @@ def pick_target(img):
     with what the bot is actually chasing.
     """
     h, w = img.shape[:2]
-    # Arrow position beats the box centre: the box drifts with UI scale, the arrow
-    # is where the character actually is.
-    cx, cy = find_player(img) or (w / 2, h / 2)
-    # Blobs under the player arrow are never a target: either we already arrived,
+    # The game keeps the character pinned to the middle of its minimap, so the box
+    # centre IS the player. Detecting the marker instead was fragile: it turns blue
+    # in a party, and in a crowd the nearest white blob is somebody else's dot.
+    cx, cy = w / 2, h / 2
+    # Blobs under the player marker are never a target: either we already arrived,
     # or it is a fixed red UI element sitting at the centre.
     dots = [d for d in find_red_dots(img)
             if (d[0] - cx) ** 2 + (d[1] - cy) ** 2 > CONCEAL_PX ** 2]
@@ -395,20 +377,19 @@ def demo():
 
     dots = find_red_dots(img)
     assert len(dots) == 3, dots       # 2 singles + the merged pair, no mushrooms
-    px, py = find_player(img)
-    assert abs(px - 105) < 3 and abs(py - 95) < 3, (px, py)
     x, y, _ = nearest(dots, 100, 100)
     assert abs(x - 120) < 3 and abs(y - 100) < 3, (x, y)
 
-    # pick_target: origin is the arrow, and a dot under it is never the target
-    cv2.circle(img, (108, 98), 4, (0, 0, 255), -1)     # right on the player arrow
-    (px2, py2), targetable, chosen = pick_target(img)
-    assert abs(px2 - 105) < 3 and abs(py2 - 95) < 3, (px2, py2)
-    assert all((d[0] - px2) ** 2 + (d[1] - py2) ** 2 > CONCEAL_PX ** 2
+    # pick_target: origin is the box centre, whatever colour the marker is, and a
+    # dot sitting on it is never the target.
+    cv2.circle(img, (104, 104), 4, (0, 0, 255), -1)    # right on the centre
+    (px, py), targetable, chosen = pick_target(img)
+    assert (px, py) == (100, 100), (px, py)            # 200x200 image
+    assert all((d[0] - px) ** 2 + (d[1] - py) ** 2 > CONCEAL_PX ** 2
                for d in targetable), targetable
-    # (120,100) and the dot on the arrow are both inside CONCEAL_PX of it, so the
-    # far up-right dot is the only thing left to chase.
-    assert abs(chosen[0] - 150) < 4 and abs(chosen[1] - 60) < 4, chosen
+    # The dot on the centre is concealed and dropped; the next nearest is chased.
+    assert abs(chosen[0] - 120) < 3 and abs(chosen[1] - 100) < 3, chosen
+    assert len(targetable) == len(dots), (targetable, dots)  # only the new one went
 
     sx, sy = stick_vector(x - 100, y - 100, 100)
     assert sx > 0.95 and abs(sy) < 0.05, (sx, sy)      # push right, full tilt
@@ -452,16 +433,15 @@ def snap(path="minimap_snap.png"):
     with mss.mss() as sct:
         img = np.array(sct.grab(minimap_region(win)))[:, :, :3].copy()
     h, w = img.shape[:2]
-    player = find_player(img)
-    print(f"  player arrow: {player or 'NOT FOUND -- falling back to box centre'}")
-    cx, cy = (int(player[0]), int(player[1])) if player else (w // 2, h // 2)
+    cx, cy = w // 2, h // 2  # the game pins the character here; see pick_target
+    print(f"  player assumed at box centre ({cx},{cy}) -- the cross must sit on the "
+          f"character marker, whatever colour it is")
     for x, y, wpx in find_red_dots(img):
         d = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
         hid = d <= CONCEAL_PX
         cv2.circle(img, (int(x), int(y)), 8, (0, 0, 255) if hid else (0, 255, 0), 1)
         print(f"  dot at ({x:6.1f},{y:6.1f}) width {wpx:5.1f} dist {d:6.1f}"
-              f"{'  REJECTED: under player arrow' if hid else ''}")
-    cv2.drawMarker(img, (w // 2, h // 2), (255, 0, 255), cv2.MARKER_CROSS, 10, 1)
+              f"{'  REJECTED: under player marker' if hid else ''}")
     cv2.drawMarker(img, (cx, cy), (255, 255, 0), cv2.MARKER_CROSS, 14, 1)
     cv2.circle(img, (cx, cy), CONCEAL_PX, (255, 255, 0), 1)
     cv2.imwrite(path, img)

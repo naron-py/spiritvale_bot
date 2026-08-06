@@ -36,7 +36,7 @@ Watch what it is tracking, live, in a second terminal:
 python minimap_bot.py --watch
 ```
 
-Green circles are targetable dots, red ones are ignored under the player arrow,
+Green circles are targetable dots, red ones are ignored under the player marker,
 cyan is the chosen target, and the magenta arrow is the stick vector being sent.
 It only reads the screen, so it drives nothing and is safe beside a running bot.
 
@@ -48,11 +48,11 @@ The only thing that needs tuning per machine is the minimap box:
 python minimap_bot.py --snap
 ```
 
-Writes `minimap_snap.png`. Magenta cross = box centre, cyan cross = the detected
-white player arrow, green circles = monsters, red circles = rejected. Nudge
-`MINIMAP = dict(cx, cy, r)` — fractions of the client area — until the box is
-centred on the arrow. Exact centring is not critical: the arrow is re-detected
-every frame and used as the real origin, the box only has to contain it.
+Writes `minimap_snap.png`. Cyan cross = the box centre, which the bot takes to be
+the character; green circles = monsters, red circles = rejected. Nudge
+`MINIMAP = dict(cx, cy, r)` — fractions of the client area — until the cross sits
+on your character marker. **Get this right:** the centre *is* the origin now, so a
+mis-centred box biases every heading the bot takes.
 
 ## Diagnostics
 
@@ -96,7 +96,12 @@ every frame and used as the real origin, the box only has to contain it.
   like a broken bot and is not one.
 - Stick tilt is direction-only at full magnitude. Scaling tilt by minimap pixel
   distance made every approach a crawl the game's own deadzone swallowed.
-- Red blobs under the player arrow are never targeted — that is either "arrived"
+- **The character is assumed to be at the box centre; the marker is never detected.**
+  It used to be found as the nearest white blob, which broke twice: the marker turns
+  **blue in a party**, and in a crowd the nearest white blob is another player's dot,
+  so the bot navigated from somebody else's position. The game pins the character to
+  the middle of its minimap, so the centre is the answer — and it costs no pixels.
+- Red blobs under the player marker are never targeted — that is either "arrived"
   or a fixed red UI element, and treating it as a target froze the bot.
 - **Monsters are told from red mushroom terrain art by saturation, not by size.**
   Dots render pure red (S 255), mushrooms are desaturated pink (S 94–154), hence

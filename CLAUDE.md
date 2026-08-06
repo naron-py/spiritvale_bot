@@ -34,11 +34,13 @@ scanning at the bottom of the file — no argparse in `minimap_bot.py`.
 
 `minimap_bot.py` is the whole bot, single file, three layers:
 
-1. **Vision** — `find_red_dots` / `find_player` run HSV threshold + contour
-   centroids over an `mss` grab of `minimap_region(win)`. The capture box is
-   `MINIMAP = dict(cx, cy, r)` as *fractions* of the client area, so it survives
-   resolution changes. The white player arrow is re-detected every frame and used
-   as the origin — the box only has to contain it, not be centred on it.
+1. **Vision** — `find_red_dots` runs an HSV threshold + contour centroids over an
+   `mss` grab of `minimap_region(win)`. The capture box is `MINIMAP = dict(cx, cy,
+   r)` as *fractions* of the client area, so it survives resolution changes. The
+   character is assumed to sit at the box centre — the game pins it to the middle
+   of its minimap — so `MINIMAP` cx/cy is load-bearing and must be calibrated with
+   `--snap`. `pick_target()` holds this rule and is shared by `main()` and
+   `--watch`, so the live view cannot disagree with what the bot chases.
 2. **Control** — `stick_vector` converts a screen delta to a stick vector. It is
    **direction-only at full magnitude**; a minimap pixel is many world metres, so
    proportional tilt lands inside the game's own deadzone. `main()` holds the last
@@ -61,8 +63,12 @@ adjusting them over adding code paths.
   first button press* during the mode swap. Every button sequence must be preceded
   by `wake_controller(pad)` (stick nudge + `WAKE_SETTLE_S`). Removing it silently
   eats the leading d-pad press.
-- **Red blobs within `CONCEAL_PX` of the player arrow are never targets** — that is
+- **Red blobs within `CONCEAL_PX` of the box centre are never targets** — that is
   either "arrived" or a fixed red UI element, and chasing it freezes the bot.
+- **Do not reintroduce marker detection.** Finding the character as the nearest
+  white blob failed two ways: the marker turns blue in a party, and in a crowd the
+  nearest white blob belongs to another player. The centre is both simpler and
+  strictly more reliable.
 - `ArduinoPad.stick` deduplicates against `self.last` because the sketch is
   synchronous (every command blocks on an `OK` reply). Keep it.
 
