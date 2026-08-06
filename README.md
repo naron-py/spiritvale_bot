@@ -1,8 +1,14 @@
 # spiritvale-bot
 
 Screen-reading combat bot for SpiritVale. Watches the minimap, walks the character
-to the nearest red monster dot with the left stick, holds the attack button, and
-recasts a d-pad buff sequence on a timer.
+to the nearest red monster dot with the left stick, holds the attack button, taps
+a spam button on a fast timer, and recasts a d-pad buff sequence on a slow one.
+Everything runs while the chase continues — the bot never stands still to cast.
+
+All tuning lives in one constant block at the top of `minimap_bot.py`:
+`SPAM_BUTTON` / `SPAM_PERIOD_S` for the spammed button (`None` disables it),
+`BUFF_SEQUENCE` / `BUFF_PERIOD_S` for the buff, `ATTACK_MASH` to tap the attack
+button instead of holding it.
 
 ## Setup
 
@@ -58,6 +64,7 @@ every frame and used as the real origin, the box only has to contain it.
 | `--test` | Walks a circle blind. Isolates pad problems from vision problems. |
 | `--buff [hold] [gap]` | Fires the buff sequence once, for timing tuning. |
 | `--probe` | Presses every X360 button in turn, named, to find a mapping. |
+| `--press` | Fires one control at a time on the Arduino, typed in by hand. |
 
 ## Gotchas found the hard way
 
@@ -81,6 +88,12 @@ every frame and used as the real origin, the box only has to contain it.
   differing: minimap frame-delta 10.1 for vgamepad, 2.1 for the Arduino against
   a 2.35 idle floor. Enabling Steam Input to force a translation layer is the
   one untried route, and it breaks the vgamepad path it would replace.
+- **The game binds XInput slot 0 only — unplug every other controller.** A DS4
+  plugged in while Steam was presenting it as XInput took slot 0, our virtual pad
+  landed in slot 1, and the bot went completely dead: correct XInput output, game
+  focused, character motionless. Nothing in the code had changed. To check, read
+  the slots back with `XInputGetState`; ours must be slot 0. This looks exactly
+  like a broken bot and is not one.
 - Stick tilt is direction-only at full magnitude. Scaling tilt by minimap pixel
   distance made every approach a crawl the game's own deadzone swallowed.
 - Red blobs under the player arrow are never targeted — that is either "arrived"

@@ -16,7 +16,7 @@ Prefer the interactive form for a whole wizard run: it holds one serial connecti
 open, and opening the port can reset the board, which drops it off the bus.
 """
 import sys
-
+import time
 from minimap_bot import TAP_HELP, ArduinoPad, press_repl, tap_one
 
 if __name__ == "__main__":
@@ -24,7 +24,7 @@ if __name__ == "__main__":
     port = sys.argv[i + 1] if i >= 0 else "auto"
     tokens = [a for n, a in enumerate(sys.argv[1:], 1)
               if not a.startswith("--") and n != i + 1]
-
+    time.sleep(1)
     if not tokens:
         press_repl(port)
     else:
