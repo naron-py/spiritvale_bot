@@ -5,14 +5,10 @@ to the nearest red monster dot with the left stick, holds the attack button, tap
 a spam button on a fast timer, and recasts a d-pad buff sequence on a slow one.
 Everything runs while the chase continues — the bot never stands still to cast.
 
-If a boss appears on the minimap it drops everything and runs: no chasing, no
-attacking, no casting, stick pointed straight away from it until it is far behind.
-
 All tuning lives in one constant block at the top of `minimap_bot.py`:
 `SPAM_BUTTON` / `SPAM_PERIOD_S` for the spammed button (`None` disables it),
 `BUFF_SEQUENCE` / `BUFF_PERIOD_S` for the buff, `ATTACK_MASH` to tap the attack
-button instead of holding it, `BOSS_FLEE_PX` / `BOSS_SAFE_PX` for how close a boss
-must get before the bot bolts and how far it must be before it settles again.
+button instead of holding it.
 
 ## Setup
 
@@ -100,12 +96,6 @@ mis-centred box biases every heading the bot takes.
   like a broken bot and is not one.
 - Stick tilt is direction-only at full magnitude. Scaling tilt by minimap pixel
   distance made every approach a crawl the game's own deadzone swallowed.
-- **The boss is matched by template, not by colour or size.** The skull icon is
-  bone/cream (V 205, S 55) and so is half the terrain on a desert map — a plain
-  grey patch scored as a "boss" at area 5539 against the real icon's 443. Template
-  matching separates them outright: 1.00 on the icon, 0.36 on a bone-white map with
-  no boss. `boss_icon.png` is cut from the minimap itself, so recut it if the game
-  ever rescales the minimap. Delete the file and boss detection simply turns off.
 - **The character is assumed to be at the box centre; the marker is never detected.**
   It used to be found as the nearest white blob, which broke twice: the marker turns
   **blue in a party**, and in a crowd the nearest white blob is another player's dot,

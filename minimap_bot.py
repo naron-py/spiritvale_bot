@@ -9,7 +9,6 @@ usage:
   python minimap_bot.py --port COM5   # Arduino Leonardo
   python minimap_bot.py --demo        # offline self-check
 """
-import os
 import sys
 import time
 
@@ -31,15 +30,6 @@ ATTACK_PERIOD_S = 0.40   # mash cycle, ignored while ATTACK_MASH is False
 ATTACK_HOLD_S = 0.15     # how long L1 stays down each mash cycle
 BUFF_PERIOD_S = 60.0     # recast the buff sequence this often
 BUFF_SEQUENCE = ("up", "left", "down", "right")
-# Boss: a skull icon, matched against a template cut from the minimap itself.
-# Colour and size both failed here -- the skull is bone/cream (V 205, S 55), and
-# so is half the terrain on a desert map, where a grey patch scored as a "boss".
-# Template matching separates them outright: 1.00 on the icon, 0.36 on a bone map
-# with no boss present. Recut boss_icon.png if the game rescales its minimap.
-BOSS_ICON = "boss_icon.png"
-BOSS_MATCH_MIN = 0.60
-BOSS_FLEE_PX = 90        # boss this close -> run. Box half-width is 140.
-BOSS_SAFE_PX = 130       # keep running until this far, so it cannot oscillate
 SPAM_BUTTON = "y"        # tapped on a timer all the while the bot runs; None = off
 SPAM_PERIOD_S = 0.5
 SPAM_HOLD_S = 0.05
@@ -118,32 +108,6 @@ def find_red_dots(bgr):
             continue
         out.append((m["m10"] / m["m00"], m["m01"] / m["m00"], width))
     return out
-
-
-_boss_icon = False  # False = not looked for yet, None = missing
-
-
-def boss_icon():
-    """The boss template, or None if the file is absent (boss check then off)."""
-    global _boss_icon
-    if _boss_icon is False:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), BOSS_ICON)
-        _boss_icon = cv2.imread(path)
-        if _boss_icon is None:
-            print(f"no {BOSS_ICON} -- boss detection disabled")
-    return _boss_icon
-
-
-def find_boss(bgr, template=None):
-    """(x, y, score) of the boss icon, or None. Best template match over the box."""
-    t = boss_icon() if template is None else template
-    if t is None or bgr.shape[0] < t.shape[0] or bgr.shape[1] < t.shape[1]:
-        return None
-    res = cv2.matchTemplate(bgr, t, cv2.TM_CCOEFF_NORMED)
-    _, score, _, loc = cv2.minMaxLoc(res)
-    if score < BOSS_MATCH_MIN:
-        return None
-    return loc[0] + t.shape[1] / 2, loc[1] + t.shape[0] / 2, score
 
 
 def nearest(dots, cx, cy):
@@ -315,7 +279,6 @@ def main(port=None):
     buff_queue = []   # d-pad presses left in the current cast
     next_press = 0.0  # earliest time for the next one
     next_spam = 0.0   # SPAM_BUTTON goes out on its own timer
-    fleeing = False   # latched while running from a boss, see BOSS_SAFE_PX
 
     # Once, up front: the game ignores buttons until it has seen stick motion.
     # After this the chase keeps it awake, so the buff never has to stop to nudge.
@@ -344,28 +307,6 @@ def main(port=None):
                 h, w = img.shape[:2]
                 (cx, cy), dots, dot = pick_target(img)
                 now = time.time()
-
-                # Boss check comes first and overrides everything: a boss that has
-                # closed to BOSS_FLEE_PX is chased off until BOSS_SAFE_PX, the wider
-                # ring keeping it from flipping every frame on the boundary.
-                boss = find_boss(img)
-                boss_d = (((boss[0] - cx) ** 2 + (boss[1] - cy) ** 2) ** 0.5
-                          if boss else None)
-                if boss_d is not None and boss_d < BOSS_FLEE_PX:
-                    fleeing = True
-                elif fleeing and (boss_d is None or boss_d > BOSS_SAFE_PX):
-                    fleeing = False
-
-                if fleeing and boss:
-                    # Straight away from it, attack released so no swing roots us.
-                    sx, sy = stick_vector(cx - boss[0], cy - boss[1], min(w, h) / 2)
-                    pad.stick(sx, sy, False)
-                    last = None          # heading is flight, not a chase to resume
-                    buff_queue.clear()   # no casting while running
-                    print(f"{'FLEEING BOSS':12} dist {boss_d:6.1f} "
-                          f"stick {sx:+.2f},{sy:+.2f}        ", end="\r")
-                    time.sleep(1 / LOOP_HZ)
-                    continue
 
                 if dot is not None:
                     dx, dy = dot[0] - cx, dot[1] - cy
@@ -450,26 +391,6 @@ def demo():
     assert abs(chosen[0] - 120) < 3 and abs(chosen[1] - 100) < 3, chosen
     assert len(targetable) == len(dots), (targetable, dots)  # only the new one went
 
-    # Boss: matched by template, so the demo brings its own rather than the real
-    # icon file -- the logic under test is match/threshold/centre, not the artwork.
-    icon = np.zeros((16, 16, 3), np.uint8)
-    cv2.circle(icon, (8, 8), 6, (200, 210, 220), -1)
-    cv2.circle(icon, (5, 6), 2, (20, 20, 20), -1)          # eye sockets: texture
-    cv2.circle(icon, (11, 6), 2, (20, 20, 20), -1)         # for the correlation
-    # own frame: the chase image is full of white circles a round template would
-    # legitimately correlate with, which says nothing about the matching logic
-    scene = np.full((200, 200, 3), 40, np.uint8)
-    cv2.circle(scene, (150, 150), 9, (0, 0, 255), -1)      # a monster dot
-    assert find_boss(scene, icon) is None, "must not match before the boss is drawn"
-    scene[32:48, 52:68] = icon
-    boss = find_boss(scene, icon)
-    assert boss is not None, "boss template must match once drawn"
-    assert abs(boss[0] - 60) < 2 and abs(boss[1] - 40) < 2, boss
-    assert boss[2] >= BOSS_MATCH_MIN, boss
-    # flee vector points from the boss back through the player, never toward it
-    fx, fy = stick_vector(100 - boss[0], 100 - boss[1], 100)
-    assert fx > 0 and fy < 0, (fx, fy)   # boss is up-left, so run down-right
-
     sx, sy = stick_vector(x - 100, y - 100, 100)
     assert sx > 0.95 and abs(sy) < 0.05, (sx, sy)      # push right, full tilt
     sx, sy = stick_vector(0, -50, 100)
@@ -515,15 +436,6 @@ def snap(path="minimap_snap.png"):
     cx, cy = w // 2, h // 2  # the game pins the character here; see pick_target
     print(f"  player assumed at box centre ({cx},{cy}) -- the cross must sit on the "
           f"character marker, whatever colour it is")
-    boss = find_boss(img)
-    if boss:
-        bd = ((boss[0] - cx) ** 2 + (boss[1] - cy) ** 2) ** 0.5
-        cv2.drawMarker(img, (int(boss[0]), int(boss[1])), (0, 0, 255),
-                       cv2.MARKER_TILTED_CROSS, 20, 2)
-        print(f"  BOSS at ({boss[0]:6.1f},{boss[1]:6.1f}) match {boss[2]:.2f} "
-              f"dist {bd:6.1f}  -> {'FLEEING' if bd < BOSS_FLEE_PX else 'far enough'}")
-    else:
-        print("  no boss on the minimap")
     for x, y, wpx in find_red_dots(img):
         d = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
         hid = d <= CONCEAL_PX
@@ -550,21 +462,6 @@ def draw_tracking(img):
                    (0, 0, 255) if hidden else (0, 255, 0), 1)
     cv2.circle(img, ipx, CONCEAL_PX, (255, 255, 0), 1)
     cv2.drawMarker(img, ipx, (255, 255, 0), cv2.MARKER_CROSS, 12, 1)
-
-    boss = find_boss(img)
-    if boss is not None:
-        bpx = (int(boss[0]), int(boss[1]))
-        bd = ((boss[0] - cx) ** 2 + (boss[1] - cy) ** 2) ** 0.5
-        cv2.circle(img, bpx, 16, (0, 0, 255), 2)
-        cv2.drawMarker(img, bpx, (0, 0, 255), cv2.MARKER_TILTED_CROSS, 20, 2)
-        cv2.circle(img, ipx, BOSS_FLEE_PX, (0, 0, 255), 1)  # cross this and we run
-        if bd < BOSS_FLEE_PX:
-            cv2.arrowedLine(img, ipx,
-                            (int(cx + (cx - boss[0]) / max(bd, 1e-6) * 40),
-                             int(cy + (cy - boss[1]) / max(bd, 1e-6) * 40)),
-                            (0, 0, 255), 2, tipLength=0.3)
-            return f"BOSS {bd:.0f}px -- FLEEING"
-
     if dot is None:
         return f"{len(dots)} dots  no target"
     tgt = (int(dot[0]), int(dot[1]))
