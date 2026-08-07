@@ -40,7 +40,11 @@ scanning at the bottom of the file — no argparse in `minimap_bot.py`.
    character is assumed to sit at the box centre — the game pins it to the middle
    of its minimap — so `MINIMAP` cx/cy is load-bearing and must be calibrated with
    `--snap`. `pick_target()` holds this rule and is shared by `main()` and
-   `--watch`, so the live view cannot disagree with what the bot chases.
+   `--watch`, so the live view cannot disagree with what the bot chases. Four
+   stateful helpers sit behind it, all reset together when the bot is toggled:
+   `PetFilter` (drops other players' pets), `TargetLock` (keeps one marker instead
+   of re-picking the nearest each frame), `StuckWatchdog` (spots a target that is
+   not getting closer) and `TargetBlacklist` (ignores it for `TARGET_IGNORE_S`).
 2. **Control** — `stick_vector` converts a screen delta to a stick vector. It is
    **direction-only at full magnitude**; a minimap pixel is many world metres, so
    proportional tilt lands inside the game's own deadzone. `main()` holds the last
@@ -65,10 +69,18 @@ adjusting them over adding code paths.
   eats the leading d-pad press.
 - **Red blobs within `CONCEAL_PX` of the box centre are never targets** — that is
   either "arrived" or a fixed red UI element, and chasing it freezes the bot.
-- **Do not reintroduce marker detection.** Finding the character as the nearest
-  white blob failed two ways: the marker turns blue in a party, and in a crowd the
-  nearest white blob belongs to another player. The centre is both simpler and
-  strictly more reliable.
+- **Do not reintroduce marker detection *for our own character*.** Finding it as
+  the nearest white blob failed two ways: the marker turns blue in a party, and in
+  a crowd the nearest white blob belongs to another player. The centre is simpler
+  and strictly more reliable. `find_white_players()` is the opposite job and is
+  fine — it looks for *other* players to pair pets with, and excludes anything
+  within `CONCEAL_PX` of the centre precisely so our own marker cannot qualify.
+- **The white player dot only renders in about half the frames.** Anything keyed
+  on it needs memory across frames, which is why `PetFilter` confirms a pair and
+  then tracks the pet by its own red marker. Do not "simplify" it to a plain
+  distance test — the pet reappears as a target every other frame if you do.
+- **`START_PAUSED` must stay true.** Launching the script has to be safe; the bot
+  waits for `Delete` (`TOGGLE_VK`) before it touches the stick.
 - `ArduinoPad.stick` deduplicates against `self.last` because the sketch is
   synchronous (every command blocks on an `OK` reply). Keep it.
 

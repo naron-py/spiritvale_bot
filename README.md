@@ -5,6 +5,10 @@ to the nearest red monster dot with the left stick, holds the attack button, tap
 a spam button on a fast timer, and recasts a d-pad buff sequence on a slow one.
 Everything runs while the chase continues — the bot never stands still to cast.
 
+It keeps hold of one target rather than re-picking the nearest every frame, skips
+other players' pets, and gives up on a monster it cannot reach instead of walking
+into a wall forever.
+
 All tuning lives in one constant block at the top of `minimap_bot.py`:
 `SPAM_BUTTON` / `SPAM_PERIOD_S` for the spammed button (`None` disables it),
 `BUFF_SEQUENCE` / `BUFF_PERIOD_S` for the buff, `ATTACK_MASH` to tap the attack
@@ -28,7 +32,8 @@ python minimap_bot.py                    # virtual X360 pad (this is the one tha
 python minimap_bot.py --port auto        # Arduino Leonardo over serial instead
 ```
 
-**End** toggles pause. Ctrl+C stops and centres the stick.
+**It starts stopped.** **Delete** toggles running, from any window. Ctrl+C exits and
+centres the stick. Launching the script never moves your character on its own.
 
 Watch what it is tracking, live, in a second terminal:
 
@@ -96,6 +101,14 @@ mis-centred box biases every heading the bot takes.
   like a broken bot and is not one.
 - Stick tilt is direction-only at full magnitude. Scaling tilt by minimap pixel
   distance made every approach a crawl the game's own deadzone swallowed.
+- **Pets share the monster colour — they are told apart by who they stand next to.**
+  Another player's pet is the same red dot as a monster, so it is paired with that
+  player's small white dot instead. Two things make this survivable: a pair must
+  hold for `PET_CONFIRM_FRAMES` before it counts, so a monster merely walking past
+  a player is not written off; and once confirmed the pet is followed by its *own*
+  marker for `PET_FORGET_FRAMES`. That memory is not optional — measured live, the
+  white player dot only renders in about half the frames, so a pet identified by
+  proximity alone would flicker back into the target list every other frame.
 - **The character is assumed to be at the box centre; the marker is never detected.**
   It used to be found as the nearest white blob, which broke twice: the marker turns
   **blue in a party**, and in a crowd the nearest white blob is another player's dot,

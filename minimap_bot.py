@@ -25,12 +25,19 @@ SPEED = 1.0              # stick magnitude while chasing, 0..1
 DEADZONE_PX = 4          # blob this close to center = arrived
 CONCEAL_PX = 20          # white player arrow hides a dot inside this radius
 LOST_HOLD_S = 1.0        # keep last heading this long after a dot vanishes
+TARGET_TRACK_PX = 20     # same marker can move this far between 20Hz captures
+TARGET_ARRIVE_PX = 28    # near-centre disappearance means stop and attack, not coast
+TARGET_FORGET_FRAMES = 10  # ignore competitors for 0.5s before choosing a new target
+STUCK_TIMEOUT_S = 3.0    # no meaningful approach this long = inaccessible target
+STUCK_PROGRESS_PX = 4    # cumulative distance gain that restarts the timeout
+STUCK_MIN_DIST_PX = 35   # never abandon a target already within attack approach range
+TARGET_IGNORE_S = 8.0    # retry an inaccessible monster later in case it moved
 ATTACK_MASH = False      # False = hold L1 down; True = tap it on the cycle below
 ATTACK_PERIOD_S = 0.40   # mash cycle, ignored while ATTACK_MASH is False
 ATTACK_HOLD_S = 0.15     # how long L1 stays down each mash cycle
 BUFF_PERIOD_S = 60.0     # recast the buff sequence this often
 BUFF_SEQUENCE = ("up", "left", "down", "right")
-SPAM_BUTTON = "y"        # tapped on a timer all the while the bot runs; None = off
+SPAM_BUTTON = "y"        # tapped on its own timer while the bot runs; None = off
 SPAM_PERIOD_S = 0.5
 SPAM_HOLD_S = 0.05
 WAKE_AMP = 0.5           # stick nudge that flips the game into controller mode
@@ -47,6 +54,17 @@ MIN_BLOB_AREA = 6        # px, filters compression speckle
 # (H 0, S 255), every mushroom pixel is desaturated pink (S 94-154). Anything
 # under this floor is terrain art. Sample a stray blob's HSV before touching it.
 RED_S_MIN = 200
+WHITE_S_MAX = 65         # player dots are bright neutral white
+WHITE_V_MIN = 190
+PLAYER_AREA = (20, 120)  # measured 8-10px dots; rejects large white UI artwork
+PLAYER_SIDE = (5, 13)
+PET_NEAR_PX = 18         # pet centres measured 11.8px and 14.8px from their player
+PET_RELEASE_PX = 24      # hysteresis: do not flicker at the entry threshold
+PET_CONFIRM_FRAMES = 3   # a monster crossing a player for one frame stays targetable
+PET_TRACK_STEP_PX = 20   # maximum marker movement between 20Hz captures
+PET_FORGET_FRAMES = 40   # remember a vanished confirmed pet for about two seconds
+TOGGLE_VK = 0x2E         # Delete, polled globally through GetAsyncKeyState
+START_PAUSED = True      # launching the script must never move the character
 LOOP_HZ = 20
 
 
@@ -61,14 +79,26 @@ def wake_controller(pad):
     time.sleep(WAKE_SETTLE_S)
 
 
-def end_key_hit():
-    """True once per physical End press, works while the game has focus.
+def toggle_key_hit(get_state=None):
+    """True once per physical Delete press, even when another window has focus.
 
     GetAsyncKeyState's low bit means 'pressed since the last call', so polling it
     is already edge-detected -- no key hook, no extra dependency.
     """
-    import ctypes
-    return bool(ctypes.windll.user32.GetAsyncKeyState(0x23) & 1)
+    if get_state is None:
+        import ctypes
+        get_state = ctypes.windll.user32.GetAsyncKeyState
+    return bool(get_state(TOGGLE_VK) & 1)
+
+
+def toggle_running(paused, pad, pet_filter, wake=wake_controller):
+    """Toggle run state, always clearing held controls and stale target state."""
+    paused = not paused
+    pad.stick(0.0, 0.0, False)
+    pet_filter.reset()
+    if not paused:
+        wake(pad)
+    return paused
 
 
 def find_window():
@@ -110,11 +140,241 @@ def find_red_dots(bgr):
     return out
 
 
+def find_white_players(bgr):
+    """Return small bright-white player dots as (x, y), rejecting white UI art."""
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (0, 0, WHITE_V_MIN), (180, WHITE_S_MAX, 255))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = []
+    for c in cnts:
+        area = cv2.contourArea(c)
+        _, _, w, h = cv2.boundingRect(c)
+        if not (PLAYER_AREA[0] <= area <= PLAYER_AREA[1] and
+                PLAYER_SIDE[0] <= w <= PLAYER_SIDE[1] and
+                PLAYER_SIDE[0] <= h <= PLAYER_SIDE[1]):
+            continue
+        m = cv2.moments(c)
+        if m["m00"]:
+            out.append((m["m10"] / m["m00"], m["m01"] / m["m00"]))
+    return out
+
+
+class PetFilter:
+    """Confirm red/white pairs over time, then return red indexes that are pets."""
+
+    def __init__(self):
+        self.states = []
+
+    def reset(self):
+        self.states = []
+
+    def pet_indexes(self, reds, whites):
+        used_red = set()
+        next_states = []
+        pets = set()
+
+        # White proximity establishes identity. Once established, follow the red
+        # marker itself: pets often roam well beyond the initial 18px pairing radius.
+        for state in (s for s in self.states if s["confirmed"]):
+            steps = state["misses"] + 1
+            vx, vy = state.get("velocity", (0.0, 0.0))
+            predicted = (state["red"][0] + vx * steps,
+                         state["red"][1] + vy * steps)
+            choices = [(((red[0] - predicted[0]) ** 2 +
+                         (red[1] - predicted[1]) ** 2) ** 0.5, i, red)
+                       for i, red in enumerate(reds) if i not in used_red]
+            best = min(choices, default=None)
+            allowance = PET_TRACK_STEP_PX * min(steps, 2)
+            if best is not None and best[0] <= allowance:
+                _, i, red = best
+                used_red.add(i)
+                velocity = ((red[0] - state["red"][0]) / steps,
+                            (red[1] - state["red"][1]) / steps)
+                white = min(whites,
+                            key=lambda p: (p[0] - red[0]) ** 2 +
+                                          (p[1] - red[1]) ** 2,
+                            default=state["white"])
+                next_states.append(dict(red=red, white=white,
+                                        frames=state["frames"] + 1,
+                                        confirmed=True, misses=0,
+                                        velocity=velocity))
+                pets.add(i)
+            elif state["misses"] < PET_FORGET_FRAMES:
+                stale = dict(state)
+                stale["misses"] += 1
+                next_states.append(stale)
+
+        # Unconfirmed dots still need a nearby white player for three frames.
+        pairs = []
+        for i, red in enumerate(reds):
+            if i in used_red:
+                continue
+            white = min(whites,
+                        key=lambda p: (p[0] - red[0]) ** 2 + (p[1] - red[1]) ** 2,
+                        default=None)
+            if white is None:
+                continue
+            separation = ((white[0] - red[0]) ** 2 +
+                          (white[1] - red[1]) ** 2) ** 0.5
+            if separation <= PET_RELEASE_PX:
+                pairs.append((i, red, white, separation))
+
+        used = set()
+        for i, red, white, separation in sorted(pairs, key=lambda p: p[3]):
+            best = None
+            for j, state in enumerate(self.states):
+                if state["confirmed"] or j in used:
+                    continue
+                allowance = PET_TRACK_STEP_PX * (state["misses"] + 1)
+                red_step = ((red[0] - state["red"][0]) ** 2 +
+                            (red[1] - state["red"][1]) ** 2) ** 0.5
+                white_step = ((white[0] - state["white"][0]) ** 2 +
+                              (white[1] - state["white"][1]) ** 2) ** 0.5
+                if red_step <= allowance and white_step <= allowance:
+                    score = red_step + white_step
+                    if best is None or score < best[0]:
+                        best = (score, j, state)
+
+            if best is not None:
+                _, j, old = best
+                used.add(j)
+                frames = old["frames"] + 1
+                confirmed = old["confirmed"] or frames >= PET_CONFIRM_FRAMES
+                steps = old["misses"] + 1
+                velocity = ((red[0] - old["red"][0]) / steps,
+                            (red[1] - old["red"][1]) / steps)
+            elif separation <= PET_NEAR_PX:
+                frames, confirmed = 1, PET_CONFIRM_FRAMES <= 1
+                velocity = (0.0, 0.0)
+            else:
+                continue  # release-band pairs cannot start a new pet track
+
+            next_states.append(dict(red=red, white=white, frames=frames,
+                                    confirmed=confirmed, misses=0,
+                                    velocity=velocity))
+            if confirmed:
+                pets.add(i)
+
+        # Survive a brief marker flicker without forgetting a confirmed pair.
+        for j, state in enumerate(self.states):
+            if not state["confirmed"] and j not in used and state["misses"] < 2:
+                stale = dict(state)
+                stale["misses"] += 1
+                next_states.append(stale)
+        self.states = next_states
+        return pets
+
+
 def nearest(dots, cx, cy):
     return min(dots, key=lambda d: (d[0] - cx) ** 2 + (d[1] - cy) ** 2, default=None)
 
 
-def pick_target(img):
+class TargetLock:
+    """Keep one red marker until it is genuinely lost instead of switching nearest."""
+
+    def __init__(self):
+        self.target_id = 0
+        self.reset()
+
+    def reset(self):
+        self.current = None
+        self.misses = 0
+        self.concealed = False
+
+    def pick(self, dots, cx, cy):
+        self.concealed = False
+        if self.current is None:
+            return self._acquire(dots, cx, cy)
+
+        dot = nearest(dots, self.current[0], self.current[1])
+        if dot is not None:
+            step = ((dot[0] - self.current[0]) ** 2 +
+                    (dot[1] - self.current[1]) ** 2) ** 0.5
+            if step <= TARGET_TRACK_PX:
+                self.current = dot
+                self.misses = 0
+                return dot
+
+        self.misses += 1
+        distance = ((self.current[0] - cx) ** 2 +
+                    (self.current[1] - cy) ** 2) ** 0.5
+        self.concealed = distance <= TARGET_ARRIVE_PX
+        if self.misses <= TARGET_FORGET_FRAMES:
+            return None
+
+        return self._acquire(dots, cx, cy)
+
+    def _acquire(self, dots, cx, cy):
+        self.current = nearest(dots, cx, cy)
+        self.misses = 0
+        self.concealed = False
+        if self.current is not None:
+            self.target_id += 1
+        return self.current
+
+
+class StuckWatchdog:
+    """Report a locked target that has not become meaningfully closer in time."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.target_id = None
+        self.best_distance = None
+        self.last_progress = None
+
+    def update(self, target_id, dot, cx, cy, now=None):
+        now = time.time() if now is None else now
+        distance = ((dot[0] - cx) ** 2 + (dot[1] - cy) ** 2) ** 0.5
+        if target_id != self.target_id:
+            self.target_id = target_id
+            self.best_distance = distance
+            self.last_progress = now
+            return False
+        if distance <= STUCK_MIN_DIST_PX:
+            self.best_distance = min(self.best_distance, distance)
+            self.last_progress = now
+            return False
+        if distance <= self.best_distance - STUCK_PROGRESS_PX:
+            self.best_distance = distance
+            self.last_progress = now
+        return now - self.last_progress >= STUCK_TIMEOUT_S
+
+
+class TargetBlacklist:
+    """Temporarily follow and exclude red markers found to be inaccessible."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.tracks = []
+
+    def block(self, dot, now=None):
+        now = time.time() if now is None else now
+        self.tracks.append(dict(dot=dot, until=now + TARGET_IGNORE_S))
+
+    def filter(self, dots, now=None):
+        now = time.time() if now is None else now
+        tracks = [track for track in self.tracks if now < track["until"]]
+        blocked = set()
+        for track in tracks:
+            choices = [((((dot[0] - track["dot"][0]) ** 2 +
+                           (dot[1] - track["dot"][1]) ** 2) ** 0.5), i, dot)
+                       for i, dot in enumerate(dots) if i not in blocked]
+            best = min(choices, default=None)
+            if best is not None and best[0] <= TARGET_TRACK_PX:
+                _, i, dot = best
+                track["dot"] = dot
+                blocked.add(i)
+        self.tracks = tracks
+        return [dot for i, dot in enumerate(dots) if i not in blocked]
+
+
+def pick_target(img, pet_filter=None, target_lock=None,
+                target_blacklist=None, now=None):
     """(origin, targetable dots, chosen dot) -- the whole targeting rule, once.
 
     main() and --watch both call this, so the live view cannot drift out of step
@@ -129,7 +389,17 @@ def pick_target(img):
     # or it is a fixed red UI element sitting at the centre.
     dots = [d for d in find_red_dots(img)
             if (d[0] - cx) ** 2 + (d[1] - cy) ** 2 > CONCEAL_PX ** 2]
-    return (cx, cy), dots, nearest(dots, cx, cy)
+    if pet_filter is not None:
+        # Our own marker may also be white when not in a party. It is fixed at the
+        # box centre and must not make a nearby real monster look like somebody's pet.
+        players = [p for p in find_white_players(img)
+                   if (p[0] - cx) ** 2 + (p[1] - cy) ** 2 > CONCEAL_PX ** 2]
+        pets = pet_filter.pet_indexes(dots, players)
+        dots = [d for i, d in enumerate(dots) if i not in pets]
+    if target_blacklist is not None:
+        dots = target_blacklist.filter(dots, now)
+    chosen = target_lock.pick(dots, cx, cy) if target_lock else nearest(dots, cx, cy)
+    return (cx, cy), dots, chosen
 
 
 def stick_vector(dx, dy, radius):
@@ -271,28 +541,34 @@ def main(port=None):
     win = find_window()
     pad = ArduinoPad(port) if port else VirtualPad()
     print(f"window {win.width}x{win.height} @ ({win.left},{win.top})"
-          f" via {type(pad).__name__} -- End to pause, ctrl+c to stop")
+          f" via {type(pad).__name__} -- Delete to start/stop, ctrl+c to exit")
 
     last = None  # (t, dist, sx, sy) of last seen dot
-    paused = False
+    pet_filter = PetFilter()
+    target_lock = TargetLock()
+    target_blacklist = TargetBlacklist()
+    stuck_watchdog = StuckWatchdog()
+    paused = START_PAUSED
     next_buff = 0.0   # 0 = cast once at startup, then every BUFF_PERIOD_S
     buff_queue = []   # d-pad presses left in the current cast
     next_press = 0.0  # earliest time for the next one
     next_spam = 0.0   # SPAM_BUTTON goes out on its own timer
 
-    # Once, up front: the game ignores buttons until it has seen stick motion.
-    # After this the chase keeps it awake, so the buff never has to stop to nudge.
-    wake_controller(pad)
+    pad.stick(0.0, 0.0, False)
+    print("STOPPED -- press Delete to start")
 
     with mss.mss() as sct:
         try:
             while True:
-                if end_key_hit():
-                    paused = not paused
-                    if paused:
-                        pad.stick(0.0, 0.0, False)  # drop stick and L1 while parked
-                        last = None
-                    print(f"\n{'PAUSED' if paused else 'RESUMED'} (End)")
+                if toggle_key_hit():
+                    paused = toggle_running(paused, pad, pet_filter)
+                    target_lock.reset()
+                    target_blacklist.reset()
+                    stuck_watchdog.reset()
+                    last = None
+                    buff_queue = []
+                    next_buff = next_press = next_spam = 0.0
+                    print(f"\n{'STOPPED' if paused else 'STARTED'} (Delete)")
                 if paused:
                     time.sleep(0.05)
                     continue
@@ -305,10 +581,21 @@ def main(port=None):
                 reg = minimap_region(win)
                 img = np.array(sct.grab(reg))[:, :, :3]
                 h, w = img.shape[:2]
-                (cx, cy), dots, dot = pick_target(img)
                 now = time.time()
+                (cx, cy), dots, dot = pick_target(
+                    img, pet_filter, target_lock, target_blacklist, now)
 
-                if dot is not None:
+                stuck = (dot is not None and stuck_watchdog.update(
+                    target_lock.target_id, dot, cx, cy, now))
+                if stuck:
+                    target_blacklist.block(dot, now)
+                    target_lock.reset()
+                    stuck_watchdog.reset()
+                    sx = sy = 0.0
+                    last = None
+                    state = "stuck skip"
+                    print(f"\nstuck target: ignoring for {TARGET_IGNORE_S:g}s")
+                elif dot is not None:
                     dx, dy = dot[0] - cx, dot[1] - cy
                     dist = (dx * dx + dy * dy) ** 0.5
                     sx, sy = stick_vector(dx, dy, min(w, h) / 2)
@@ -318,8 +605,8 @@ def main(port=None):
                         state = "centered"
                     else:
                         state = f"dist {dist:6.1f}"
-                elif last and last[1] < CONCEAL_PX and now - last[0] < LOST_HOLD_S:
-                    # dot vanished right under the white player arrow -> we are on it
+                elif target_lock.concealed:
+                    # The locked dot vanished near centre: stay put and attack it.
                     sx = sy = 0.0
                     state = "concealed"
                 elif last and now - last[0] < LOST_HOLD_S:
@@ -361,6 +648,84 @@ def main(port=None):
 
 def demo():
     """Self-check: synthetic minimap, no game or gamepad needed."""
+    assert SPAM_BUTTON == "y", SPAM_BUTTON
+
+    # Nearest-from-scratch oscillates when two monsters exchange which is a pixel
+    # closer. A lock must keep the original marker, then stop rather than coast
+    # through it when that marker disappears beneath the player arrow.
+    lock = TargetLock()
+    left, right = (75.0, 100.0, 8.0), (127.0, 100.0, 8.0)
+    assert lock.pick([left, right], 100.0, 100.0) == left
+    left, right = (74.0, 100.0, 8.0), (125.0, 100.0, 8.0)
+    assert nearest([left, right], 100.0, 100.0) == right
+    assert lock.pick([left, right], 100.0, 100.0) == left
+
+    lock.reset()
+    near, competitor = (122.0, 100.0, 8.0), (150.0, 100.0, 8.0)
+    assert lock.pick([near, competitor], 100.0, 100.0) == near
+    assert lock.pick([competitor], 100.0, 100.0) is None and lock.concealed
+    missing = [lock.pick([competitor], 100.0, 100.0)
+               for _ in range(TARGET_FORGET_FRAMES)]
+    assert all(dot is None for dot in missing[:-1]), missing
+    assert missing[-1] == competitor and not lock.concealed
+
+    lock.reset()
+    assert lock.pick([(60.0, 100.0, 8.0)], 100.0, 100.0)
+    assert lock.pick([], 100.0, 100.0) is None and not lock.concealed
+
+    watchdog = StuckWatchdog()
+    blocked = (60.0, 100.0, 8.0)  # 40px away and making no progress
+    assert not watchdog.update(1, blocked, 100.0, 100.0, now=0.0)
+    assert not watchdog.update(1, blocked, 100.0, 100.0,
+                               now=STUCK_TIMEOUT_S - 0.01)
+    assert watchdog.update(1, blocked, 100.0, 100.0, now=STUCK_TIMEOUT_S)
+
+    # Four pixels of cumulative progress restarts the timeout.
+    watchdog.reset()
+    assert not watchdog.update(2, (50.0, 100.0, 8.0), 100.0, 100.0, now=0.0)
+    assert not watchdog.update(2, (55.0, 100.0, 8.0), 100.0, 100.0, now=2.9)
+    assert not watchdog.update(2, (55.0, 100.0, 8.0), 100.0, 100.0, now=5.8)
+    assert watchdog.update(2, (55.0, 100.0, 8.0), 100.0, 100.0, now=5.9)
+    watchdog.reset()
+    assert not watchdog.update(3, (130.0, 100.0, 8.0),
+                               100.0, 100.0, now=99.0)  # near targets never time out
+
+    blacklist = TargetBlacklist()
+    other = (150.0, 100.0, 8.0)
+    blacklist.block(blocked, now=0.0)
+    assert blacklist.filter([blocked, other], now=0.0) == [other]
+    moved_blocked = (65.0, 100.0, 8.0)
+    assert blacklist.filter([moved_blocked, other], now=1.0) == [other]
+    assert blacklist.filter([moved_blocked, other],
+                            now=TARGET_IGNORE_S + 0.01) == [moved_blocked, other]
+
+    assert TOGGLE_VK == 0x2E and START_PAUSED
+    polled = []
+    assert toggle_key_hit(lambda vk: polled.append(vk) or 1)
+    assert polled == [0x2E]
+
+    class TogglePad:
+        def __init__(self):
+            self.calls = []
+
+        def stick(self, sx, sy, attack):
+            self.calls.append((sx, sy, attack))
+
+    class TogglePets:
+        def __init__(self):
+            self.resets = 0
+
+        def reset(self):
+            self.resets += 1
+
+    toggle_pad, toggle_pets = TogglePad(), TogglePets()
+    paused = toggle_running(True, toggle_pad, toggle_pets,
+                            wake=lambda pad: pad.calls.append("wake"))
+    assert not paused and toggle_pad.calls == [(0.0, 0.0, False), "wake"]
+    paused = toggle_running(paused, toggle_pad, toggle_pets,
+                            wake=lambda pad: pad.calls.append("wake"))
+    assert paused and toggle_pad.calls[-1] == (0.0, 0.0, False)
+    assert toggle_pad.calls.count("wake") == 1 and toggle_pets.resets == 2
     img = np.zeros((200, 200, 3), np.uint8)
     cv2.circle(img, (150, 60), 4, (0, 0, 255), -1)   # far, up-right
     cv2.circle(img, (120, 100), 4, (0, 0, 255), -1)  # near, right
@@ -391,6 +756,28 @@ def demo():
     assert abs(chosen[0] - 120) < 3 and abs(chosen[1] - 100) < 3, chosen
     assert len(targetable) == len(dots), (targetable, dots)  # only the new one went
 
+    # Another player's pet uses the same red dot as a monster, but stays beside
+    # that player's small white dot. Confirm the pair over several frames so a
+    # monster merely crossing a player is not discarded immediately.
+    pet_img = np.zeros((200, 200, 3), np.uint8)
+    cv2.circle(pet_img, (50, 80), 4, (255, 255, 255), -1)  # other player
+    cv2.circle(pet_img, (62, 80), 4, (0, 0, 255), -1)      # their pet
+    cv2.circle(pet_img, (150, 80), 4, (0, 0, 255), -1)     # real monster
+    assert len(find_white_players(pet_img)) == 1
+    pets = PetFilter()
+    for _ in range(PET_CONFIRM_FRAMES - 1):
+        _, before, chosen = pick_target(pet_img, pets)
+        assert len(before) == 2 and chosen[0] < 100, (before, chosen)
+    _, after, chosen = pick_target(pet_img, pets)
+    assert len(after) == 1 and chosen[0] > 100, (after, chosen)
+
+    far_pet_img = np.zeros((200, 200, 3), np.uint8)
+    cv2.circle(far_pet_img, (50, 80), 4, (255, 255, 255), -1)
+    cv2.circle(far_pet_img, (80, 80), 4, (0, 0, 255), -1)   # pet moved 30px away
+    cv2.circle(far_pet_img, (150, 80), 4, (0, 0, 255), -1)
+    _, far_after, chosen = pick_target(far_pet_img, pets)
+    assert len(far_after) == 1 and chosen[0] > 100, (far_after, chosen)
+
     sx, sy = stick_vector(x - 100, y - 100, 100)
     assert sx > 0.95 and abs(sy) < 0.05, (sx, sy)      # push right, full tilt
     sx, sy = stick_vector(0, -50, 100)
@@ -419,7 +806,7 @@ def demo():
                     b"V4\n", b"V-1\n", b"V2\n", b"V-1\n"], sent
 
     sent.clear()
-    pad.tap_button(SPAM_BUTTON)   # by name
+    pad.tap_button("y")           # by name
     pad.tap_button(3)             # same button by index
     assert sent == [b"B3\n", b"B3\n"], sent
 
@@ -448,22 +835,24 @@ def snap(path="minimap_snap.png"):
     print(f"{w}x{h} region -> {path}")
 
 
-def draw_tracking(img):
+def draw_tracking(img, pet_filter=None, target_lock=None):
     """Annotate a minimap grab in place with what the bot would do. Returns a label.
 
-    green = targetable, red = ignored under the arrow, cyan = the chosen target,
-    magenta arrow = the stick vector that would be sent.
+    green = targetable, orange = confirmed pet, red = ignored under the arrow,
+    cyan = chosen target, magenta arrow = the stick vector that would be sent.
     """
-    (cx, cy), dots, dot = pick_target(img)
+    (cx, cy), dots, dot = pick_target(img, pet_filter, target_lock)
     ipx = (int(cx), int(cy))
     for x, y, _ in find_red_dots(img):
         hidden = (x - cx) ** 2 + (y - cy) ** 2 <= CONCEAL_PX ** 2
-        cv2.circle(img, (int(x), int(y)), 7,
-                   (0, 0, 255) if hidden else (0, 255, 0), 1)
+        kept = any((x - d[0]) ** 2 + (y - d[1]) ** 2 < 1 for d in dots)
+        colour = (0, 0, 255) if hidden else ((0, 255, 0) if kept else (0, 165, 255))
+        cv2.circle(img, (int(x), int(y)), 7, colour, 1)
     cv2.circle(img, ipx, CONCEAL_PX, (255, 255, 0), 1)
     cv2.drawMarker(img, ipx, (255, 255, 0), cv2.MARKER_CROSS, 12, 1)
     if dot is None:
-        return f"{len(dots)} dots  no target"
+        state = "target concealed" if target_lock and target_lock.concealed else "no target"
+        return f"{len(dots)} dots  {state}"
     tgt = (int(dot[0]), int(dot[1]))
     cv2.line(img, ipx, tgt, (0, 255, 255), 1)
     cv2.circle(img, tgt, 10, (0, 255, 255), 2)
@@ -483,12 +872,14 @@ def watch(scale=2):
     import mss
     win = find_window()
     title = "spiritvale tracking -- q to quit"
+    pet_filter = PetFilter()
+    target_lock = TargetLock()
     print(f"watching {minimap_region(win)}  (q or ESC in the window to quit)")
     last, fps = time.time(), 0.0
     with mss.mss() as sct:
         while True:
             img = np.array(sct.grab(minimap_region(win)))[:, :, :3].copy()
-            label = draw_tracking(img)
+            label = draw_tracking(img, pet_filter, target_lock)
             view = cv2.resize(img, None, fx=scale, fy=scale,
                               interpolation=cv2.INTER_NEAREST)
             now = time.time()
