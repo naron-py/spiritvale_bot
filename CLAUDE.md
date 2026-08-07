@@ -75,6 +75,15 @@ adjusting them over adding code paths.
   and strictly more reliable. `find_white_players()` is the opposite job and is
   fine — it looks for *other* players to pair pets with, and excludes anything
   within `CONCEAL_PX` of the centre precisely so our own marker cannot qualify.
+- **Do not drop the concealed dots before `TargetLock` sees them.** `pick_target`
+  splits red blobs into `dots` (targetable) and `near` (inside `CONCEAL_PX`) and
+  hands both to the lock. `near` is what tells "still hitting a live monster"
+  apart from "it died" — the two are indistinguishable otherwise, and the code
+  used to guess with a 0.5s timer that was wrong both ways: idle after a fast
+  kill, and walking off mid-fight on a slow one. Measured live, dots inside the
+  conceal radius are still rendered (22 sightings at 10-20px over 40 frames), so
+  the signal is real. `ENGAGE_MAX_S` is only a guard against a fixed red UI
+  element at the centre; it is not the normal way a fight ends.
 - **The white player dot only renders in about half the frames.** Anything keyed
   on it needs memory across frames, which is why `PetFilter` confirms a pair and
   then tracks the pet by its own red marker. Do not "simplify" it to a plain

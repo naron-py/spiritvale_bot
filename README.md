@@ -6,8 +6,8 @@ a spam button on a fast timer, and recasts a d-pad buff sequence on a slow one.
 Everything runs while the chase continues — the bot never stands still to cast.
 
 It keeps hold of one target rather than re-picking the nearest every frame, skips
-other players' pets, and gives up on a monster it cannot reach instead of walking
-into a wall forever.
+other players' pets, stays on a monster until it is actually dead, and gives up on
+one it cannot reach instead of walking into a wall forever.
 
 All tuning lives in one constant block at the top of `minimap_bot.py`:
 `SPAM_BUTTON` / `SPAM_PERIOD_S` for the spammed button (`None` disables it),
@@ -101,6 +101,13 @@ mis-centred box biases every heading the bot takes.
   like a broken bot and is not one.
 - Stick tilt is direction-only at full magnitude. Scaling tilt by minimap pixel
   distance made every approach a crawl the game's own deadzone swallowed.
+- **"Am I still fighting?" is answered by the picture, not a timer.** Walking onto
+  a monster pushes its dot inside `CONCEAL_PX`, where it stops being a target — so
+  a dead monster and one you are standing on look identical unless you keep those
+  dots. `pick_target` hands them to `TargetLock` as `near`: still there means keep
+  hitting, gone means take the next target immediately. The old fixed 0.5s window
+  was wrong both ways, idling after a fast kill and walking off mid-fight on a slow
+  one. Post-kill delay is now 0.15s, and a long fight is never abandoned.
 - **Pets share the monster colour — they are told apart by who they stand next to.**
   Another player's pet is the same red dot as a monster, so it is paired with that
   player's small white dot instead. Two things make this survivable: a pair must
