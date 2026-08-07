@@ -63,7 +63,7 @@ PET_RELEASE_PX = 24      # hysteresis: do not flicker at the entry threshold
 PET_CONFIRM_FRAMES = 3   # a monster crossing a player for one frame stays targetable
 PET_TRACK_STEP_PX = 20   # maximum marker movement between 20Hz captures
 PET_FORGET_FRAMES = 40   # remember a vanished confirmed pet for about two seconds
-TOGGLE_VK = 0x2E         # Delete, polled globally through GetAsyncKeyState
+TOGGLE_VK = 0x23         # End, polled globally through GetAsyncKeyState
 START_PAUSED = True      # launching the script must never move the character
 LOOP_HZ = 20
 
@@ -80,7 +80,7 @@ def wake_controller(pad):
 
 
 def toggle_key_hit(get_state=None):
-    """True once per physical Delete press, even when another window has focus.
+    """True once per physical End press, even when another window has focus.
 
     GetAsyncKeyState's low bit means 'pressed since the last call', so polling it
     is already edge-detected -- no key hook, no extra dependency.
@@ -541,7 +541,7 @@ def main(port=None):
     win = find_window()
     pad = ArduinoPad(port) if port else VirtualPad()
     print(f"window {win.width}x{win.height} @ ({win.left},{win.top})"
-          f" via {type(pad).__name__} -- Delete to start/stop, ctrl+c to exit")
+          f" via {type(pad).__name__} -- End to start/stop, ctrl+c to exit")
 
     last = None  # (t, dist, sx, sy) of last seen dot
     pet_filter = PetFilter()
@@ -555,7 +555,7 @@ def main(port=None):
     next_spam = 0.0   # SPAM_BUTTON goes out on its own timer
 
     pad.stick(0.0, 0.0, False)
-    print("STOPPED -- press Delete to start")
+    print("STOPPED -- press End to start")
 
     with mss.mss() as sct:
         try:
@@ -568,7 +568,7 @@ def main(port=None):
                     last = None
                     buff_queue = []
                     next_buff = next_press = next_spam = 0.0
-                    print(f"\n{'STOPPED' if paused else 'STARTED'} (Delete)")
+                    print(f"\n{'STOPPED' if paused else 'STARTED'} (End)")
                 if paused:
                     time.sleep(0.05)
                     continue
@@ -699,10 +699,10 @@ def demo():
     assert blacklist.filter([moved_blocked, other],
                             now=TARGET_IGNORE_S + 0.01) == [moved_blocked, other]
 
-    assert TOGGLE_VK == 0x2E and START_PAUSED
+    assert TOGGLE_VK == 0x23 and START_PAUSED
     polled = []
     assert toggle_key_hit(lambda vk: polled.append(vk) or 1)
-    assert polled == [0x2E]
+    assert polled == [0x23]
 
     class TogglePad:
         def __init__(self):

@@ -80,7 +80,7 @@ adjusting them over adding code paths.
   then tracks the pet by its own red marker. Do not "simplify" it to a plain
   distance test — the pet reappears as a target every other frame if you do.
 - **`START_PAUSED` must stay true.** Launching the script has to be safe; the bot
-  waits for `Delete` (`TOGGLE_VK`) before it touches the stick.
+  waits for `End` (`TOGGLE_VK`) before it touches the stick.
 - `ArduinoPad.stick` deduplicates against `self.last` because the sketch is
   synchronous (every command blocks on an `OK` reply). Keep it.
 

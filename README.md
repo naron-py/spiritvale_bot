@@ -32,7 +32,7 @@ python minimap_bot.py                    # virtual X360 pad (this is the one tha
 python minimap_bot.py --port auto        # Arduino Leonardo over serial instead
 ```
 
-**It starts stopped.** **Delete** toggles running, from any window. Ctrl+C exits and
+**It starts stopped.** **End** toggles running, from any window. Ctrl+C exits and
 centres the stick. Launching the script never moves your character on its own.
 
 Watch what it is tracking, live, in a second terminal:
