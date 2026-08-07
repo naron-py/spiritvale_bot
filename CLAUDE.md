@@ -65,6 +65,11 @@ adjusting them over adding code paths.
   eats the leading d-pad press.
 - **Red blobs within `CONCEAL_PX` of the box centre are never targets** — that is
   either "arrived" or a fixed red UI element, and chasing it freezes the bot.
+- **Boss detection is template matching against `boss_icon.png`, and must stay
+  that way.** Colour and size were both tried and both failed: the skull is
+  bone/cream, indistinguishable from desert terrain, which scored area 5539
+  against the icon's 443. A missing template file disables the check rather than
+  crashing. Recut it from a live minimap grab if the game rescales its UI.
 - **Do not reintroduce marker detection.** Finding the character as the nearest
   white blob failed two ways: the marker turns blue in a party, and in a crowd the
   nearest white blob belongs to another player. The centre is both simpler and
