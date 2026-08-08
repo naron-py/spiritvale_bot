@@ -398,6 +398,63 @@ def find_position(walk, stand, min_move=0.5, max_move=500.0, verbose=True):
         return sorted(final)
 
 
+def verify(mem, addrs, push, min_move=0.3, max_move=100.0, max_dy=2.0,
+           balance=0.35, verbose=True):
+    """Keep addresses that move opposite ways when walked opposite ways.
+
+    `push(sx, sy, seconds)` drives the stick. With the camera fixed, a real
+    position must go one way for east and the other way for west -- an anti-
+    correlation nothing incidental survives. Distance alone cannot do this: it
+    passes anything that merely changes while walking.
+    """
+    def sample():
+        out = {}
+        for a in addrs:
+            blob = mem.read(a, 12)
+            if blob:
+                t = struct.unpack("<fff", blob)
+                if looks_like_place(t):
+                    out[a] = t
+        return out
+
+    if verbose:
+        print(f"  verifying {len(addrs):,} candidates against opposite walks")
+    before_e = sample()
+    push(1.0, 0.0, 1.5)
+    after_e = sample()
+    before_w = sample()
+    push(-1.0, 0.0, 1.5)
+    after_w = sample()
+
+    kept = []
+    for a in addrs:
+        if not all(a in s for s in (before_e, after_e, before_w, after_w)):
+            continue
+        ex = after_e[a][0] - before_e[a][0]
+        ez = after_e[a][2] - before_e[a][2]
+        wx = after_w[a][0] - before_w[a][0]
+        wz = after_w[a][2] - before_w[a][2]
+        east = (ex * ex + ez * ez) ** 0.5
+        west = (wx * wx + wz * wz) ** 0.5
+        if not (min_move <= east <= max_move and min_move <= west <= max_move):
+            continue
+        # opposite input, opposite travel: the dot product must be negative
+        if ex * wx + ez * wz >= 0:
+            continue
+        # same duration at the same speed, so the two legs must be comparable.
+        # Without this the list fills with values that swing wildly both ways.
+        if abs(east - west) / max(east, west) > balance:
+            continue
+        # walking is horizontal; the ground does not rise and fall underneath
+        if (abs(after_e[a][1] - before_e[a][1]) > max_dy or
+                abs(after_w[a][1] - before_w[a][1]) > max_dy):
+            continue
+        kept.append((a, after_w[a], east, west))
+    if verbose:
+        print(f"  {len(kept):,} moved opposite ways, evenly, on level ground")
+    return kept
+
+
 def survey():
     """How much memory is worth scanning, and is it readable at all."""
     pid = find_pid()
@@ -453,21 +510,43 @@ def findpos():
     if not hits:
         print("\nno candidates -- see which step emptied out above")
         return
-    print(f"\n{len(hits)} candidates (address, position, distance walked):")
-    for addr, (x, y, z), dist in hits[:25]:
-        print(f"  0x{addr:012X}  x={x:9.2f} y={y:8.2f} z={z:9.2f}  moved {dist:6.2f}")
-    if len(hits) > 25:
-        print(f"  ... and {len(hits) - 25} more")
-    print("\nre-read live, to see which ones track the character:")
-    import time
-    with Mem() as mem:
-        for addr, _, _ in hits[:8]:
-            blob = mem.read(addr, 12)
-            first = struct.unpack("<fff", blob) if blob else None
-            time.sleep(0.4)
-            blob = mem.read(addr, 12)
-            second = struct.unpack("<fff", blob) if blob else None
-            print(f"  0x{addr:012X}  {first}  ->  {second}")
+    print(f"\n{len(hits):,} candidates survived the walk/stand/walk filter")
+
+    def push(sx, sy, seconds):
+        bot.wake_controller(pad)
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            pad.stick(sx, sy, False)
+            time.sleep(0.05)
+        pad.stick(0.0, 0.0, False)
+        time.sleep(0.3)
+
+    pad = bot.VirtualPad()
+    try:
+        with Mem() as mem:
+            good = verify(mem, [a for a, _, _ in hits], push)
+            if not good:
+                print("\nnothing tracked the character both ways")
+                return
+            # the best candidate is the most balanced pair of legs, not the
+            # biggest -- sorting by size just surfaces the wildest values
+            good.sort(key=lambda r: abs(r[2] - r[3]) / max(r[2], r[3]))
+            print(f"\nbest {min(len(good), 15)} (address, position, east, west):")
+            for addr, (x, y, z), e, w in good[:15]:
+                print(f"  0x{addr:012X}  x={x:9.2f} y={y:8.2f} z={z:9.2f}"
+                      f"   east {e:6.2f}  west {w:6.2f}")
+            print("\nlive read of the top few, walking north:")
+            top = [r[0] for r in good[:5]]
+            first = {a: mem.read(a, 12) for a in top}
+            push(0.0, 1.0, 1.5)
+            for a in top:
+                b0, b1 = first[a], mem.read(a, 12)
+                if b0 and b1:
+                    p, q = struct.unpack("<fff", b0), struct.unpack("<fff", b1)
+                    d = tuple(round(q[i] - p[i], 2) for i in range(3))
+                    print(f"  0x{a:012X}  {tuple(round(v, 1) for v in q)}  delta {d}")
+    finally:
+        pad.close()
 
 
 def demo():
@@ -519,6 +598,22 @@ def demo():
     # a region that appeared or resized between passes is skipped, not crashed on
     assert changed_pages({}, now) == []
     assert changed_pages({0x1000: np.array([1], dtype=np.uint64)}, now) == []
+
+    # verify(): a position reverses when the stick reverses; a drifting float
+    # does not. sample() runs four times -- before/after east, before/after west.
+    seq = {0x10: [10.0, 15.0, 15.0, 10.0],   # walks east, walks back west
+           0x20: [10.0, 15.0, 15.0, 20.0]}   # keeps drifting east regardless
+    calls = {"n": 0}
+
+    class FakeMem:
+        def read(self, addr, size):
+            phase = min(calls["n"] // len(seq), 3)
+            calls["n"] += 1
+            return struct.pack("<fff", seq[addr][phase], 3.0, 7.0)
+
+    kept = [a for a, *_ in verify(FakeMem(), [0x10, 0x20], lambda *a: None,
+                                  verbose=False)]
+    assert kept == [0x10], kept
 
     print("demo ok")
 
