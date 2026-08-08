@@ -72,10 +72,14 @@ RECONNECT = True          # False disables the whole thing, clicks included
 RECONNECT_POLL_S = 2.0    # how often to look for a login screen while running
 RECONNECT_SETTLE_S = 1.5  # wait after each click; these screens animate
 UI_BLUE = ((95, 90, 150), (112, 255, 255))    # the game's button blue, in HSV
-OK_BTN = (0.500, 0.144)       # "Ok" on the disconnected modal
-SEA_ROW = (0.500, 0.4755)     # "Southeast Asia (SEA)" row in the server table
-CONNECT_BTN = (0.500, 0.915)  # "Connect" under the server table
-PLAY_BTN = (0.500, 0.948)     # "Play Character" on the character screen
+# (x, y, width) fractions. Width matters: Connect and Play sit only 0.033 apart
+# vertically, close enough that either matches the other on position alone -- the
+# first live test read the character screen as the server screen for exactly that
+# reason. Their widths are nearly 2x apart, so size is what separates them.
+OK_BTN = (0.500, 0.144, 0.073)       # "Ok" on the disconnected modal
+SEA_ROW = (0.500, 0.4755, 0.264)     # "Southeast Asia (SEA)" row, a highlight
+CONNECT_BTN = (0.500, 0.915, 0.081)  # "Connect" under the server table
+PLAY_BTN = (0.500, 0.948, 0.147)     # "Play Character" on the character screen
 # Dark modal body, sampled either side of the message text. Well clear of the Ok
 # button, which spans x 0.464-0.536: probing right beside its edge left 0.004 of
 # margin, which is no margin at all.
@@ -141,23 +145,25 @@ def window_region(win):
     return dict(left=win.left, top=win.top, width=win.width, height=win.height)
 
 
-def find_blue_button(img, frac, tol=0.06):
-    """Centre (x, y) of the blue UI button sitting near `frac`, or None.
+def find_blue_button(img, btn, tol=0.03, wtol=0.35):
+    """Centre (x, y) of the blue UI button matching `btn` = (fx, fy, wfrac), or None.
 
-    Looks for the button rather than sampling a pixel: the sky is blue too, and a
-    fixed probe point on the login modal lands on it during normal play.
+    Matches on size as well as position. Looking for the button at all, rather
+    than sampling a pixel, is what keeps the blue sky and the blue skill icons out
+    of it; matching its width is what keeps Connect and Play Character apart.
     """
     h, w = img.shape[:2]
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, UI_BLUE[0], UI_BLUE[1])
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    wx, wy = w * frac[0], h * frac[1]
+    wx, wy, want = w * btn[0], h * btn[1], w * btn[2]
     for c in cnts:
         if cv2.contourArea(c) < w * h * 1e-3:  # skip small blue icons and text
             continue
         x, y, bw, bh = cv2.boundingRect(c)
         cx, cy = x + bw / 2, y + bh / 2
-        if abs(cx - wx) <= w * tol and abs(cy - wy) <= h * tol:
+        if (abs(cx - wx) <= w * tol and abs(cy - wy) <= h * tol and
+                abs(bw - want) <= want * wtol):
             return int(cx), int(cy)
     return None
 
@@ -963,11 +969,10 @@ def demo():
 
     # Login screens. Built at an odd size on purpose: every coordinate is a
     # fraction, so the flow must work at a resolution nobody measured.
-    def blue(img, frac):
+    def blue(img, btn):
         h, w = img.shape[:2]
-        # the real Ok button measures 0.072 x 0.036 of the client area
-        bw, bh = int(w * 0.072), int(h * 0.036)
-        x, y = int(w * frac[0]), int(h * frac[1])
+        bw, bh = int(w * btn[2]), int(h * 0.036)   # each button at its real width
+        x, y = int(w * btn[0]), int(h * btn[1])
         cv2.rectangle(img, (x - bw // 2, y - bh // 2), (x + bw // 2, y + bh // 2),
                       (232, 168, 79), -1)          # the game's button blue
 
@@ -992,8 +997,13 @@ def demo():
 
     chars = np.zeros((432, 768, 3), np.uint8)
     chars[:] = (53, 36, 28)                        # the dark character backdrop
+    cv2.circle(chars, (int(768 * 0.42), int(432 * 0.60)), 40, (250, 250, 250), -1)
     blue(chars, PLAY_BTN)
-    assert login_screen(chars) == "character"
+    # Regression, found the hard way on a live disconnect: Connect and Play sit
+    # 0.033 apart vertically, and the character's own bright armour can sit under
+    # the white-panel probe, so this screen read as "server" and the flow stalled.
+    assert login_screen(chars) == "character", "Play must not be taken for Connect"
+    assert find_blue_button(chars, CONNECT_BTN) is None, "widths must separate them"
 
     # The clicks themselves: right buttons, right order, window offset applied.
     class FakeWin:
