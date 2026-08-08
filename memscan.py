@@ -10,6 +10,8 @@ deps: none beyond the stdlib. ctypes talks to the Win32 API directly.
 
 usage:
   python memscan.py --survey     # how much scannable memory the game has
+  python memscan.py --findpos    # hunt for the player position by walking
+  python memscan.py --pos        # live position, once POSITION_CHAIN is set
   python memscan.py --demo       # offline self-check, no game needed
 """
 import ctypes
@@ -455,6 +457,100 @@ def verify(mem, addrs, push, min_move=0.3, max_move=100.0, max_dy=2.0,
     return kept
 
 
+# Fill these in from Cheat Engine once a pointer scan settles on a stable path.
+# "GameAssembly.dll" + 0x1234AB, then offsets walked one pointer at a time; the
+# last offset is added without a dereference, so it lands on the x float itself.
+POSITION_CHAIN = dict(module=None, base=0x0, offsets=())
+
+
+def module_base(pid, name):
+    """Load address of a module in the target process, or None."""
+    TH32CS_SNAPMODULE = 0x08
+    TH32CS_SNAPMODULE32 = 0x10
+
+    class MODULEENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("th32ModuleID", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("GlblcntUsage", wintypes.DWORD),
+                    ("ProccntUsage", wintypes.DWORD),
+                    ("modBaseAddr", ctypes.POINTER(ctypes.c_byte)),
+                    ("modBaseSize", wintypes.DWORD),
+                    ("hModule", wintypes.HMODULE),
+                    ("szModule", ctypes.c_wchar * 256),
+                    ("szExePath", ctypes.c_wchar * 260)]
+
+    k32 = ctypes.windll.kernel32
+    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+                                        pid)
+    if snap == -1:
+        return None
+    entry = MODULEENTRY32W()
+    entry.dwSize = ctypes.sizeof(MODULEENTRY32W)
+    try:
+        ok = k32.Module32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            if entry.szModule.lower() == name.lower():
+                return ctypes.cast(entry.modBaseAddr, ctypes.c_void_p).value
+            ok = k32.Module32NextW(snap, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snap)
+    return None
+
+
+def resolve(mem, start, offsets):
+    """Follow a Cheat Engine pointer chain to a final address, or None.
+
+    Every offset but the last is a dereference; the last is added plainly, which
+    is what CE means by "base + offsets" -- it stops on the field, not through it.
+    """
+    addr = start
+    for off in offsets[:-1] if offsets else []:
+        blob = mem.read(addr + off, 8)
+        if not blob:
+            return None
+        addr = struct.unpack("<Q", blob)[0]
+        if not addr:
+            return None
+    return addr + (offsets[-1] if offsets else 0)
+
+
+def read_vec3(mem, addr):
+    blob = mem.read(addr, 12)
+    return struct.unpack("<fff", blob) if blob else None
+
+
+def player_position(mem, chain=None):
+    """Live (x, y, z) from POSITION_CHAIN, or None if it is not configured yet."""
+    chain = chain or POSITION_CHAIN
+    if not chain.get("module"):
+        return None
+    base = module_base(mem.pid, chain["module"])
+    if base is None:
+        return None
+    addr = resolve(mem, base + chain["base"], chain["offsets"])
+    return read_vec3(mem, addr) if addr else None
+
+
+def watch_position():
+    """Print the player's position as it changes. Needs POSITION_CHAIN filled in."""
+    import time
+    if not POSITION_CHAIN.get("module"):
+        print("POSITION_CHAIN is empty -- find the address in Cheat Engine first,\n"
+              "then set module/base/offsets at the top of this file.")
+        return
+    with Mem() as mem:
+        last = None
+        for _ in range(200):
+            p = player_position(mem)
+            if p is None:
+                print("chain did not resolve -- the game may have restarted")
+                return
+            if last is None or max(abs(p[i] - last[i]) for i in range(3)) > 0.01:
+                print(f"  x={p[0]:9.2f}  y={p[1]:8.2f}  z={p[2]:9.2f}")
+                last = p
+            time.sleep(0.1)
+
+
 def survey():
     """How much memory is worth scanning, and is it readable at all."""
     pid = find_pid()
@@ -615,6 +711,24 @@ def demo():
                                   verbose=False)]
     assert kept == [0x10], kept
 
+    # pointer chain: every offset but the last dereferences, the last does not
+    heap = {0x1000: struct.pack("<Q", 0x2000),      # base+0x00 -> 0x2000
+            0x2030: struct.pack("<Q", 0x3000)}      # 0x2000+0x30 -> 0x3000
+
+    class ChainMem:
+        pid = 0
+
+        def read(self, addr, size):
+            if size == 8:
+                return heap.get(addr)
+            return struct.pack("<fff", 1.5, 2.5, 3.5) if addr == 0x3018 else None
+
+    cm = ChainMem()
+    assert resolve(cm, 0x1000, (0x00, 0x30, 0x18)) == 0x3018
+    assert read_vec3(cm, resolve(cm, 0x1000, (0x00, 0x30, 0x18))) == (1.5, 2.5, 3.5)
+    assert resolve(cm, 0x1000, ()) == 0x1000          # no offsets is the base
+    assert resolve(cm, 0x9999, (0x00, 0x10)) is None  # unreadable link gives up
+
     print("demo ok")
 
 
@@ -625,5 +739,7 @@ if __name__ == "__main__":
         survey()
     elif "--findpos" in sys.argv:
         findpos()
+    elif "--pos" in sys.argv:
+        watch_position()
     else:
         print(__doc__)
