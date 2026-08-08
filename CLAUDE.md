@@ -75,15 +75,17 @@ adjusting them over adding code paths.
   and strictly more reliable. `find_white_players()` is the opposite job and is
   fine — it looks for *other* players to pair pets with, and excludes anything
   within `CONCEAL_PX` of the centre precisely so our own marker cannot qualify.
-- **Do not drop the concealed dots before `TargetLock` sees them.** `pick_target`
-  splits red blobs into `dots` (targetable) and `near` (inside `CONCEAL_PX`) and
-  hands both to the lock. `near` is what tells "still hitting a live monster"
-  apart from "it died" — the two are indistinguishable otherwise, and the code
-  used to guess with a 0.5s timer that was wrong both ways: idle after a fast
-  kill, and walking off mid-fight on a slow one. Measured live, dots inside the
-  conceal radius are still rendered (22 sightings at 10-20px over 40 frames), so
-  the signal is real. `ENGAGE_MAX_S` is only a guard against a fixed red UI
-  element at the centre; it is not the normal way a fight ends.
+- **The bot never stands still waiting for a kill to finish, and cannot be made
+  to.** Standing on a monster hides its dot inside `CONCEAL_PX`, which is
+  indistinguishable from the monster dying — *our own pet follows the character
+  and sits in that radius permanently*, so every "is something still under me"
+  test answers yes forever. Two attempts failed here: a fixed 0.5s timer, then
+  keeping the concealed dots and checking them (which parked the bot for a full
+  6s after every kill, the pet being all it ever found). Attack is held
+  continuously anyway, so walking straight to the next target keeps hitting.
+  `TARGET_FLICKER_FRAMES` covers point-blank occlusion and nothing more — total
+  gap after a kill is 0.15s. Do not reintroduce an engagement state without
+  first solving own-pet identification.
 - **The white player dot only renders in about half the frames.** Anything keyed
   on it needs memory across frames, which is why `PetFilter` confirms a pair and
   then tracks the pet by its own red marker. Do not "simplify" it to a plain

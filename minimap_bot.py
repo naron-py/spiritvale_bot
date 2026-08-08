@@ -29,7 +29,6 @@ LOST_HOLD_S = 1.0        # keep last heading this long after a dot vanishes
 TARGET_TRACK_PX = 20     # same marker can move this far between 20Hz captures
 TARGET_ARRIVE_PX = 28    # near-centre disappearance means stop and attack, not coast
 TARGET_FLICKER_FRAMES = 2  # tolerate this much point-blank occlusion, no more
-ENGAGE_MAX_S = 6.0       # cap on standing and hitting one spot, see TargetLock
 STUCK_TIMEOUT_S = 3.0    # no meaningful approach this long = inaccessible target
 STUCK_PROGRESS_PX = 4    # cumulative distance gain that restarts the timeout
 STUCK_MIN_DIST_PX = 35   # never abandon a target already within attack approach range
@@ -432,11 +431,12 @@ def nearest(dots, cx, cy):
 class TargetLock:
     """Keep one red marker until it is genuinely lost instead of switching nearest.
 
-    A target that vanishes has either died or is simply standing under our own
-    marker, where pick_target stops treating it as a target. Those two look
-    identical to a timer, so this asks the picture instead: `near` holds the dots
-    inside CONCEAL_PX, and while one of them is there the monster is alive and
-    worth hitting. Empty means it is gone and the next target is due immediately.
+    The bot never stands still waiting for a kill to finish. Standing on a monster
+    hides its dot inside CONCEAL_PX, and there is no way to tell that from the
+    monster having died: our own pet follows the character and sits in that same
+    radius permanently, so any "is something still under me" test says yes forever.
+    Waiting on it parked the bot for seconds after every kill. Attack is held
+    continuously anyway, so walking straight to the next target keeps hitting.
     """
 
     def __init__(self):
@@ -447,10 +447,8 @@ class TargetLock:
         self.current = None
         self.misses = 0
         self.concealed = False
-        self.engaged_since = None
 
-    def pick(self, dots, cx, cy, near=(), now=None):
-        now = time.time() if now is None else now
+    def pick(self, dots, cx, cy):
         self.concealed = False
         if self.current is None:
             return self._acquire(dots, cx, cy)
@@ -462,29 +460,15 @@ class TargetLock:
             if step <= TARGET_TRACK_PX:
                 self.current = dot
                 self.misses = 0
-                self.engaged_since = None
                 return dot
 
-        distance = ((self.current[0] - cx) ** 2 +
-                    (self.current[1] - cy) ** 2) ** 0.5
-        if near and distance <= TARGET_ARRIVE_PX:
-            # Standing on it with something red still underneath: keep hitting,
-            # however long it takes. ENGAGE_MAX_S is only a guard against a fixed
-            # red UI element at the centre, which would otherwise hold us forever.
-            if self.engaged_since is None:
-                self.engaged_since = now
-            if now - self.engaged_since < ENGAGE_MAX_S:
-                self.concealed = True
-                self.misses = 0
-                return None
-        else:
-            self.engaged_since = None
-            self.misses += 1
-            # Nothing underneath, so it died or truly vanished. Only point-blank
-            # occlusion is worth waiting out, and that lasts a frame or two.
-            if self.misses <= TARGET_FLICKER_FRAMES:
-                self.concealed = distance <= TARGET_ARRIVE_PX
-                return None
+        self.misses += 1
+        # Only point-blank occlusion is worth waiting out, and that lasts a frame
+        # or two. Anything longer is a pause the bot cannot justify.
+        if self.misses <= TARGET_FLICKER_FRAMES:
+            self.concealed = ((self.current[0] - cx) ** 2 +
+                              (self.current[1] - cy) ** 2) ** 0.5 <= TARGET_ARRIVE_PX
+            return None
 
         return self._acquire(dots, cx, cy)
 
@@ -492,7 +476,6 @@ class TargetLock:
         self.current = nearest(dots, cx, cy)
         self.misses = 0
         self.concealed = False
-        self.engaged_since = None
         if self.current is not None:
             self.target_id += 1
         return self.current
@@ -569,10 +552,10 @@ def pick_target(img, pet_filter=None, target_lock=None,
     # centre IS the player. Detecting the marker instead was fragile: it turns blue
     # in a party, and in a crowd the nearest white blob is somebody else's dot.
     cx, cy = w / 2, h / 2
-    # Blobs under the player marker are never a target: either we already arrived,
-    # or it is a fixed red UI element sitting at the centre. They are kept in
-    # `near` rather than dropped -- their presence is how TargetLock knows the
-    # monster it is standing on is still alive, instead of guessing with a timer.
+    # Blobs under the player marker are never a target: we have arrived, or it is
+    # our own pet, or a fixed red UI element at the centre. Keeping them to detect
+    # "still fighting" was tried and reverted -- our pet never leaves that radius,
+    # so it read as an endless fight and stalled the bot after every kill.
     red = find_red_dots(img)
     if pet_filter is not None:
         # Our own marker may also be white when not in a party. It is fixed at the
@@ -583,14 +566,11 @@ def pick_target(img, pet_filter=None, target_lock=None,
         # would double-step every confirmation counter.
         pets = pet_filter.pet_indexes(red, players)
         red = [d for i, d in enumerate(red) if i not in pets]
-    dots, near = [], []
-    for d in red:
-        far = (d[0] - cx) ** 2 + (d[1] - cy) ** 2 > CONCEAL_PX ** 2
-        (dots if far else near).append(d)
+    dots = [d for d in red
+            if (d[0] - cx) ** 2 + (d[1] - cy) ** 2 > CONCEAL_PX ** 2]
     if target_blacklist is not None:
         dots = target_blacklist.filter(dots, now)
-    chosen = (target_lock.pick(dots, cx, cy, near, now) if target_lock
-              else nearest(dots, cx, cy))
+    chosen = target_lock.pick(dots, cx, cy) if target_lock else nearest(dots, cx, cy)
     return (cx, cy), dots, chosen
 
 
@@ -872,32 +852,19 @@ def demo():
     assert nearest([left, right], 100.0, 100.0) == right
     assert lock.pick([left, right], 100.0, 100.0) == left
 
-    # Walking onto a monster hides its dot from the target list, so the lock is
-    # told what is underneath. Something there means it is alive: stand and hit
-    # it for as long as that takes, rather than leaving on a timer.
+    # The target vanishes -- killed, or hidden under the character. Either way the
+    # next one is due at once. Waiting to see whether it was really dead cannot
+    # work: our own pet sits inside CONCEAL_PX forever, so every test for "is
+    # something still under me" answers yes and the bot stands there.
     lock.reset()
     close, competitor = (122.0, 100.0, 8.0), (150.0, 100.0, 8.0)
-    under = (104.0, 100.0, 8.0)
     assert lock.pick([close, competitor], 100.0, 100.0) == close
-    engaged = [lock.pick([competitor], 100.0, 100.0, [under], now=t / LOOP_HZ)
-               for t in range(60)]
-    assert all(dot is None for dot in engaged), engaged
-    assert lock.concealed
-
-    # It dies: nothing underneath any more, so the next target is due at once --
-    # only point-blank occlusion is waited out, and that is a frame or two.
-    after = [lock.pick([competitor], 100.0, 100.0, [], now=3.0 + t / LOOP_HZ)
-             for t in range(TARGET_FLICKER_FRAMES + 1)]
+    after = [lock.pick([competitor], 100.0, 100.0)
+             for _ in range(TARGET_FLICKER_FRAMES + 1)]
     assert after[:-1] == [None] * TARGET_FLICKER_FRAMES, after
     assert after[-1] == competitor and not lock.concealed
-    assert len(after) * (1 / LOOP_HZ) <= 0.2, "post-kill stall must stay under 0.2s"
-
-    # A permanent red UI blob at the centre must not hold the bot forever.
-    lock.reset()
-    assert lock.pick([close, competitor], 100.0, 100.0, [], now=0.0) == close
-    assert lock.pick([competitor], 100.0, 100.0, [under], now=1.0) is None
-    assert lock.pick([competitor], 100.0, 100.0, [under],
-                     now=1.0 + ENGAGE_MAX_S) == competitor
+    stall = len(after) / LOOP_HZ
+    assert stall <= 0.2, f"post-kill stall must stay under 0.2s, got {stall}"
 
     lock.reset()
     assert lock.pick([(60.0, 100.0, 8.0)], 100.0, 100.0)

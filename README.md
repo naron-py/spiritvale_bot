@@ -6,8 +6,8 @@ a spam button on a fast timer, and recasts a d-pad buff sequence on a slow one.
 Everything runs while the chase continues — the bot never stands still to cast.
 
 It keeps hold of one target rather than re-picking the nearest every frame, skips
-other players' pets, stays on a monster until it is actually dead, and gives up on
-one it cannot reach instead of walking into a wall forever.
+other players' pets, never stands still between kills, and gives up on a monster it
+cannot reach instead of walking into a wall forever.
 
 If the server drops you it logs back in by itself: **Ok** on the disconnect modal,
 then the **SEA** server, then **Play Character** — with the mouse, since those
@@ -127,13 +127,14 @@ mis-centred box biases every heading the bot takes.
   well clear of the Ok button, which spans x 0.464–0.536; sampling beside its edge
   left 0.004 of margin. Verified against both real screenshots, the server screen
   underneath, and a live gameplay frame that must stay `None`.
-- **"Am I still fighting?" is answered by the picture, not a timer.** Walking onto
-  a monster pushes its dot inside `CONCEAL_PX`, where it stops being a target — so
-  a dead monster and one you are standing on look identical unless you keep those
-  dots. `pick_target` hands them to `TargetLock` as `near`: still there means keep
-  hitting, gone means take the next target immediately. The old fixed 0.5s window
-  was wrong both ways, idling after a fast kill and walking off mid-fight on a slow
-  one. Post-kill delay is now 0.15s, and a long fight is never abandoned.
+- **The bot never waits for a kill to finish — it cannot tell that it needs to.**
+  Standing on a monster hides its dot inside `CONCEAL_PX`, which looks exactly like
+  the monster dying. There is no signal to separate them, because **your own pet
+  follows you and sits inside that radius permanently**, so anything asking "is
+  something still under me" answers yes forever. A 0.5s timer was tried first, then
+  checking the concealed dots directly — that one parked the bot for a full 6s after
+  every kill, the pet being the only thing it ever saw. Attack is held continuously
+  regardless, so the bot just walks to the next target: 0.15s, every time.
 - **Pets share the monster colour — they are told apart by who they stand next to.**
   Another player's pet is the same red dot as a monster, so it is paired with that
   player's small white dot instead. Two things make this survivable: a pair must
