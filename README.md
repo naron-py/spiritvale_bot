@@ -148,8 +148,16 @@ mis-centred box biases every heading the bot takes.
   **blue in a party**, and in a crowd the nearest white blob is another player's dot,
   so the bot navigated from somebody else's position. The game pins the character to
   the middle of its minimap, so the centre is the answer — and it costs no pixels.
-- Red blobs under the player marker are never targeted — that is either "arrived"
-  or a fixed red UI element, and treating it as a target froze the bot.
+- **Your own pet renders as a red dot identical to a monster, and only distance
+  excludes it.** Measured sitting 24.9px from the character — five pixels outside
+  the old 20px `CONCEAL_PX`, which is exactly why the bot chased it. The radius is
+  now 35. Nothing cleverer works: colour and size are identical, and "it follows
+  the character" also describes every monster that has aggro'd you. Two attempts
+  at behavioural detection failed on that. The cost is that monsters inside 35px
+  are not walked to — attack is held continuously, so they still get hit.
+  `--petcheck` measures where a follower actually sits if the pet is ever restyled.
+- Red blobs under the player marker are never targeted — that is either "arrived",
+  the pet, or a fixed red UI element, and treating one as a target froze the bot.
 - **Monsters are told from red mushroom terrain art by saturation, not by size.**
   Dots render pure red (S 255), mushrooms are desaturated pink (S 94–154), hence
   `RED_S_MIN`. Size cannot work: an occluded cap is a dot-sized sliver, and dots

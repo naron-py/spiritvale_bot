@@ -24,10 +24,16 @@ WINDOW_TITLE = "SpiritVale"
 MINIMAP = dict(cx=0.927, cy=0.152, r=0.055)
 SPEED = 1.0              # stick magnitude while chasing, 0..1
 DEADZONE_PX = 4          # blob this close to center = arrived
-CONCEAL_PX = 20          # white player arrow hides a dot inside this radius
+# Dots this close to the character are never targeted. It covers three things: a
+# monster we have arrived at, a fixed red UI element at the centre, and -- the
+# reason it is 35 and not 20 -- the player's own pet, measured sitting 24.9px out
+# while idle. The pet renders exactly like a monster, so nothing but distance can
+# exclude it. ponytail: raise it if the bot still chases the pet while running,
+# lower it if it walks past monsters it should engage.
+CONCEAL_PX = 35
 LOST_HOLD_S = 1.0        # keep last heading this long after a dot vanishes
 TARGET_TRACK_PX = 20     # same marker can move this far between 20Hz captures
-TARGET_ARRIVE_PX = 28    # near-centre disappearance means stop and attack, not coast
+TARGET_ARRIVE_PX = 42    # near-centre disappearance means arrival; keep > CONCEAL_PX
 TARGET_FLICKER_FRAMES = 2  # tolerate this much point-blank occlusion, no more
 STUCK_TIMEOUT_S = 3.0    # no meaningful approach this long = inaccessible target
 STUCK_PROGRESS_PX = 4    # cumulative distance gain that restarts the timeout
@@ -866,8 +872,11 @@ def demo():
     stall = len(after) / LOOP_HZ
     assert stall <= 0.2, f"post-kill stall must stay under 0.2s, got {stall}"
 
+    # A target lost well away from the character is not an arrival: it flickered
+    # or died out there, so the bot coasts rather than treating it as reached.
     lock.reset()
-    assert lock.pick([(60.0, 100.0, 8.0)], 100.0, 100.0)
+    far = (100.0 - TARGET_ARRIVE_PX - 15, 100.0, 8.0)
+    assert lock.pick([far], 100.0, 100.0)
     assert lock.pick([], 100.0, 100.0) is None and not lock.concealed
 
     watchdog = StuckWatchdog()
@@ -942,16 +951,18 @@ def demo():
     x, y, _ = nearest(dots, 100, 100)
     assert abs(x - 120) < 3 and abs(y - 100) < 3, (x, y)
 
-    # pick_target: origin is the box centre, whatever colour the marker is, and a
-    # dot sitting on it is never the target.
+    # pick_target: origin is the box centre, whatever colour the marker is, and
+    # nothing inside CONCEAL_PX is ever a target -- that radius covers the arrived
+    # monster, red UI at the centre, and the player's own pet at ~25px.
     cv2.circle(img, (104, 104), 4, (0, 0, 255), -1)    # right on the centre
     (px, py), targetable, chosen = pick_target(img)
     assert (px, py) == (100, 100), (px, py)            # 200x200 image
     assert all((d[0] - px) ** 2 + (d[1] - py) ** 2 > CONCEAL_PX ** 2
                for d in targetable), targetable
-    # The dot on the centre is concealed and dropped; the next nearest is chased.
-    assert abs(chosen[0] - 120) < 3 and abs(chosen[1] - 100) < 3, chosen
-    assert len(targetable) == len(dots), (targetable, dots)  # only the new one went
+    # The centre dot and the one 20px out are both inside the radius, so the far
+    # dot is chased -- a pet sitting where that 20px dot is would be skipped too.
+    assert abs(chosen[0] - 150) < 4 and abs(chosen[1] - 60) < 4, chosen
+    assert all(d[0] != 104 for d in targetable), targetable
 
     # Another player's pet uses the same red dot as a monster, but stays beside
     # that player's small white dot. Confirm the pair over several frames so a
