@@ -1195,6 +1195,91 @@ def relogin(dry=False):
     print(f"handled: {reconnect_step(img, win)}")
 
 
+def petcheck(seconds=25, window=10):
+    """Find red dots that keep up with the character. Read-only, drives nothing.
+
+    Walk around with the pet out and run this. The minimap is character-centred,
+    so terrain and everything standing on it slide together as we move; the pet
+    does not, it holds station. Measured on this game, a dot's own movement over
+    the window matches the terrain shift to within 0.27 of it, so a follower --
+    which barely moves at all -- stands out at roughly 1.0.
+
+    The window matters: per frame the terrain moves ~1.2px, which is the same size
+    as blob centroid jitter, and the two are indistinguishable. Over ten frames it
+    is ~9px and the split is clean.
+    """
+    import mss
+    win = find_window()
+    reg = minimap_region(win)
+    han = cv2.createHanningWindow((reg["width"], reg["height"]), cv2.CV_32F)
+    print(f"walk around with the pet out -- {seconds}s, ctrl+c to stop early")
+    tracks, next_id, frames, rows = {}, 0, [], []
+    t0 = time.time()
+    with mss.mss() as sct:
+        try:
+            while time.time() - t0 < seconds:
+                img = np.array(sct.grab(reg))[:, :, :3]
+                gray = np.float32(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+                h, w = img.shape[:2]
+                dots = find_red_dots(img)
+
+                seen, used = {}, set()
+                for tid, pos in tracks.items():
+                    best, bd = None, 1e9
+                    for i, d in enumerate(dots):
+                        if i in used:
+                            continue
+                        dd = ((d[0] - pos[0]) ** 2 + (d[1] - pos[1]) ** 2) ** 0.5
+                        if dd < bd:
+                            best, bd = i, dd
+                    if best is not None and bd <= TARGET_TRACK_PX:
+                        used.add(best)
+                        seen[tid] = dots[best][:2]
+                for i, d in enumerate(dots):
+                    if i not in used:
+                        seen[next_id] = d[:2]
+                        next_id += 1
+                tracks = seen
+
+                frames.append((gray, dict(seen)))
+                if len(frames) > window:
+                    old_gray, old_pos = frames.pop(0)
+                    (sx, sy), _ = cv2.phaseCorrelate(old_gray, gray, han)
+                    shift = (sx * sx + sy * sy) ** 0.5
+                    if shift > 6:  # only windows where we really travelled
+                        for tid, pos in seen.items():
+                            if tid not in old_pos:
+                                continue
+                            mx = pos[0] - old_pos[tid][0]
+                            my = pos[1] - old_pos[tid][1]
+                            # static dots satisfy m ~= shift; a follower ~= 0 move
+                            follows = ((mx - sx) ** 2 + (my - sy) ** 2) ** 0.5
+                            dist = ((pos[0] - w / 2) ** 2 +
+                                    (pos[1] - h / 2) ** 2) ** 0.5
+                            rows.append((dist, follows / shift))
+                time.sleep(1 / LOOP_HZ)
+        except KeyboardInterrupt:
+            pass
+
+    if not rows:
+        print("no samples -- was the character moving, with dots on the minimap?")
+        return
+    a = np.array(rows)
+    kept, slid = a[a[:, 1] >= 0.6], a[a[:, 1] < 0.6]
+    print(f"\n{len(a)} windowed samples")
+    for label, sel in (("kept up with us", kept), ("slid with terrain", slid)):
+        if len(sel):
+            print(f"  {label:18} n={len(sel):5d}  dist from centre: "
+                  f"median {np.median(sel[:, 0]):5.1f}  max {sel[:, 0].max():5.1f}")
+        else:
+            print(f"  {label:18} none")
+    if len(kept) < len(a) * 0.02:
+        print("\n  nothing follows the character -- is the pet actually summoned?")
+    else:
+        print(f"\n  -> OWN_PET_PX should cover "
+              f"{np.percentile(kept[:, 0], 95):.0f}px (95th pct of what kept up)")
+
+
 def probe(hold=0.4, gap=2.0):
     """Press every X360 button in turn, naming each. Watch which one buffs."""
     import vgamepad as vg
@@ -1333,6 +1418,8 @@ if __name__ == "__main__":
         watch()
     elif "--relogin" in sys.argv:
         relogin("--dry" in sys.argv)
+    elif "--petcheck" in sys.argv:
+        petcheck()
     elif "--probe" in sys.argv:
         probe()
     elif "--press" in sys.argv:
