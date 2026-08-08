@@ -67,14 +67,15 @@ adjusting them over adding code paths.
   first button press* during the mode swap. Every button sequence must be preceded
   by `wake_controller(pad)` (stick nudge + `WAKE_SETTLE_S`). Removing it silently
   eats the leading d-pad press.
-- **Red blobs within `CONCEAL_PX` of the box centre are never targets** — an
-  arrived monster, a fixed red UI element, or the player's own pet. `CONCEAL_PX`
-  is 35 because the pet was measured at 24.9px and the old 20px missed it by five
-  pixels, so the bot chased its own pet. Do not try to detect the pet by
-  behaviour: it renders identically to a monster, and "follows the character"
-  equally describes anything that has aggro'd. Two measurement attempts failed to
-  separate them — see `--petcheck`, which reports what actually follows.
-  `TARGET_ARRIVE_PX` must stay above `CONCEAL_PX`.
+- **Red blobs within `CONCEAL_PX` of the box centre are never targets** — that is
+  either "arrived" or a fixed red UI element. `TARGET_ARRIVE_PX` must stay above
+  `CONCEAL_PX`.
+- **The player's own pet cannot be excluded from the screen, and three attempts
+  proved it.** It renders identically to a monster; "follows the character"
+  describes any aggro'd monster equally (measured: followers were monsters at
+  19–31px, the pet's own range); and a wider `CONCEAL_PX` fails because the pet
+  wanders off to loot. Do not attempt a fourth screen-based fix — the identity of
+  the dot has to come from somewhere other than the picture.
 - **Do not reintroduce marker detection *for our own character*.** Finding it as
   the nearest white blob failed two ways: the marker turns blue in a party, and in
   a crowd the nearest white blob belongs to another player. The centre is simpler

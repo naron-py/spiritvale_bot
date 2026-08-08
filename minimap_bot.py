@@ -24,16 +24,15 @@ WINDOW_TITLE = "SpiritVale"
 MINIMAP = dict(cx=0.927, cy=0.152, r=0.055)
 SPEED = 1.0              # stick magnitude while chasing, 0..1
 DEADZONE_PX = 4          # blob this close to center = arrived
-# Dots this close to the character are never targeted. It covers three things: a
-# monster we have arrived at, a fixed red UI element at the centre, and -- the
-# reason it is 35 and not 20 -- the player's own pet, measured sitting 24.9px out
-# while idle. The pet renders exactly like a monster, so nothing but distance can
-# exclude it. ponytail: raise it if the bot still chases the pet while running,
-# lower it if it walks past monsters it should engage.
-CONCEAL_PX = 35
+# Dots this close to the character are never targeted: a monster we have arrived
+# at, or a fixed red UI element at the centre. It was briefly widened to 35 to
+# swallow the player's own pet as well, which does not work -- the pet wanders off
+# to pick up items, so no radius covers it without blinding the bot to real
+# monsters. Excluding the pet needs to know which dot it is, not where it is.
+CONCEAL_PX = 20
 LOST_HOLD_S = 1.0        # keep last heading this long after a dot vanishes
 TARGET_TRACK_PX = 20     # same marker can move this far between 20Hz captures
-TARGET_ARRIVE_PX = 42    # near-centre disappearance means arrival; keep > CONCEAL_PX
+TARGET_ARRIVE_PX = 28    # near-centre disappearance means arrival; keep > CONCEAL_PX
 TARGET_FLICKER_FRAMES = 2  # tolerate this much point-blank occlusion, no more
 STUCK_TIMEOUT_S = 3.0    # no meaningful approach this long = inaccessible target
 STUCK_PROGRESS_PX = 4    # cumulative distance gain that restarts the timeout
@@ -44,8 +43,8 @@ ATTACK_PERIOD_S = 0.40   # mash cycle, ignored while ATTACK_MASH is False
 ATTACK_HOLD_S = 0.15     # how long L1 stays down each mash cycle
 BUFF_PERIOD_S = 60.0     # recast the buff sequence this often
 BUFF_SEQUENCE = ("up", "left", "down", "right")
-SPAM_BUTTON = "y"        # tapped on its own timer while the bot runs; None = off
-SPAM_PERIOD_S = 0.5
+SPAM_BUTTON = None       # button tapped on its own timer while running; None = off
+SPAM_PERIOD_S = 2
 SPAM_HOLD_S = 0.05
 WAKE_AMP = 0.5           # stick nudge that flips the game into controller mode
 WAKE_STEP_S = 0.15
@@ -846,7 +845,7 @@ def main(port=None):
 
 def demo():
     """Self-check: synthetic minimap, no game or gamepad needed."""
-    assert SPAM_BUTTON == "y", SPAM_BUTTON
+    assert SPAM_BUTTON is None or SPAM_BUTTON in ArduinoPad.FACE, SPAM_BUTTON
 
     # Nearest-from-scratch oscillates when two monsters exchange which is a pixel
     # closer. A lock must keep the original marker, then stop rather than coast
@@ -951,17 +950,15 @@ def demo():
     x, y, _ = nearest(dots, 100, 100)
     assert abs(x - 120) < 3 and abs(y - 100) < 3, (x, y)
 
-    # pick_target: origin is the box centre, whatever colour the marker is, and
-    # nothing inside CONCEAL_PX is ever a target -- that radius covers the arrived
-    # monster, red UI at the centre, and the player's own pet at ~25px.
+    # pick_target: origin is the box centre, whatever colour the marker is, and a
+    # dot sitting on it is never the target.
     cv2.circle(img, (104, 104), 4, (0, 0, 255), -1)    # right on the centre
     (px, py), targetable, chosen = pick_target(img)
     assert (px, py) == (100, 100), (px, py)            # 200x200 image
     assert all((d[0] - px) ** 2 + (d[1] - py) ** 2 > CONCEAL_PX ** 2
                for d in targetable), targetable
-    # The centre dot and the one 20px out are both inside the radius, so the far
-    # dot is chased -- a pet sitting where that 20px dot is would be skipped too.
-    assert abs(chosen[0] - 150) < 4 and abs(chosen[1] - 60) < 4, chosen
+    # The dot on the centre is concealed and dropped; the next nearest is chased.
+    assert abs(chosen[0] - 120) < 3 and abs(chosen[1] - 100) < 3, chosen
     assert all(d[0] != 104 for d in targetable), targetable
 
     # Another player's pet uses the same red dot as a monster, but stays beside
@@ -1206,91 +1203,6 @@ def relogin(dry=False):
     print(f"handled: {reconnect_step(img, win)}")
 
 
-def petcheck(seconds=25, window=10):
-    """Find red dots that keep up with the character. Read-only, drives nothing.
-
-    Walk around with the pet out and run this. The minimap is character-centred,
-    so terrain and everything standing on it slide together as we move; the pet
-    does not, it holds station. Measured on this game, a dot's own movement over
-    the window matches the terrain shift to within 0.27 of it, so a follower --
-    which barely moves at all -- stands out at roughly 1.0.
-
-    The window matters: per frame the terrain moves ~1.2px, which is the same size
-    as blob centroid jitter, and the two are indistinguishable. Over ten frames it
-    is ~9px and the split is clean.
-    """
-    import mss
-    win = find_window()
-    reg = minimap_region(win)
-    han = cv2.createHanningWindow((reg["width"], reg["height"]), cv2.CV_32F)
-    print(f"walk around with the pet out -- {seconds}s, ctrl+c to stop early")
-    tracks, next_id, frames, rows = {}, 0, [], []
-    t0 = time.time()
-    with mss.mss() as sct:
-        try:
-            while time.time() - t0 < seconds:
-                img = np.array(sct.grab(reg))[:, :, :3]
-                gray = np.float32(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
-                h, w = img.shape[:2]
-                dots = find_red_dots(img)
-
-                seen, used = {}, set()
-                for tid, pos in tracks.items():
-                    best, bd = None, 1e9
-                    for i, d in enumerate(dots):
-                        if i in used:
-                            continue
-                        dd = ((d[0] - pos[0]) ** 2 + (d[1] - pos[1]) ** 2) ** 0.5
-                        if dd < bd:
-                            best, bd = i, dd
-                    if best is not None and bd <= TARGET_TRACK_PX:
-                        used.add(best)
-                        seen[tid] = dots[best][:2]
-                for i, d in enumerate(dots):
-                    if i not in used:
-                        seen[next_id] = d[:2]
-                        next_id += 1
-                tracks = seen
-
-                frames.append((gray, dict(seen)))
-                if len(frames) > window:
-                    old_gray, old_pos = frames.pop(0)
-                    (sx, sy), _ = cv2.phaseCorrelate(old_gray, gray, han)
-                    shift = (sx * sx + sy * sy) ** 0.5
-                    if shift > 6:  # only windows where we really travelled
-                        for tid, pos in seen.items():
-                            if tid not in old_pos:
-                                continue
-                            mx = pos[0] - old_pos[tid][0]
-                            my = pos[1] - old_pos[tid][1]
-                            # static dots satisfy m ~= shift; a follower ~= 0 move
-                            follows = ((mx - sx) ** 2 + (my - sy) ** 2) ** 0.5
-                            dist = ((pos[0] - w / 2) ** 2 +
-                                    (pos[1] - h / 2) ** 2) ** 0.5
-                            rows.append((dist, follows / shift))
-                time.sleep(1 / LOOP_HZ)
-        except KeyboardInterrupt:
-            pass
-
-    if not rows:
-        print("no samples -- was the character moving, with dots on the minimap?")
-        return
-    a = np.array(rows)
-    kept, slid = a[a[:, 1] >= 0.6], a[a[:, 1] < 0.6]
-    print(f"\n{len(a)} windowed samples")
-    for label, sel in (("kept up with us", kept), ("slid with terrain", slid)):
-        if len(sel):
-            print(f"  {label:18} n={len(sel):5d}  dist from centre: "
-                  f"median {np.median(sel[:, 0]):5.1f}  max {sel[:, 0].max():5.1f}")
-        else:
-            print(f"  {label:18} none")
-    if len(kept) < len(a) * 0.02:
-        print("\n  nothing follows the character -- is the pet actually summoned?")
-    else:
-        print(f"\n  -> OWN_PET_PX should cover "
-              f"{np.percentile(kept[:, 0], 95):.0f}px (95th pct of what kept up)")
-
-
 def probe(hold=0.4, gap=2.0):
     """Press every X360 button in turn, naming each. Watch which one buffs."""
     import vgamepad as vg
@@ -1429,8 +1341,6 @@ if __name__ == "__main__":
         watch()
     elif "--relogin" in sys.argv:
         relogin("--dry" in sys.argv)
-    elif "--petcheck" in sys.argv:
-        petcheck()
     elif "--probe" in sys.argv:
         probe()
     elif "--press" in sys.argv:
