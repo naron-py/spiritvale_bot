@@ -15,6 +15,8 @@ usage:
 import ctypes
 import struct
 import sys
+
+import numpy as np
 from ctypes import wintypes
 
 PROCESS_NAME = "SpiritVale.exe"
@@ -163,6 +165,239 @@ def narrow(candidates, fresh, expect, tol):
     return kept
 
 
+PAGE = 4096
+
+
+def page_hashes(mem, regions, cap=1 << 26):
+    """{region_base: uint64 array, one hash per 4 KB page}.
+
+    A full pass reads ~9.7 GB at ~720 MB/s. Hashing it to 8 bytes per page costs
+    19 MB of state, so the next pass only has to look at pages that actually
+    changed. Kept as one array per region rather than a dict keyed by page:
+    there are 2.4M pages, and building a dict that size in Python costs more
+    than the reads do.
+    """
+    out = {}
+    for base, size in regions:
+        blob = mem.read(base, min(size, cap))
+        if not blob:
+            continue
+        pages = len(blob) // PAGE
+        if not pages:
+            continue
+        a = np.frombuffer(blob[:pages * PAGE], dtype=np.uint64).reshape(pages, -1)
+        with np.errstate(over="ignore"):  # wrapping is the point of the mix
+            out[base] = (a * np.uint64(0x9E3779B97F4A7C15)).sum(axis=1,
+                                                                dtype=np.uint64)
+    return out
+
+
+def changed_pages(before, after):
+    """[(region_base, page_index)] for pages whose hash moved. Vectorised."""
+    out = []
+    for base, now in after.items():
+        was = before.get(base)
+        if was is None or len(was) != len(now):
+            continue
+        for i in np.nonzero(was != now)[0]:
+            out.append((base, int(i)))
+    return out
+
+
+def read_triple(blob, base, addr):
+    """(x, y, z) at addr inside this page blob, or None if it does not fit."""
+    off = addr - base
+    if off < 0 or off + 12 > len(blob):
+        return None
+    return struct.unpack_from("<fff", blob, off)
+
+
+def looks_like_place(t):
+    """A world position is finite, in range, and not sitting at the origin.
+
+    Freed-and-reused memory is mostly zeros, and a zeroed triple otherwise passes
+    every movement test -- it 'moves' when the page is recycled and 'holds still'
+    when it is not. That accounted for every one of the first 123k candidates.
+    """
+    if t is None:
+        return False
+    x, y, z = t
+    if not all(abs(v) < POS_MAX for v in t):
+        return False
+    if any(v != v for v in t):  # NaN
+        return False
+    return abs(x) > 1e-3 and abs(z) > 1e-3
+
+
+def walked_triples(before, after, base, min_move, max_move, max_dy=1.0):
+    """Addresses of (x, y, z) triples that moved like a character walking.
+
+    A Unity world position is three contiguous floats, and walking on flat ground
+    has a shape nothing else does: x and z both change, together covering the
+    distance travelled, while y barely moves. Vectorised -- a page holds ~1000
+    candidate offsets and there are thousands of pages, so this cannot be a loop.
+    """
+    import numpy as np
+    n = min(len(before), len(after)) // 4
+    if n < 3:
+        return []
+    b = np.frombuffer(before[:n * 4], dtype=np.float32).astype(np.float64)
+    a = np.frombuffer(after[:n * 4], dtype=np.float32).astype(np.float64)
+    good = np.isfinite(b) & np.isfinite(a) & (np.abs(b) < POS_MAX) & (np.abs(a) < POS_MAX)
+    d = np.where(good, a - b, np.nan)
+
+    # index i is x, i+1 is y, i+2 is z
+    dx, dy, dz = d[:n - 2], d[1:n - 1], d[2:n]
+    dist = np.sqrt(dx * dx + dz * dz)
+    hit = ((dist >= min_move) & (dist <= max_move) & (np.abs(dy) <= max_dy) &
+           np.isfinite(dist) & np.isfinite(dy))
+    return [(base + int(i) * 4, float(dist[i])) for i in np.nonzero(hit)[0]]
+
+
+def still_triples(before, after, base, addrs, tol=0.05):
+    """Of `addrs`, those that did NOT move -- run while the character stands still.
+
+    This is the filter that does the real work. Plenty of floats change when the
+    character walks (velocity, animation, camera), but only a position both moves
+    when walking and holds perfectly still when stopped.
+    """
+    import numpy as np
+    n = min(len(before), len(after)) // 4
+    b = np.frombuffer(before[:n * 4], dtype=np.float32).astype(np.float64)
+    a = np.frombuffer(after[:n * 4], dtype=np.float32).astype(np.float64)
+    kept = []
+    for addr in addrs:
+        i = (addr - base) // 4
+        if i < 0 or i + 2 >= n:
+            continue
+        if np.all(np.abs(a[i:i + 3] - b[i:i + 3]) <= tol):
+            kept.append(addr)
+    return kept
+
+
+def read_pages(mem, pages):
+    """{(base, index): bytes} for the given pages, skipping any that vanished."""
+    out = {}
+    for key in pages:
+        base, i = key
+        blob = mem.read(base + i * PAGE, PAGE)
+        if blob:
+            out[key] = blob
+    return out
+
+
+def find_position(walk, stand, min_move=0.5, max_move=500.0, verbose=True):
+    """Addresses that behave like the player's world position.
+
+    `walk(seconds)` must move the character; `stand(seconds)` must keep it still.
+    Both are passed in so this module never imports the pad -- and so the search
+    can be driven by hand if the gamepad is unavailable.
+
+    Four steps, each one cutting the field:
+      1. hash every page, walk, hash again -- only changed pages can hold it
+      2. read those pages, walk again, keep triples shaped like horizontal travel
+      3. read again while standing still, keep the ones that stop dead
+      4. walk once more, keep the ones that move again
+    Step 3 is what separates a position from the velocity and animation floats
+    that also move while walking.
+    """
+    with Mem() as mem:
+        regions = mem.regions()
+        if verbose:
+            print(f"pid {mem.pid}: {len(regions)} regions, "
+                  f"{sum(s for _, s in regions) / 1e6:.0f} MB")
+
+        if verbose:
+            print("  1/4 hashing pages, then walking...")
+        before = page_hashes(mem, regions)
+        walk(2.0)
+        after = page_hashes(mem, regions)
+        pages = changed_pages(before, after)
+        if verbose:
+            print(f"      {len(before):,} pages, {len(pages):,} changed")
+        if not pages:
+            print("      nothing changed -- did the character actually move?")
+            return []
+
+        if verbose:
+            print("  2/4 walking again, looking for horizontal travel...")
+        snap1 = read_pages(mem, pages)
+        walk(2.0)
+        snap2 = read_pages(mem, pages)
+        # keyed by page from the start: filtering a flat hit list per page is
+        # O(pages x hits), which with ~100k of each does not finish
+        by_page, walk1 = {}, {}
+        for key, blob in snap1.items():
+            if key not in snap2:
+                continue
+            base = key[0] + key[1] * PAGE
+            found = []
+            for addr, dist in walked_triples(blob, snap2[key], base,
+                                             min_move, max_move):
+                # both ends must look like somewhere in the world, which is what
+                # rules out a page that was freed and refilled with zeros
+                if (looks_like_place(read_triple(blob, base, addr)) and
+                        looks_like_place(read_triple(snap2[key], base, addr))):
+                    found.append(addr)
+                    walk1[addr] = dist
+            if found:
+                by_page[key] = found
+        if verbose:
+            print(f"      {sum(len(v) for v in by_page.values()):,} triples "
+                  f"moved like a walk, across {len(by_page):,} pages")
+        if not by_page:
+            return []
+
+        if verbose:
+            print("  3/4 standing still -- a position must stop dead...")
+        snap3 = read_pages(mem, by_page)
+        stand(2.0)
+        snap4 = read_pages(mem, by_page)
+        still = {}
+        for key, addrs in by_page.items():
+            if key in snap3 and key in snap4:
+                held = still_triples(snap3[key], snap4[key],
+                                     key[0] + key[1] * PAGE, addrs)
+                if held:
+                    still[key] = held
+        if verbose:
+            print(f"      {sum(len(v) for v in still.values()):,} held still")
+        if not still:
+            return []
+
+        if verbose:
+            print("  4/4 walking once more to confirm...")
+        snap5 = read_pages(mem, still)
+        walk(2.0)
+        snap6 = read_pages(mem, still)
+        final = []
+        for key, addrs in still.items():
+            if key not in snap5 or key not in snap6:
+                continue
+            base = key[0] + key[1] * PAGE
+            moved = dict(walked_triples(snap5[key], snap6[key], base,
+                                        min_move, max_move))
+            for a in addrs:
+                if a not in moved:
+                    continue
+                t5, t6 = read_triple(snap5[key], base, a), read_triple(snap6[key],
+                                                                       base, a)
+                if not (looks_like_place(t5) and looks_like_place(t6)):
+                    continue
+                # both walks lasted the same time at the same speed, so a real
+                # position covers a comparable distance; recycled memory does not
+                ratio = moved[a] / max(walk1.get(a, 0.0), 1e-6)
+                if not 0.4 <= ratio <= 2.5:
+                    continue
+                # and the ground does not move under the character between walks
+                if abs(t5[1] - t6[1]) > 2.0:
+                    continue
+                final.append((a, t6, moved[a]))
+        if verbose:
+            print(f"      {len(final):,} confirmed")
+        return sorted(final)
+
+
 def survey():
     """How much memory is worth scanning, and is it readable at all."""
     pid = find_pid()
@@ -184,8 +419,60 @@ def survey():
         print(f"plausible coordinate floats in the first 40 regions: {floats:,}")
 
 
+def findpos():
+    """Drive the character with the pad and report position candidates."""
+    import time
+
+    sys.path.insert(0, __file__.rsplit("\\", 1)[0])
+    import minimap_bot as bot
+
+    win = bot.find_window()
+    pad = bot.VirtualPad()
+    print(f"game window {win.width}x{win.height} -- focus it now, 3s")
+    time.sleep(3)
+
+    def walk(seconds):
+        bot.wake_controller(pad)
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            # a slow arc, so x and z both change and neither stays zero
+            a = (time.time() - t0) * 1.2
+            pad.stick(float(np.cos(a)), float(np.sin(a)), False)
+            time.sleep(0.05)
+        pad.stick(0.0, 0.0, False)
+
+    def stand(seconds):
+        pad.stick(0.0, 0.0, False)
+        time.sleep(seconds)
+
+    try:
+        hits = find_position(walk, stand)
+    finally:
+        pad.close()
+
+    if not hits:
+        print("\nno candidates -- see which step emptied out above")
+        return
+    print(f"\n{len(hits)} candidates (address, position, distance walked):")
+    for addr, (x, y, z), dist in hits[:25]:
+        print(f"  0x{addr:012X}  x={x:9.2f} y={y:8.2f} z={z:9.2f}  moved {dist:6.2f}")
+    if len(hits) > 25:
+        print(f"  ... and {len(hits) - 25} more")
+    print("\nre-read live, to see which ones track the character:")
+    import time
+    with Mem() as mem:
+        for addr, _, _ in hits[:8]:
+            blob = mem.read(addr, 12)
+            first = struct.unpack("<fff", blob) if blob else None
+            time.sleep(0.4)
+            blob = mem.read(addr, 12)
+            second = struct.unpack("<fff", blob) if blob else None
+            print(f"  0x{addr:012X}  {first}  ->  {second}")
+
+
 def demo():
     """Self-check for the parsing and narrowing, no game needed."""
+    import numpy as np
     blob = struct.pack("<ffffff", 1.5, 1e30, float("nan"), 0.0, -250.25, 3e5)
     got = plausible_floats(blob, 0x1000)
     assert got == {0x1000: 1.5, 0x1010: -250.25}, got  # huge, NaN, zero all dropped
@@ -198,6 +485,41 @@ def demo():
     # an address that vanished between snapshots is dropped, not crashed on
     assert narrow(before, {1: 12.0}, expect=2.0, tol=0.5) == {1: 12.0}
 
+    # a walking position: x and z travel, y stays put. Laid out beside things
+    # that must NOT match -- a vertical-only change, and a wild jump.
+    b = struct.pack("<fffffffff", 10.0, 5.0, 20.0,   # position, walks
+                                  1.0, 1.0, 1.0,      # only y will move
+                                  0.0, 0.0, 0.0)      # will jump miles
+    a = struct.pack("<fffffffff", 13.0, 5.02, 24.0,
+                                  1.0, 9.0, 1.0,
+                                  900.0, 0.0, 900.0)
+    hits = walked_triples(b, a, 0x2000, min_move=1.0, max_move=50.0)
+    addrs = [h[0] for h in hits]
+    assert 0x2000 in addrs, hits              # 5m in x, 4m in z, y +0.02
+    assert 0x200C not in addrs, hits          # vertical only
+    assert 0x2018 not in addrs, hits          # 1272m in one step, a teleport
+    assert abs(dict(hits)[0x2000] - 5.0) < 0.01, hits
+
+    # standing still: the position holds, a drifting float does not
+    b2 = struct.pack("<ffffff", 10.0, 5.0, 20.0, 1.0, 2.0, 3.0)
+    a2 = struct.pack("<ffffff", 10.0, 5.0, 20.0, 1.4, 2.0, 3.0)
+    assert still_triples(b2, a2, 0x3000, [0x3000, 0x300C]) == [0x3000]
+
+    # page hashing must notice a single changed byte and ignore an identical page
+    import hashlib  # noqa: F401  (kept out of the hash path deliberately)
+    p1 = bytes(PAGE)
+    p2 = bytes(PAGE - 1) + b"\x01"
+    h1 = np.frombuffer(p1, dtype=np.uint64) * np.uint64(0x9E3779B97F4A7C15)
+    h2 = np.frombuffer(p2, dtype=np.uint64) * np.uint64(0x9E3779B97F4A7C15)
+    assert h1.sum(dtype=np.uint64) != h2.sum(dtype=np.uint64)
+    was = {0x1000: np.array([1, 2, 3], dtype=np.uint64)}
+    now = {0x1000: np.array([1, 9, 3], dtype=np.uint64)}
+    assert changed_pages(was, now) == [(0x1000, 1)], changed_pages(was, now)
+    assert changed_pages(was, was) == []
+    # a region that appeared or resized between passes is skipped, not crashed on
+    assert changed_pages({}, now) == []
+    assert changed_pages({0x1000: np.array([1], dtype=np.uint64)}, now) == []
+
     print("demo ok")
 
 
@@ -206,5 +528,7 @@ if __name__ == "__main__":
         demo()
     elif "--survey" in sys.argv:
         survey()
+    elif "--findpos" in sys.argv:
+        findpos()
     else:
         print(__doc__)
