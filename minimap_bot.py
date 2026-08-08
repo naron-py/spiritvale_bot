@@ -9,6 +9,7 @@ usage:
   python minimap_bot.py --port COM5   # Arduino Leonardo
   python minimap_bot.py --demo        # offline self-check
 """
+import os
 import sys
 import time
 
@@ -77,9 +78,15 @@ UI_BLUE = ((95, 90, 150), (112, 255, 255))    # the game's button blue, in HSV
 # first live test read the character screen as the server screen for exactly that
 # reason. Their widths are nearly 2x apart, so size is what separates them.
 OK_BTN = (0.500, 0.144, 0.073)       # "Ok" on the disconnected modal
-SEA_ROW = (0.500, 0.4755, 0.264)     # "Southeast Asia (SEA)" row, a highlight
 CONNECT_BTN = (0.500, 0.915, 0.081)  # "Connect" under the server table
 PLAY_BTN = (0.500, 0.948, 0.147)     # "Play Character" on the character screen
+# The server table reorders itself, so SEA has no fixed row -- it is found by its
+# own label. The template is cut from a 1920-wide screenshot and rescaled to the
+# live client width; matching a simulated 2560 screen scores 0.98, and a screen
+# without the text scores 0.34. Recut it if the game restyles the list.
+SEA_ICON = "sea_row.png"
+SEA_REF_W = 1920
+SEA_MATCH_MIN = 0.70
 # Dark modal body, sampled either side of the message text. Well clear of the Ok
 # button, which spans x 0.464-0.536: probing right beside its edge left 0.004 of
 # margin, which is no margin at all.
@@ -168,6 +175,42 @@ def find_blue_button(img, btn, tol=0.03, wtol=0.35):
     return None
 
 
+_sea_icon = False  # False = not looked for yet, None = missing
+
+
+def sea_icon():
+    """The SEA label template, or None if the file is absent."""
+    global _sea_icon
+    if _sea_icon is False:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), SEA_ICON)
+        _sea_icon = cv2.imread(path)
+        if _sea_icon is None:
+            print(f"no {SEA_ICON} -- cannot pick the server row")
+    return _sea_icon
+
+
+def find_sea_row(img, template=None):
+    """Centre (x, y) of the "Southeast Asia (SEA)" label, or None.
+
+    The list is sorted by ping and reorders between sessions, so the row cannot be
+    addressed by position. Clicking the label selects the row it sits in.
+    """
+    t = sea_icon() if template is None else template
+    if t is None:
+        return None
+    scale = img.shape[1] / SEA_REF_W
+    if scale != 1:
+        t = cv2.resize(t, None, fx=scale, fy=scale,
+                       interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC)
+    if img.shape[0] <= t.shape[0] or img.shape[1] <= t.shape[1]:
+        return None
+    res = cv2.matchTemplate(img, t, cv2.TM_CCOEFF_NORMED)
+    _, score, _, loc = cv2.minMaxLoc(res)
+    if score < SEA_MATCH_MIN:
+        return None
+    return loc[0] + t.shape[1] / 2, loc[1] + t.shape[0] / 2
+
+
 def _probe(img, frac, dark):
     h, w = img.shape[:2]
     px = img[int(h * frac[1]), int(w * frac[0])]
@@ -202,7 +245,8 @@ def click_at(x, y):
     u.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
 
 
-def reconnect_step(img, win, click=click_at, settle=RECONNECT_SETTLE_S):
+def reconnect_step(img, win, click=click_at, settle=RECONNECT_SETTLE_S,
+                   sea_template=None):
     """Advance the login flow by one screen. Returns what it did, or None.
 
     Driven by what is on screen rather than a fixed script, so a slow server or a
@@ -220,9 +264,13 @@ def reconnect_step(img, win, click=click_at, settle=RECONNECT_SETTLE_S):
     if screen == "disconnected":
         press(OK_BTN)
     elif screen == "server":
-        # The row is usually selected already, but clicking it costs nothing and
-        # covers the case where the game remembered a different region.
-        press(SEA_ROW)
+        sea = find_sea_row(img, sea_template)
+        if sea is None:
+            # Better to sit on this screen and say so than to click blind and
+            # join whichever region happens to be sitting in that row today.
+            return "server: SEA row not found"
+        click(win.left + sea[0], win.top + sea[1])
+        time.sleep(settle)
         press(CONNECT_BTN)
     else:
         press(PLAY_BTN)
@@ -995,6 +1043,20 @@ def demo():
     blue(srv, CONNECT_BTN)
     assert login_screen(srv) == "server"
 
+    # The server list is sorted by ping and reorders between sessions, so SEA has
+    # to be found by its label. Drop a fake label into an arbitrary row and check
+    # the click follows it there rather than going to a fixed position.
+    label = np.zeros((13, 96, 3), np.uint8)
+    cv2.putText(label, "SEA", (2, 11), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                (60, 55, 55), 1, cv2.LINE_AA)
+    scale = 768 / SEA_REF_W
+    small = cv2.resize(label, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    row_y, row_x = 300, 250                      # third row down, nothing special
+    srv[row_y:row_y + small.shape[0], row_x:row_x + small.shape[1]] = small
+    found = find_sea_row(srv, label)
+    assert found is not None, "SEA label must be found wherever the row sits"
+    assert abs(found[1] - (row_y + small.shape[0] / 2)) < 3, found
+
     chars = np.zeros((432, 768, 3), np.uint8)
     chars[:] = (53, 36, 28)                        # the dark character backdrop
     cv2.circle(chars, (int(768 * 0.42), int(432 * 0.60)), 40, (250, 250, 250), -1)
@@ -1016,9 +1078,18 @@ def demo():
     assert reconnect_step(disc, FakeWin, rec, settle=0) == "disconnected"
     assert clicks == [(100 + 768 * OK_BTN[0], 50 + 432 * OK_BTN[1])], clicks
     clicks.clear()
-    assert reconnect_step(srv, FakeWin, rec, settle=0) == "server"
-    assert clicks == [(100 + 768 * SEA_ROW[0], 50 + 432 * SEA_ROW[1]),
+    assert reconnect_step(srv, FakeWin, rec, settle=0, sea_template=label) == "server"
+    assert clicks == [(100 + found[0], 50 + found[1]),
                       (100 + 768 * CONNECT_BTN[0], 50 + 432 * CONNECT_BTN[1])], clicks
+
+    # No SEA row means no click at all: joining whichever region happens to sit in
+    # that row today is worse than sitting on the screen and saying so.
+    blank = srv.copy()
+    blank[row_y:row_y + small.shape[0], row_x:row_x + small.shape[1]] = 255
+    clicks.clear()
+    assert reconnect_step(blank, FakeWin, rec, settle=0,
+                          sea_template=label) == "server: SEA row not found"
+    assert clicks == [], clicks
     clicks.clear()
     assert reconnect_step(chars, FakeWin, rec, settle=0) == "character"
     assert clicks == [(100 + 768 * PLAY_BTN[0], 50 + 432 * PLAY_BTN[1])], clicks
@@ -1145,9 +1216,14 @@ def relogin(dry=False):
     if screen is None or dry:
         if screen and dry:
             h, w = img.shape[:2]
-            spot = {"disconnected": OK_BTN, "server": SEA_ROW, "character": PLAY_BTN}
-            f = spot[screen]
-            print(f"  would click ({win.left + w * f[0]:.0f},{win.top + h * f[1]:.0f})")
+            if screen == "server":
+                sea = find_sea_row(img)
+                where = (f"SEA row at ({win.left + sea[0]:.0f},{win.top + sea[1]:.0f})"
+                         if sea else "SEA row NOT FOUND -- would not click")
+            else:
+                f = OK_BTN if screen == "disconnected" else PLAY_BTN
+                where = f"({win.left + w * f[0]:.0f},{win.top + h * f[1]:.0f})"
+            print(f"  would click {where}")
         return
     print(f"handled: {reconnect_step(img, win)}")
 

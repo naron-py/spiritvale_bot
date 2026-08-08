@@ -106,6 +106,18 @@ mis-centred box biases every heading the bot takes.
   like a broken bot and is not one.
 - Stick tilt is direction-only at full magnitude. Scaling tilt by minimap pixel
   distance made every approach a crawl the game's own deadzone swallowed.
+- **The server list reorders, so SEA is found by its label, not its position.**
+  The table is sorted by ping and the row moves between sessions. `sea_row.png` is
+  a crop of the "Southeast Asia (SEA)" text, rescaled to the live client width
+  before matching — cut at 1920 wide, it scores 0.98 against a 2560 screen and
+  0.34 against a screen without the text. If the label is not found the bot clicks
+  nothing and says so: sitting on the server screen beats joining whichever region
+  happens to occupy that row today.
+- **Connect and Play Character are told apart by width, not position.** They sit
+  0.033 of the screen height apart, so a position-only match takes each for the
+  other — found on a live disconnect, where the character screen read as the
+  server screen and the flow stalled re-clicking Connect. Widths are 0.081 and
+  0.147, so size settles it.
 - **The login screens are found by button-plus-backdrop, never by one pixel.** The
   sky is the same blue as the buttons, and the skill bar sits where "Play Character"
   does, so a fixed probe point matches during ordinary play — and a false positive

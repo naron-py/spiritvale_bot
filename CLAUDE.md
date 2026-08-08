@@ -88,6 +88,13 @@ adjusting them over adding code paths.
   on it needs memory across frames, which is why `PetFilter` confirms a pair and
   then tracks the pet by its own red marker. Do not "simplify" it to a plain
   distance test — the pet reappears as a target every other frame if you do.
+- **The server row is found by template, never by position.** The list is sorted
+  by ping and reorders between sessions, so a fixed row fraction picks a different
+  region each time. `find_sea_row()` matches `sea_row.png` (the label text, cut at
+  1920 wide and rescaled to the live width). No match means no click at all —
+  never fall back to a fixed row. Buttons likewise match on width as well as
+  position: Connect and Play Character are 0.033 apart vertically and were
+  mistaken for each other on a live disconnect.
 - **Login-screen detection needs a button *and* a backdrop, never one pixel.**
   `login_screen()` gates each screen on a blue button near a known fraction plus a
   probe of something only that screen has behind it. Gameplay has blue sky where
