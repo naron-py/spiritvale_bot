@@ -64,6 +64,24 @@ PET_RELEASE_PX = 24      # hysteresis: do not flicker at the entry threshold
 PET_CONFIRM_FRAMES = 3   # a monster crossing a player for one frame stays targetable
 PET_TRACK_STEP_PX = 20   # maximum marker movement between 20Hz captures
 PET_FORGET_FRAMES = 40   # remember a vanished confirmed pet for about two seconds
+# Reconnect after a disconnect: click Ok, pick the server, play the character.
+# Every coordinate is a fraction of the client area, measured off screenshots taken
+# at two different resolutions (1920x1080 and 2560x1440), so they survive a
+# resolution change the same way MINIMAP does. Buttons are all centred on x.
+RECONNECT = True          # False disables the whole thing, clicks included
+RECONNECT_POLL_S = 2.0    # how often to look for a login screen while running
+RECONNECT_SETTLE_S = 1.5  # wait after each click; these screens animate
+UI_BLUE = ((95, 90, 150), (112, 255, 255))    # the game's button blue, in HSV
+OK_BTN = (0.500, 0.144)       # "Ok" on the disconnected modal
+SEA_ROW = (0.500, 0.4755)     # "Southeast Asia (SEA)" row in the server table
+CONNECT_BTN = (0.500, 0.915)  # "Connect" under the server table
+PLAY_BTN = (0.500, 0.948)     # "Play Character" on the character screen
+# Dark modal body, sampled either side of the message text. Well clear of the Ok
+# button, which spans x 0.464-0.536: probing right beside its edge left 0.004 of
+# margin, which is no margin at all.
+MODAL_DARK = ((0.44, 0.093), (0.55, 0.093))
+PANEL_WHITE = (0.42, 0.60)    # white body of the server table
+CHAR_BG = ((0.30, 0.50), (0.50, 0.06), (0.70, 0.85), (0.06, 0.60))  # dark backdrop
 TOGGLE_VK = 0x23         # End, polled globally through GetAsyncKeyState
 START_PAUSED = True      # launching the script must never move the character
 LOOP_HZ = 20
@@ -117,6 +135,92 @@ def minimap_region(win):
     x = win.left + int(win.width * MINIMAP["cx"])
     y = win.top + int(win.height * MINIMAP["cy"])
     return dict(left=x - r, top=y - r, width=2 * r, height=2 * r)
+
+
+def window_region(win):
+    return dict(left=win.left, top=win.top, width=win.width, height=win.height)
+
+
+def find_blue_button(img, frac, tol=0.06):
+    """Centre (x, y) of the blue UI button sitting near `frac`, or None.
+
+    Looks for the button rather than sampling a pixel: the sky is blue too, and a
+    fixed probe point on the login modal lands on it during normal play.
+    """
+    h, w = img.shape[:2]
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, UI_BLUE[0], UI_BLUE[1])
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    wx, wy = w * frac[0], h * frac[1]
+    for c in cnts:
+        if cv2.contourArea(c) < w * h * 1e-3:  # skip small blue icons and text
+            continue
+        x, y, bw, bh = cv2.boundingRect(c)
+        cx, cy = x + bw / 2, y + bh / 2
+        if abs(cx - wx) <= w * tol and abs(cy - wy) <= h * tol:
+            return int(cx), int(cy)
+    return None
+
+
+def _probe(img, frac, dark):
+    h, w = img.shape[:2]
+    px = img[int(h * frac[1]), int(w * frac[0])]
+    return int(px.max()) < 90 if dark else int(px.min()) > 200
+
+
+def login_screen(img):
+    """Which login screen is showing: 'disconnected', 'server', 'character', None.
+
+    Each test pairs a button with something only that screen has behind it, so
+    ordinary gameplay -- blue sky above, blue skill icons below -- cannot match.
+    The disconnect modal sits on top of the server table, hence the order.
+    """
+    if (find_blue_button(img, OK_BTN) and
+            all(_probe(img, f, dark=True) for f in MODAL_DARK)):
+        return "disconnected"
+    if find_blue_button(img, CONNECT_BTN) and _probe(img, PANEL_WHITE, dark=False):
+        return "server"
+    if (find_blue_button(img, PLAY_BTN) and
+            all(_probe(img, f, dark=True) for f in CHAR_BG)):
+        return "character"
+    return None
+
+
+def click_at(x, y):
+    """Left click in screen coordinates. mouse_event is ancient but is 3 lines."""
+    import ctypes
+    u = ctypes.windll.user32
+    u.SetCursorPos(int(x), int(y))
+    time.sleep(0.05)
+    u.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
+    u.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+
+
+def reconnect_step(img, win, click=click_at, settle=RECONNECT_SETTLE_S):
+    """Advance the login flow by one screen. Returns what it did, or None.
+
+    Driven by what is on screen rather than a fixed script, so a slow server or a
+    missed click just means the same screen is handled again next poll.
+    """
+    screen = login_screen(img)
+    if screen is None:
+        return None
+    h, w = img.shape[:2]
+
+    def press(frac):
+        click(win.left + w * frac[0], win.top + h * frac[1])
+        time.sleep(settle)
+
+    if screen == "disconnected":
+        press(OK_BTN)
+    elif screen == "server":
+        # The row is usually selected already, but clicking it costs nothing and
+        # covers the case where the game remembered a different region.
+        press(SEA_ROW)
+        press(CONNECT_BTN)
+    else:
+        press(PLAY_BTN)
+    return screen
 
 
 def find_red_dots(bgr):
@@ -587,6 +691,7 @@ def main(port=None):
     buff_queue = []   # d-pad presses left in the current cast
     next_press = 0.0  # earliest time for the next one
     next_spam = 0.0   # SPAM_BUTTON goes out on its own timer
+    next_login_check = 0.0  # a whole-window grab, so kept to RECONNECT_POLL_S
 
     pad.stick(0.0, 0.0, False)
     print("STOPPED -- press End to start")
@@ -606,6 +711,25 @@ def main(port=None):
                 if paused:
                     time.sleep(0.05)
                     continue
+
+                if RECONNECT and time.time() >= next_login_check:
+                    next_login_check = time.time() + RECONNECT_POLL_S
+                    full = np.array(sct.grab(window_region(win)))[:, :, :3]
+                    if login_screen(full):
+                        # Drop the stick and attack before touching the mouse: the
+                        # character is gone, and a held button carries into the
+                        # next session.
+                        pad.stick(0.0, 0.0, False)
+                        did = reconnect_step(full, win)
+                        print(f"\nreconnect: handled the {did} screen")
+                        target_lock.reset()
+                        target_blacklist.reset()
+                        stuck_watchdog.reset()
+                        pet_filter.reset()
+                        last = None
+                        buff_queue = []
+                        next_buff = next_press = next_spam = 0.0
+                        continue
 
                 if not buff_queue and time.time() >= next_buff:
                     buff_queue = list(BUFF_SEQUENCE)
@@ -837,6 +961,61 @@ def demo():
     sx, sy = stick_vector(3, -4, 100)                  # near target, still full
     assert abs((sx * sx + sy * sy) ** 0.5 - 1.0) < 0.01, (sx, sy)
 
+    # Login screens. Built at an odd size on purpose: every coordinate is a
+    # fraction, so the flow must work at a resolution nobody measured.
+    def blue(img, frac):
+        h, w = img.shape[:2]
+        # the real Ok button measures 0.072 x 0.036 of the client area
+        bw, bh = int(w * 0.072), int(h * 0.036)
+        x, y = int(w * frac[0]), int(h * frac[1])
+        cv2.rectangle(img, (x - bw // 2, y - bh // 2), (x + bw // 2, y + bh // 2),
+                      (232, 168, 79), -1)          # the game's button blue
+
+    sky = np.zeros((432, 768, 3), np.uint8)
+    sky[:] = (200, 150, 90)                        # bright blue sky, and
+    blue(sky, PLAY_BTN)                            # blue skill icons below
+    blue(sky, OK_BTN)                              # a blue thing up in the sky
+    assert login_screen(sky) is None, "gameplay must never look like a login screen"
+
+    disc = np.zeros((432, 768, 3), np.uint8)
+    disc[:] = (255, 255, 255)                      # server table behind the modal
+    cv2.rectangle(disc, (int(768 * 0.40), int(432 * 0.06)),
+                  (int(768 * 0.60), int(432 * 0.18)), (69, 51, 49), -1)
+    blue(disc, OK_BTN)
+    blue(disc, CONNECT_BTN)                        # both are on screen at once
+    assert login_screen(disc) == "disconnected", "the modal must be handled first"
+
+    srv = np.zeros((432, 768, 3), np.uint8)
+    srv[:] = (255, 255, 255)
+    blue(srv, CONNECT_BTN)
+    assert login_screen(srv) == "server"
+
+    chars = np.zeros((432, 768, 3), np.uint8)
+    chars[:] = (53, 36, 28)                        # the dark character backdrop
+    blue(chars, PLAY_BTN)
+    assert login_screen(chars) == "character"
+
+    # The clicks themselves: right buttons, right order, window offset applied.
+    class FakeWin:
+        left, top, width, height = 100, 50, 768, 432
+
+    clicks = []
+    def rec(x, y):
+        clicks.append((x, y))
+
+    assert reconnect_step(disc, FakeWin, rec, settle=0) == "disconnected"
+    assert clicks == [(100 + 768 * OK_BTN[0], 50 + 432 * OK_BTN[1])], clicks
+    clicks.clear()
+    assert reconnect_step(srv, FakeWin, rec, settle=0) == "server"
+    assert clicks == [(100 + 768 * SEA_ROW[0], 50 + 432 * SEA_ROW[1]),
+                      (100 + 768 * CONNECT_BTN[0], 50 + 432 * CONNECT_BTN[1])], clicks
+    clicks.clear()
+    assert reconnect_step(chars, FakeWin, rec, settle=0) == "character"
+    assert clicks == [(100 + 768 * PLAY_BTN[0], 50 + 432 * PLAY_BTN[1])], clicks
+    clicks.clear()
+    assert reconnect_step(sky, FakeWin, rec, settle=0) is None
+    assert clicks == [], "gameplay must never move the mouse"
+
     # ArduinoPad wire format, no board attached
     pad = ArduinoPad.__new__(ArduinoPad)
     sent = []
@@ -943,6 +1122,24 @@ def watch(scale=2):
             if cv2.waitKey(max(1, int(1000 / LOOP_HZ))) in (27, ord("q")):
                 break
     cv2.destroyAllWindows()
+
+
+def relogin(dry=False):
+    """Handle whatever login screen is showing, once. --dry looks without clicking."""
+    import mss
+    win = find_window()
+    with mss.mss() as sct:
+        img = np.array(sct.grab(window_region(win)))[:, :, :3]
+    screen = login_screen(img)
+    print(f"screen: {screen or 'not a login screen (gameplay, or something new)'}")
+    if screen is None or dry:
+        if screen and dry:
+            h, w = img.shape[:2]
+            spot = {"disconnected": OK_BTN, "server": SEA_ROW, "character": PLAY_BTN}
+            f = spot[screen]
+            print(f"  would click ({win.left + w * f[0]:.0f},{win.top + h * f[1]:.0f})")
+        return
+    print(f"handled: {reconnect_step(img, win)}")
 
 
 def probe(hold=0.4, gap=2.0):
@@ -1081,6 +1278,8 @@ if __name__ == "__main__":
         snap()
     elif "--watch" in sys.argv:
         watch()
+    elif "--relogin" in sys.argv:
+        relogin("--dry" in sys.argv)
     elif "--probe" in sys.argv:
         probe()
     elif "--press" in sys.argv:

@@ -88,6 +88,12 @@ adjusting them over adding code paths.
   on it needs memory across frames, which is why `PetFilter` confirms a pair and
   then tracks the pet by its own red marker. Do not "simplify" it to a plain
   distance test — the pet reappears as a target every other frame if you do.
+- **Login-screen detection needs a button *and* a backdrop, never one pixel.**
+  `login_screen()` gates each screen on a blue button near a known fraction plus a
+  probe of something only that screen has behind it. Gameplay has blue sky where
+  the Ok button goes and blue skill icons where Play Character goes, so a lone
+  colour probe fires mid-fight — and the consequence is a mouse click during
+  combat. Keep both halves of every test. `RECONNECT = False` disables all of it.
 - **`START_PAUSED` must stay true.** Launching the script has to be safe; the bot
   waits for `End` (`TOGGLE_VK`) before it touches the stick.
 - `ArduinoPad.stick` deduplicates against `self.last` because the sketch is

@@ -9,6 +9,10 @@ It keeps hold of one target rather than re-picking the nearest every frame, skip
 other players' pets, stays on a monster until it is actually dead, and gives up on
 one it cannot reach instead of walking into a wall forever.
 
+If the server drops you it logs back in by itself: **Ok** on the disconnect modal,
+then the **SEA** server, then **Play Character** — with the mouse, since those
+screens do not take the gamepad. Set `RECONNECT = False` to turn that off.
+
 All tuning lives in one constant block at the top of `minimap_bot.py`:
 `SPAM_BUTTON` / `SPAM_PERIOD_S` for the spammed button (`None` disables it),
 `BUFF_SEQUENCE` / `BUFF_PERIOD_S` for the buff, `ATTACK_MASH` to tap the attack
@@ -70,6 +74,7 @@ mis-centred box biases every heading the bot takes.
 | `--buff [hold] [gap]` | Fires the buff sequence once, for timing tuning. |
 | `--probe` | Presses every X360 button in turn, named, to find a mapping. |
 | `--press` | Fires one control at a time on the Arduino, typed in by hand. |
+| `--relogin [--dry]` | Handles the login screen showing now. `--dry` looks without clicking. |
 
 ## Gotchas found the hard way
 
@@ -101,6 +106,15 @@ mis-centred box biases every heading the bot takes.
   like a broken bot and is not one.
 - Stick tilt is direction-only at full magnitude. Scaling tilt by minimap pixel
   distance made every approach a crawl the game's own deadzone swallowed.
+- **The login screens are found by button-plus-backdrop, never by one pixel.** The
+  sky is the same blue as the buttons, and the skill bar sits where "Play Character"
+  does, so a fixed probe point matches during ordinary play — and a false positive
+  here means clicking the mouse mid-fight. Each screen therefore needs its button
+  *and* something only that screen has behind it: a dark modal body, the white
+  server table, or the near-black character backdrop. The dark-modal probes sit
+  well clear of the Ok button, which spans x 0.464–0.536; sampling beside its edge
+  left 0.004 of margin. Verified against both real screenshots, the server screen
+  underneath, and a live gameplay frame that must stay `None`.
 - **"Am I still fighting?" is answered by the picture, not a timer.** Walking onto
   a monster pushes its dot inside `CONCEAL_PX`, where it stops being a target — so
   a dead monster and one you are standing on look identical unless you keep those
