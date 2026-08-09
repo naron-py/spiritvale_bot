@@ -11,6 +11,7 @@ deps: none beyond the stdlib. ctypes talks to the Win32 API directly.
 usage:
   python memscan.py --survey     # how much scannable memory the game has
   python memscan.py --findpos    # hunt for the player position by walking
+  python memscan.py --check 1A2B3C4 ...   # judge addresses found in Cheat Engine
   python memscan.py --pos        # live position, once POSITION_CHAIN is set
   python memscan.py --demo       # offline self-check, no game needed
 """
@@ -551,6 +552,68 @@ def watch_position():
             time.sleep(0.1)
 
 
+def check(addrs):
+    """Judge hand-found addresses: which one is the player, and where are y/z?
+
+    Cheat Engine leaves several smooth movers, and they are not interchangeable.
+    The camera tracks the character, so it moves too -- but it eases to a stop,
+    while the character's own position freezes the instant the stick centres.
+    That coast is the tell, so this measures it directly.
+    """
+    import time
+    sys.path.insert(0, __file__.rsplit("\\", 1)[0])
+    import minimap_bot as bot
+
+    pad = bot.VirtualPad()
+    print("focus the game -- 3s")
+    time.sleep(3)
+
+    def sample(mem):
+        # read a window around each address: CE finds x, and y/z sit next to it
+        return {a: read_vec3(mem, a) for a in addrs}
+
+    try:
+        with Mem() as mem:
+            bot.wake_controller(pad)
+            print("\nwalking east, then stopping dead:")
+            start = sample(mem)
+            t0 = time.time()
+            while time.time() - t0 < 1.5:
+                pad.stick(1.0, 0.0, False)
+                time.sleep(0.05)
+            moving = sample(mem)
+            pad.stick(0.0, 0.0, False)      # centre the stick and read at once
+            time.sleep(0.12)
+            just_after = sample(mem)
+            time.sleep(1.0)
+            settled = sample(mem)
+
+            print(f"  {'address':>16}{'walked':>9}{'coasted':>9}   verdict")
+            for a in addrs:
+                if not all(s.get(a) for s in (start, moving, just_after, settled)):
+                    print(f"  0x{a:012X}   unreadable")
+                    continue
+                walked = max(abs(moving[a][i] - start[a][i]) for i in (0, 2))
+                coast = max(abs(settled[a][i] - just_after[a][i]) for i in (0, 2))
+                if walked < 0.05:
+                    verdict = "did not move -- not it"
+                elif coast > 0.05:
+                    verdict = "coasted after stop -- camera, or smoothed"
+                else:
+                    verdict = "STOPS DEAD -- looks like the character"
+                print(f"  0x{a:012X}{walked:9.2f}{coast:9.2f}   {verdict}")
+
+            print("\n  current values, and the floats either side:")
+            for a in addrs:
+                blob = mem.read(a - 8, 32)
+                if blob:
+                    vals = struct.unpack("<8f", blob)
+                    show = "  ".join(f"{v:9.2f}" for v in vals)
+                    print(f"  0x{a:012X}  [-8..+20]  {show}")
+    finally:
+        pad.close()
+
+
 def survey():
     """How much memory is worth scanning, and is it readable at all."""
     pid = find_pid()
@@ -741,5 +804,12 @@ if __name__ == "__main__":
         findpos()
     elif "--pos" in sys.argv:
         watch_position()
+    elif "--check" in sys.argv:
+        given = [int(a, 16) for a in sys.argv[sys.argv.index("--check") + 1:]
+                 if not a.startswith("--")]
+        if not given:
+            print("usage: python memscan.py --check <hex address> [more...]")
+        else:
+            check(given)
     else:
         print(__doc__)
