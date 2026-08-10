@@ -10,7 +10,9 @@ deps: none beyond the stdlib. ctypes talks to the Win32 API directly.
 
 usage:
   python memscan.py --survey     # how much scannable memory the game has
-  python memscan.py --findpos    # hunt for the player position by walking
+  python memscan.py --track      # hunt, then rank against the minimap
+  python memscan.py --hunt       # iterative walk/stand scan only
+  python memscan.py --findpos    # older one-shot scan, kept for reference
   python memscan.py --check 1A2B3C4 ...   # judge addresses found in Cheat Engine
   python memscan.py --pos        # live position, once POSITION_CHAIN is set
   python memscan.py --demo       # offline self-check, no game needed
@@ -552,6 +554,217 @@ def watch_position():
             time.sleep(0.1)
 
 
+def hunt(walk, stand, rounds=10, min_walk=0.05, still_tol=1e-4, verbose=True):
+    """Cheat Engine's iterative scan, automated: walk, stand, walk, stand...
+
+    Each round is a hard filter -- a coordinate MUST change while walking and MUST
+    NOT change while standing. One round of each proves little; ten in a row is
+    what collapses millions of floats to a handful, and it is the part that makes
+    the manual version tedious. Driving the stick from here removes that.
+
+    Candidates live as numpy arrays keyed by page, not a Python dict of addresses:
+    there are millions after round one.
+    """
+    with Mem() as mem:
+        regions = mem.regions()
+        if verbose:
+            print(f"pid {mem.pid}: hashing {len(regions):,} regions...")
+        h0 = page_hashes(mem, regions)
+        walk(1.5)
+        h1 = page_hashes(mem, regions)
+        pages = changed_pages(h0, h1)
+        if verbose:
+            print(f"  {len(pages):,} pages changed while walking")
+        if not pages:
+            return {}
+
+        cands = {}
+        for key, blob in read_pages(mem, pages).items():
+            n = len(blob) // 4
+            a = np.frombuffer(blob[:n * 4], dtype=np.float32)
+            ok = np.isfinite(a) & (np.abs(a) > 1e-3) & (np.abs(a) < POS_MAX)
+            idx = np.nonzero(ok)[0]
+            if len(idx):
+                cands[key] = (idx.astype(np.int32), a[idx].copy())
+        if verbose:
+            print(f"  {sum(len(v[0]) for v in cands.values()):,} plausible floats "
+                  f"to start")
+
+        for r in range(rounds):
+            moving = r % 2 == 1          # candidates were captured after a walk
+            (walk if moving else stand)(1.2)
+            fresh = read_pages(mem, cands)
+            nxt = {}
+            for key, (idx, old) in cands.items():
+                blob = fresh.get(key)
+                if blob is None:
+                    continue
+                n = len(blob) // 4
+                a = np.frombuffer(blob[:n * 4], dtype=np.float32)
+                fits = idx < n
+                idx2, old2 = idx[fits], old[fits]
+                if not len(idx2):
+                    continue
+                cur = a[idx2]
+                d = np.abs(cur.astype(np.float64) - old2.astype(np.float64))
+                keep = (d >= min_walk) if moving else (d <= still_tol)
+                keep &= np.isfinite(cur)
+                if keep.any():
+                    nxt[key] = (idx2[keep], cur[keep].copy())
+            cands = nxt
+            total = sum(len(v[0]) for v in cands.values())
+            if verbose:
+                print(f"  round {r + 1:2d} {'walk ' if moving else 'stand'}: "
+                      f"{total:,} left")
+            if not total:
+                break
+        return cands
+
+
+def correlate(mem, addrs, drive, grab_gray, shift_of, legs=None, verbose=True):
+    """Rank addresses by how well they track the minimap across several headings.
+
+    The minimap is ground truth: whatever the world axes are, a real position maps
+    to minimap travel by ONE rotation and scale, the same for every direction.
+    Fitting that 2x2 map and measuring the residual tests all headings at once,
+    which single-direction checks cannot -- a value can look right going north and
+    do nothing going east, and several here do exactly that.
+    """
+    legs = legs or [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0),
+                    (0.7, 0.7), (-0.7, 0.7)]
+    world = {a: [] for a in addrs}
+    mini = []
+
+    for sx, sy in legs:
+        g0 = grab_gray()
+        before = {a: read_vec3(mem, a) for a in addrs}
+        drive(sx, sy, 1.2)
+        after = {a: read_vec3(mem, a) for a in addrs}
+        mini.append(shift_of(g0, grab_gray()))
+        for a in addrs:
+            b, f = before[a], after[a]
+            world[a].append((f[0] - b[0], f[2] - b[2]) if b and f else (0.0, 0.0))
+        if verbose:
+            print(f"    leg ({sx:+.1f},{sy:+.1f}) minimap "
+                  f"({mini[-1][0]:+6.1f},{mini[-1][1]:+6.1f})")
+
+    M = np.array(mini)                      # minimap travel per leg
+    scored = []
+    for a in addrs:
+        W = np.array(world[a])              # world travel per leg
+        if np.abs(W).max() < 1e-3 or not np.isfinite(W).all():
+            continue
+        if (np.abs(W).max(axis=1) < 1e-3).any():
+            continue                        # sat still on at least one heading
+        A, *_ = np.linalg.lstsq(M, W, rcond=None)
+        resid = float(np.abs(W - M @ A).sum() / max(np.abs(W).sum(), 1e-9))
+        # a rotation-and-scale has orthogonal columns of equal length; anything
+        # else is a coincidence that happens to fit these particular legs
+        c0, c1 = A[:, 0], A[:, 1]
+        ortho = abs(float(c0 @ c1)) / max(float(np.linalg.norm(c0) *
+                                                np.linalg.norm(c1)), 1e-9)
+        even = abs(float(np.linalg.norm(c0) - np.linalg.norm(c1))) / \
+            max(float(np.linalg.norm(c0)), 1e-9)
+        scored.append((resid + ortho + even, resid, ortho, even, a,
+                       float(np.linalg.norm(c0))))
+    scored.sort()
+    return scored
+
+
+def hunt_report(cands, limit=20):
+    """Flatten hunt() output to sorted (address, value) pairs and show a few."""
+    out = []
+    for (base, page), (idx, vals) in cands.items():
+        for i, v in zip(idx, vals):
+            out.append((base + page * PAGE + int(i) * 4, float(v)))
+    out.sort()
+    print(f"\n{len(out):,} survivors")
+    for addr, v in out[:limit]:
+        print(f"  0x{addr:012X}  {v:12.3f}")
+    if len(out) > limit:
+        print(f"  ... and {len(out) - limit:,} more")
+    return out
+
+
+def track(rounds=10):
+    """Hunt for the position, then rank survivors against the minimap.
+
+    One process start to finish: addresses die on a relog, a map change and a
+    patch, so finding and testing them has to happen without a gap in between.
+    """
+    import time
+    import cv2
+    import mss
+
+    sys.path.insert(0, __file__.rsplit("\\", 1)[0])
+    import minimap_bot as bot
+
+    win = bot.find_window()
+    reg = bot.minimap_region(win)
+    han = cv2.createHanningWindow((reg["width"], reg["height"]), cv2.CV_32F)
+    sct = mss.mss()
+    pad = bot.VirtualPad()
+
+    def grab_gray():
+        img = np.array(sct.grab(reg))[:, :, :3]
+        return np.float32(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+
+    def shift_of(g0, g1):
+        (dx, dy), _ = cv2.phaseCorrelate(g0, g1, han)
+        return dx, dy
+
+    def drive(sx, sy, secs):
+        bot.wake_controller(pad)
+        t0 = time.time()
+        while time.time() - t0 < secs:
+            pad.stick(sx, sy, False)
+            time.sleep(0.05)
+        pad.stick(0.0, 0.0, False)
+        time.sleep(0.25)
+
+    def walk(secs):
+        bot.wake_controller(pad)
+        t0 = time.time()
+        while time.time() - t0 < secs:
+            a = (time.time() - t0) * 1.1
+            pad.stick(float(np.cos(a)), float(np.sin(a)), False)
+            time.sleep(0.05)
+        pad.stick(0.0, 0.0, False)
+
+    def stand(secs):
+        pad.stick(0.0, 0.0, False)
+        time.sleep(secs)
+
+    print("focus the game -- 3s")
+    time.sleep(3)
+    try:
+        cands = hunt(walk, stand, rounds=rounds)
+        addrs = [base + page * PAGE + int(i) * 4
+                 for (base, page), (idx, _) in cands.items() for i in idx]
+        if not addrs:
+            print("nothing survived the hunt")
+            return
+        print(f"\ncorrelating {len(addrs):,} survivors against the minimap")
+        with Mem() as mem:
+            scored = correlate(mem, addrs, drive, grab_gray, shift_of)
+        if not scored:
+            print("  none of them moved on every heading")
+            return
+        print(f"\n  best fits (lower is better; scale is world units per "
+              f"minimap pixel):")
+        print(f"  {'address':>16}{'error':>9}{'skew':>8}{'uneven':>9}{'scale':>9}"
+              f"   position")
+        with Mem() as mem:
+            for total, resid, ortho, even, a, scale in scored[:12]:
+                p = read_vec3(mem, a)
+                shown = f"({p[0]:9.1f},{p[1]:7.1f},{p[2]:9.1f})" if p else "?"
+                print(f"  0x{a:012X}{resid:9.3f}{ortho:8.3f}{even:9.3f}"
+                      f"{scale:9.2f}   {shown}")
+    finally:
+        pad.close()
+        sct.close()
+
+
 def check(addrs):
     """Judge hand-found addresses: which one is the player, and where are y/z?
 
@@ -804,6 +1017,35 @@ if __name__ == "__main__":
         findpos()
     elif "--pos" in sys.argv:
         watch_position()
+    elif "--hunt" in sys.argv:
+        import time as _t
+
+        sys.path.insert(0, __file__.rsplit("\\", 1)[0])
+        import minimap_bot as _bot
+
+        _pad = _bot.VirtualPad()
+        print("focus the game -- 3s")
+        _t.sleep(3)
+
+        def _walk(secs):
+            _bot.wake_controller(_pad)
+            _t0 = _t.time()
+            while _t.time() - _t0 < secs:
+                _a = (_t.time() - _t0) * 1.1
+                _pad.stick(float(np.cos(_a)), float(np.sin(_a)), False)
+                _t.sleep(0.05)
+            _pad.stick(0.0, 0.0, False)
+
+        def _stand(secs):
+            _pad.stick(0.0, 0.0, False)
+            _t.sleep(secs)
+
+        try:
+            hunt_report(hunt(_walk, _stand))
+        finally:
+            _pad.close()
+    elif "--track" in sys.argv:
+        track()
     elif "--check" in sys.argv:
         given = [int(a, 16) for a in sys.argv[sys.argv.index("--check") + 1:]
                  if not a.startswith("--")]
