@@ -647,7 +647,7 @@ def hunt(walk, stand, rounds=10, min_walk=0.2, still_tol=0.02,
 
 
 def correlate(mem, addrs, drive, grab_gray, shift_of, wake=lambda: None,
-              legs=None, verbose=True):
+              legs=None, secs=1.2, verbose=True):
     """Rank addresses by how well they track the minimap across several headings.
 
     The minimap is ground truth: whatever the world axes are, a real position maps
@@ -669,7 +669,7 @@ def correlate(mem, addrs, drive, grab_gray, shift_of, wake=lambda: None,
     for sx, sy in legs:
         g0 = grab_gray()
         before = {a: read_vec3(mem, a) for a in addrs}
-        drive(sx, sy, 1.2)
+        drive(sx, sy, secs)
         after = {a: read_vec3(mem, a) for a in addrs}
         shift = shift_of(g0, grab_gray())
         if (shift[0] ** 2 + shift[1] ** 2) ** 0.5 < 5.0:
@@ -692,6 +692,13 @@ def correlate(mem, addrs, drive, grab_gray, shift_of, wake=lambda: None,
     M = np.array(mini)                      # minimap travel per leg
     scored = []
     for a in addrs:
+        # A normalised direction vector fits the minimap perfectly -- it IS the
+        # heading -- and swamped the rankings until this went in. A real map
+        # position sits hundreds of units from the origin and converts at a
+        # sane number of world units per pixel.
+        here = read_vec3(mem, a)
+        if not here or max(abs(here[0]), abs(here[2])) < 10.0:
+            continue
         W = np.array(world[a])              # world travel per leg
         if np.abs(W).max() < 1e-3 or not np.isfinite(W).all():
             continue
@@ -706,8 +713,10 @@ def correlate(mem, addrs, drive, grab_gray, shift_of, wake=lambda: None,
                                                 np.linalg.norm(c1)), 1e-9)
         even = abs(float(np.linalg.norm(c0) - np.linalg.norm(c1))) / \
             max(float(np.linalg.norm(c0)), 1e-9)
-        scored.append((resid + ortho + even, resid, ortho, even, a,
-                       float(np.linalg.norm(c0))))
+        scale = float(np.linalg.norm(c0))
+        if not 0.05 <= scale <= 3.0:
+            continue        # a plausible minimap pixel is a fraction of a metre
+        scored.append((resid + ortho + even, resid, ortho, even, a, scale))
     scored.sort()
     return scored
 
@@ -730,7 +739,10 @@ def hunt_report(cands, limit=20):
 HITS_FILE = "memscan_hits.txt"
 
 
-def track(rounds=10):
+def track(rounds=10, secs=0.7):
+    # Short legs on purpose. The map can be small enough that a couple of seconds
+    # of walking ends at a wall, and a leg that stops early travels an unknown
+    # fraction of what was asked for, which is worse for the fit than a short one.
     """Hunt for the position, then rank survivors against the minimap.
 
     One process start to finish: addresses die on a relog, a map change and a
@@ -810,7 +822,7 @@ def track(rounds=10):
         print(f"\ncorrelating {len(addrs):,} survivors against the minimap")
         with Mem() as mem:
             scored = correlate(mem, addrs, drive, grab_gray, shift_of,
-                               wake=lambda: bot.wake_controller(pad))
+                               wake=lambda: bot.wake_controller(pad), secs=secs)
         if not scored:
             print("  none of them moved on every heading")
             return
