@@ -895,8 +895,12 @@ def entity_class(mem, pos_addr, verbose=True):
         if verbose:
             print(f"  class 0x{cls:012X} +0x{off:<4X} {len(objs):5d} instances, "
                   f"{good:5d} with a position")
+        # How many instances carry a position varies a lot by map -- 63% on one,
+        # 19% on the next, because most of the class is pooled and idle. The
+        # decoys sit near 3%, so the gap is still wide; do not tighten this to
+        # fit whichever map you happen to be standing on.
         share = good / max(len(objs), 1)
-        if good >= 20 and share > 0.25 and (best is None or good > best[2]):
+        if good >= 15 and share > 0.10 and (best is None or good > best[2]):
             best = (cls, off, good)
     return (best[0], best[1]) if best else (None, None)
 
