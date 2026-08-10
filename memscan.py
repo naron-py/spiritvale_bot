@@ -14,6 +14,7 @@ usage:
   python memscan.py --hunt       # iterative walk/stand scan only
   python memscan.py --findpos    # older one-shot scan, kept for reference
   python memscan.py --check 1A2B3C4 ...   # judge addresses found in Cheat Engine
+  python memscan.py --entities [addr]     # list entities near the player
   python memscan.py --pos        # live position, once POSITION_CHAIN is set
   python memscan.py --demo       # offline self-check, no game needed
 """
@@ -474,6 +475,10 @@ def verify(mem, addrs, push, min_move=0.3, max_move=100.0, max_dy=2.0,
 # last offset is added without a dereference, so it lands on the x float itself.
 POSITION_CHAIN = dict(module=None, base=0x0, offsets=())
 
+# A position address confirmed by --track. Per session: the heap is reshuffled by
+# a relog, a map change and a patch, so this is a scratch value, not a constant.
+PLAYER_POS_ADDR = 0x02499CB5A190
+
 
 def module_base(pid, name):
     """Load address of a module in the target process, or None."""
@@ -824,6 +829,120 @@ def track(rounds=10):
         sct.close()
 
 
+def object_headers(mem, addr, back=0x600):
+    """Candidate IL2CPP object headers before `addr`: [(base, class_ptr)].
+
+    An object starts with a pointer to its Il2CppClass followed by a monitor
+    field that is almost always zero. Several candidates match by luck, so the
+    caller has to test them -- see entity_class().
+    """
+    blob = mem.read(addr - back, back)
+    if not blob:
+        return []
+    out = []
+    for off in range(len(blob) - 16, -1, -8):
+        q0 = struct.unpack_from("<Q", blob, off)[0]
+        q1 = struct.unpack_from("<Q", blob, off + 8)[0]
+        if q1 or not (0x10000 < q0 < 0x7FFFFFFFFFFF):
+            continue
+        probe = mem.read(q0, 8)
+        if not probe:
+            continue
+        inner = struct.unpack("<Q", probe)[0]
+        if 0x10000 < inner < 0x7FFFFFFFFFFF:
+            out.append((addr - back + off, q0))
+    return out
+
+
+def instances_of(mem, class_ptr, limit=4000):
+    """Addresses of every object whose header points at `class_ptr`."""
+    target = np.uint64(class_ptr)
+    out = []
+    for base, size in mem.regions():
+        blob = mem.read(base, min(size, 1 << 24))
+        if not blob:
+            continue
+        n = len(blob) // 8
+        a = np.frombuffer(blob[:n * 8], dtype=np.uint64)
+        for i in np.nonzero(a == target)[0]:
+            out.append(base + int(i) * 8)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def entity_class(mem, pos_addr, verbose=True):
+    """(class_ptr, offset) for the class whose instances all carry a position.
+
+    The header nearest the position is usually the wrong one: the first match
+    walking backwards had 37,591 instances, every one reading zero. What picks
+    the right class is not the header pattern but the payload -- its instances
+    must hold real coordinates at the same offset.
+    """
+    best = None
+    for base, cls in object_headers(mem, pos_addr):
+        off = pos_addr - base
+        objs = instances_of(mem, cls, limit=1500)
+        good = 0
+        for o in objs:
+            blob = mem.read(o + off, 12)
+            if not blob:
+                continue
+            x, y, z = struct.unpack("<fff", blob)
+            if (all(abs(v) < POS_MAX for v in (x, y, z)) and abs(y) < 3000
+                    and (abs(x) > 1 or abs(z) > 1)):
+                good += 1
+        if verbose:
+            print(f"  class 0x{cls:012X} +0x{off:<4X} {len(objs):5d} instances, "
+                  f"{good:5d} with a position")
+        share = good / max(len(objs), 1)
+        if good >= 20 and share > 0.25 and (best is None or good > best[2]):
+            best = (cls, off, good)
+    return (best[0], best[1]) if best else (None, None)
+
+
+def entities(mem, class_ptr, off):
+    """[(distance_from_first, address, x, y, z)] for everything with a position."""
+    out = []
+    for o in instances_of(mem, class_ptr):
+        blob = mem.read(o + off, 12)
+        if not blob:
+            continue
+        x, y, z = struct.unpack("<fff", blob)
+        if not all(abs(v) < POS_MAX for v in (x, y, z)):
+            continue
+        if abs(x) < 1 and abs(z) < 1:
+            continue
+        out.append((o, x, y, z))
+    return out
+
+
+def show_entities(pos_addr=None):
+    """Find the entity class from a known position address and list what is near."""
+    pos_addr = pos_addr or PLAYER_POS_ADDR
+    if not pos_addr:
+        print("need a confirmed position address -- run --track first, then pass it")
+        return
+    with Mem() as mem:
+        here = read_vec3(mem, pos_addr)
+        if not here or not looks_like_place(here):
+            print(f"0x{pos_addr:X} no longer holds a position -- re-run --track")
+            return
+        print(f"player at ({here[0]:.1f},{here[1]:.1f},{here[2]:.1f})")
+        cls, off = entity_class(mem, pos_addr)
+        if cls is None:
+            print("no class looked like an entity list")
+            return
+        print(f"\nentity class 0x{cls:012X}, position at +0x{off:X}")
+        ents = entities(mem, cls, off)
+        ranked = sorted(((((x - here[0]) ** 2 + (z - here[2]) ** 2) ** 0.5, o, x, y, z)
+                         for o, x, y, z in ents))
+        near = [e for e in ranked if e[0] <= 34]
+        print(f"{len(ents)} with positions, {len(near)} within the minimap radius\n")
+        for d, o, x, y, z in near[:20]:
+            print(f"  0x{o:012X}  dist {d:6.1f}  ({x:8.1f},{y:6.1f},{z:8.1f})")
+
+
 def check(addrs):
     """Judge hand-found addresses: which one is the player, and where are y/z?
 
@@ -1105,6 +1224,10 @@ if __name__ == "__main__":
             _pad.close()
     elif "--track" in sys.argv:
         track()
+    elif "--entities" in sys.argv:
+        rest = [a for a in sys.argv[sys.argv.index("--entities") + 1:]
+                if not a.startswith("--")]
+        show_entities(int(rest[0], 16) if rest else None)
     elif "--check" in sys.argv:
         given = [int(a, 16) for a in sys.argv[sys.argv.index("--check") + 1:]
                  if not a.startswith("--")]
