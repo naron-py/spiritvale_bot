@@ -569,7 +569,7 @@ def watch_position():
 
 
 def hunt(walk, stand, rounds=10, min_walk=0.2, still_tol=0.02,
-         travelled=None, verbose=True):
+         travelled=None, stayed=None, verbose=True):
     """Cheat Engine's iterative scan, automated: walk, stand, walk, stand...
 
     Each round is a hard filter -- a coordinate MUST change while walking and MUST
@@ -612,6 +612,12 @@ def hunt(walk, stand, rounds=10, min_walk=0.2, still_tol=0.02,
         for r in range(rounds):
             moving = r % 2 == 1          # candidates were captured after a walk
             (walk if moving else stand)(1.2)
+            if not moving and stayed is not None and not stayed():
+                # a monster shoved the character, so it did not stand still and
+                # the "must not have moved" filter would delete the real position
+                if verbose:
+                    print(f"  round {r + 1:2d} stand: pushed around, round skipped")
+                continue
             if moving and travelled is not None and not travelled():
                 # the character was blocked, so nothing was proved. Applying the
                 # "must have moved" filter here would delete the real position.
@@ -697,13 +703,18 @@ def correlate(mem, addrs, drive, grab_gray, shift_of, wake=lambda: None,
         # position sits hundreds of units from the origin and converts at a
         # sane number of world units per pixel.
         here = read_vec3(mem, a)
-        if not here or max(abs(here[0]), abs(here[2])) < 10.0:
+        if not here or not looks_like_place(here):
+            continue
+        if max(abs(here[0]), abs(here[2])) < 10.0 or abs(here[1]) > 5000:
             continue
         W = np.array(world[a])              # world travel per leg
         if np.abs(W).max() < 1e-3 or not np.isfinite(W).all():
             continue
-        if (np.abs(W).max(axis=1) < 1e-3).any():
-            continue                        # sat still on at least one heading
+        # A majority of headings, not all of them: monsters interrupt the walk,
+        # and demanding every leg move threw the real position away on a busy map.
+        moved_legs = int((np.abs(W).max(axis=1) >= 1e-3).sum())
+        if moved_legs < max(4, int(0.7 * len(M))):
+            continue
         A, *_ = np.linalg.lstsq(M, W, rcond=None)
         resid = float(np.abs(W - M @ A).sum() / max(np.abs(W).sum(), 1e-9))
         # a rotation-and-scale has orthogonal columns of equal length; anything
