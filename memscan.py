@@ -31,11 +31,15 @@ PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_VM_READ = 0x0010
 MEM_COMMIT = 0x1000
 MEM_PRIVATE = 0x20000
+MEM_MAPPED = 0x40000
+PAGE_EXECUTE_WRITECOPY = 0x80
 PAGE_READWRITE = 0x04
 PAGE_EXECUTE_READWRITE = 0x40
 PAGE_WRITECOPY = 0x08
 PAGE_GUARD = 0x100
-READABLE = (PAGE_READWRITE, PAGE_EXECUTE_READWRITE, PAGE_WRITECOPY)
+# only the low byte is the protection; the rest are modifier flags
+WRITABLE = (PAGE_READWRITE, PAGE_WRITECOPY, PAGE_EXECUTE_READWRITE,
+            PAGE_EXECUTE_WRITECOPY)
 
 # Unity world coordinates are floats in metres. Anything outside this is not a
 # position -- it filters out the vast majority of 4-byte patterns, which are
@@ -114,17 +118,22 @@ class Mem:
         self.close()
 
     def regions(self):
-        """Committed, readable, private regions -- where game state lives.
+        """Committed, writable regions -- where game state lives.
 
-        Private excludes mapped files and images: the player's coordinates are
-        heap data, and skipping the rest cuts the search by a wide margin.
+        Two things this deliberately does NOT do, both of which silently hid
+        memory before. It does not compare Protect exactly: the low byte is the
+        protection and the high bits are modifiers, so an exact match drops every
+        page carrying WRITECOMBINE -- 270 MB of them here. And it does not insist
+        on MEM_PRIVATE: MAPPED holds another 288 MB of writable memory. Images
+        are still skipped, being code and statics rather than object data.
         """
         mbi = MEMORY_BASIC_INFORMATION64()
         addr, out = 0, []
         while self.k32.VirtualQueryEx(self.h, ctypes.c_void_p(addr),
                                       ctypes.byref(mbi), ctypes.sizeof(mbi)):
-            if (mbi.State == MEM_COMMIT and mbi.Type == MEM_PRIVATE and
-                    mbi.Protect in READABLE and not (mbi.Protect & PAGE_GUARD)):
+            if (mbi.State == MEM_COMMIT and mbi.Type in (MEM_PRIVATE, MEM_MAPPED)
+                    and (mbi.Protect & 0xFF) in WRITABLE
+                    and not (mbi.Protect & PAGE_GUARD)):
                 out.append((mbi.BaseAddress, mbi.RegionSize))
             addr = mbi.BaseAddress + mbi.RegionSize
             if addr >= 0x7FFFFFFFFFFF:
