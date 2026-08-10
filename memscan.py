@@ -6,6 +6,27 @@ README), because identity is not in the picture. This reads it from the process.
 
 Nothing here writes to the game -- ReadProcessMemory only.
 
+READ THIS BEFORE EXTENDING THE SCANNING. The player position is found reliably
+(--track, fit 0.002-0.03 on a quiet map). The entity list is not, and scanning
+harder will not get it: 226,000 Vec3s sit within a 400-unit square around the
+character, one every half metre, so any target position matches something --
+both signs of the fitted transform matched ~30 of 30 monster dots with a median
+gap of 0.4 units. Killing a monster narrows it to a few dozen freed addresses,
+but those are its death effects, one position repeated across a churning pool.
+
+The game answers this itself. global-metadata.dat next to the exe carries the
+IL2CPP class and field names, and already contains IsMonster, IsMonsterNotSummon,
+MonsterId, PetId, OwnerId and EntityType -- IsMonsterNotSummon being exactly the
+monster-versus-pet distinction all of this set out to recover. Il2CppDumper turns
+that file plus GameAssembly.dll into class definitions with byte offsets, which
+replaces every heuristic here with a field read. Do that before writing more
+scanning code.
+
+Separately, and useful without any of this: the minimap frame is rotated relative
+to the stick frame, and the rotation is per map (0 degrees on one, 90 on another).
+minimap_bot feeds minimap deltas straight to the stick, so on a rotated map every
+heading it takes is wrong. correlate() measures that rotation in about 15 seconds.
+
 deps: none beyond the stdlib. ctypes talks to the Win32 API directly.
 
 usage:
