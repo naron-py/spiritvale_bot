@@ -554,13 +554,18 @@ def watch_position():
             time.sleep(0.1)
 
 
-def hunt(walk, stand, rounds=10, min_walk=0.05, still_tol=1e-4, verbose=True):
+def hunt(walk, stand, rounds=10, min_walk=0.2, still_tol=0.02,
+         travelled=None, verbose=True):
     """Cheat Engine's iterative scan, automated: walk, stand, walk, stand...
 
     Each round is a hard filter -- a coordinate MUST change while walking and MUST
     NOT change while standing. One round of each proves little; ten in a row is
     what collapses millions of floats to a handful, and it is the part that makes
     the manual version tedious. Driving the stick from here removes that.
+
+    still_tol is not zero on purpose. A character position keeps twitching while
+    the character stands there -- server reconciliation, idle animation -- and
+    demanding it hold to 1e-4 threw the real thing away along with the noise.
 
     Candidates live as numpy arrays keyed by page, not a Python dict of addresses:
     there are millions after round one.
@@ -593,6 +598,12 @@ def hunt(walk, stand, rounds=10, min_walk=0.05, still_tol=1e-4, verbose=True):
         for r in range(rounds):
             moving = r % 2 == 1          # candidates were captured after a walk
             (walk if moving else stand)(1.2)
+            if moving and travelled is not None and not travelled():
+                # the character was blocked, so nothing was proved. Applying the
+                # "must have moved" filter here would delete the real position.
+                if verbose:
+                    print(f"  round {r + 1:2d} walk : blocked, round skipped")
+                continue
             fresh = read_pages(mem, cands)
             nxt = {}
             for key, (idx, old) in cands.items():
@@ -621,7 +632,8 @@ def hunt(walk, stand, rounds=10, min_walk=0.05, still_tol=1e-4, verbose=True):
         return cands
 
 
-def correlate(mem, addrs, drive, grab_gray, shift_of, legs=None, verbose=True):
+def correlate(mem, addrs, drive, grab_gray, shift_of, wake=lambda: None,
+              legs=None, verbose=True):
     """Rank addresses by how well they track the minimap across several headings.
 
     The minimap is ground truth: whatever the world axes are, a real position maps
@@ -631,22 +643,37 @@ def correlate(mem, addrs, drive, grab_gray, shift_of, legs=None, verbose=True):
     do nothing going east, and several here do exactly that.
     """
     legs = legs or [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0),
-                    (0.7, 0.7), (-0.7, 0.7)]
+                    (0.7, 0.7), (-0.7, 0.7), (0.7, -0.7), (-0.7, -0.7)]
     world = {a: [] for a in addrs}
     mini = []
+
+    wake()                 # once, outside the measured legs
+    for _ in range(2):     # throwaway: the first pushes after a pause come
+        drive(0.0, 1.0, 0.8)   # out weak, and a soft leg skews every fit
+        drive(0.0, -1.0, 0.8)
 
     for sx, sy in legs:
         g0 = grab_gray()
         before = {a: read_vec3(mem, a) for a in addrs}
         drive(sx, sy, 1.2)
         after = {a: read_vec3(mem, a) for a in addrs}
-        mini.append(shift_of(g0, grab_gray()))
+        shift = shift_of(g0, grab_gray())
+        if (shift[0] ** 2 + shift[1] ** 2) ** 0.5 < 5.0:
+            if verbose:
+                print(f"    leg ({sx:+.1f},{sy:+.1f}) went nowhere -- dropped")
+            continue        # blocked by terrain; it proves nothing either way
+        mini.append(shift)
         for a in addrs:
             b, f = before[a], after[a]
             world[a].append((f[0] - b[0], f[2] - b[2]) if b and f else (0.0, 0.0))
         if verbose:
             print(f"    leg ({sx:+.1f},{sy:+.1f}) minimap "
-                  f"({mini[-1][0]:+6.1f},{mini[-1][1]:+6.1f})")
+                  f"({shift[0]:+6.1f},{shift[1]:+6.1f})")
+
+    if len(mini) < 4:
+        if verbose:
+            print(f"    only {len(mini)} usable legs -- need open ground")
+        return []
 
     M = np.array(mini)                      # minimap travel per leg
     scored = []
@@ -686,6 +713,9 @@ def hunt_report(cands, limit=20):
     return out
 
 
+HITS_FILE = "memscan_hits.txt"
+
+
 def track(rounds=10):
     """Hunt for the position, then rank survivors against the minimap.
 
@@ -714,7 +744,9 @@ def track(rounds=10):
         return dx, dy
 
     def drive(sx, sy, secs):
-        bot.wake_controller(pad)
+        # deliberately no wake_controller here: its up-then-down nudge lands
+        # inside the measured window and cancels most of the leg's travel.
+        # Waking once before the legs is enough -- the walking keeps it awake.
         t0 = time.time()
         while time.time() - t0 < secs:
             pad.stick(sx, sy, False)
@@ -735,18 +767,36 @@ def track(rounds=10):
         pad.stick(0.0, 0.0, False)
         time.sleep(secs)
 
+    seen = {"gray": None}
+
+    def walk_watched(secs):
+        seen["gray"] = grab_gray()
+        walk(secs)
+
+    def travelled():
+        if seen["gray"] is None:
+            return True
+        dx, dy = shift_of(seen["gray"], grab_gray())
+        return (dx * dx + dy * dy) ** 0.5 >= 8.0
+
     print("focus the game -- 3s")
     time.sleep(3)
     try:
-        cands = hunt(walk, stand, rounds=rounds)
+        cands = hunt(walk_watched, stand, rounds=rounds, travelled=travelled)
         addrs = [base + page * PAGE + int(i) * 4
                  for (base, page), (idx, _) in cands.items() for i in idx]
         if not addrs:
             print("nothing survived the hunt")
             return
+        # saved so the correlation can be retried without a fresh 3-minute hunt;
+        # the addresses stay valid until the character object is rebuilt
+        with open(HITS_FILE, "w") as fh:
+            fh.write("\n".join(f"{a:X}" for a in addrs))
+        print(f"  survivors written to {HITS_FILE}")
         print(f"\ncorrelating {len(addrs):,} survivors against the minimap")
         with Mem() as mem:
-            scored = correlate(mem, addrs, drive, grab_gray, shift_of)
+            scored = correlate(mem, addrs, drive, grab_gray, shift_of,
+                               wake=lambda: bot.wake_controller(pad))
         if not scored:
             print("  none of them moved on every heading")
             return

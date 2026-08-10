@@ -6,3 +6,4 @@ __pycache__/
 minimap_snap.png
 calib_*.png
 image.png
+memscan_hits.txt
