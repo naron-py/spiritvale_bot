@@ -1085,16 +1085,36 @@ def units_like(mem, sample, limit=4000):
     return [o for o in instances_of(mem, cls, limit) if unit_at(mem, o)]
 
 
+def looks_like_class(mem, ptr):
+    """Rough check that `ptr` is an Il2CppClass and not an uninitialised slot.
+
+    A class is heap-allocated below module space and starts with a pointer to its
+    Il2CppImage. Slots read as garbage before their class is initialised -- at a
+    login or loading screen, one read as 0x1E0000 -- and scanning for a garbage
+    value matches unrelated memory and invents units out of it.
+    """
+    if not (0x10000 < ptr < 0x7FF000000000):
+        return False
+    first = read_ptr(mem, ptr)
+    return bool(first) and bool(mem.read(first, 8))
+
+
 def type_classes(mem):
     """{'monster': class_ptr, ...} resolved through GameAssembly.dll at runtime.
 
-    The RVAs come from the dump; ASLR moves the module, so each one is read from
-    wherever the module actually landed this session.
+    The RVAs come from the dump; ASLR moves the module, so each is read from
+    wherever it actually landed. Entries that have not been initialised yet are
+    dropped rather than returned as nonsense.
     """
     base = module_base(mem.pid, "GameAssembly.dll")
     if base is None:
         return {}
-    return {name: read_ptr(mem, base + rva) for name, rva in TYPE_RVA.items()}
+    out = {}
+    for name, rva in TYPE_RVA.items():
+        ptr = read_ptr(mem, base + rva)
+        if looks_like_class(mem, ptr):
+            out[name] = ptr
+    return out
 
 
 def unit_regions(mem, cls=None):
@@ -1122,6 +1142,8 @@ def world_units(mem, regions=None):
         return []
     out = []
     for name, kind in (("monster", None), ("player", "player")):
+        if not cls.get(name):
+            continue        # that class has not been initialised yet
         for obj in instances_of(mem, cls[name], limit=8000, regions=regions):
             if not unit_at(mem, obj):
                 continue

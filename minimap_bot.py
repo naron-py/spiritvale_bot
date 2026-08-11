@@ -677,6 +677,7 @@ class MemoryEyes:
         self.me = None            # our own BaseUnitController
         self.basis = None         # stick push -> world travel
         self.units = []           # cached (kind, addr, x, y, z)
+        self.world_per_px = None  # minimap scale, measured during calibration
         self.anchor = None        # (x, z) the leash is measured from
         self.mode = "chasing"
         self.hot = None           # regions worth sweeping
@@ -701,8 +702,12 @@ class MemoryEyes:
                 out[a] = p
         return out
 
-    def calibrate(self, pad):
+    def calibrate(self, pad, grab=None):      
         """Find which unit is us, and how a stick push maps to world travel.
+
+        `grab` returns a greyscale minimap frame. Given one, the same two pushes
+        also measure how many world units a minimap pixel is worth, which is what
+        lets a leash radius be quoted in something the player can see.
 
         Both come from the same two pushes: our unit is the one that moves when
         we push, which is a fact we can create on demand rather than infer. It
@@ -712,8 +717,11 @@ class MemoryEyes:
         if not players:
             return False
 
+        seen = []
+
         def push(sx, sy):
             before = self._positions(players)
+            g0 = grab() if grab else None
             t0 = time.time()
             while time.time() - t0 < MEM_CAL_PUSH_S:
                 pad.stick(sx, sy, False)
@@ -721,6 +729,12 @@ class MemoryEyes:
             pad.stick(0.0, 0.0, False)
             time.sleep(0.2)
             after = self._positions(players)
+            if g0 is not None:
+                # the same push, measured on the minimap: world units per pixel
+                han = cv2.createHanningWindow((g0.shape[1], g0.shape[0]),
+                                              cv2.CV_32F)
+                (mx, my), _ = cv2.phaseCorrelate(g0, grab(), han)
+                seen.append((mx * mx + my * my) ** 0.5)
             return {a: (after[a][0] - before[a][0], after[a][2] - before[a][2])
                     for a in before if a in after}
 
@@ -737,7 +751,17 @@ class MemoryEyes:
         ex, ez = east[best]
         nx, nz = north[best]
         self.basis = ((ex, nx), (ez, nz))
+        # How many world units a minimap pixel is worth, so a leash radius can be
+        # quoted in something visible. It is per map -- the minimap zooms.
+        travel = [(ex * ex + ez * ez) ** 0.5, (nx * nx + nz * nz) ** 0.5]
+        pairs = [(w, m) for w, m in zip(travel, seen) if m > 3.0]
+        self.world_per_px = (sum(w / m for w, m in pairs) / len(pairs)
+                             if pairs else None)
         return stick_for(self.basis, 1.0, 0.0) is not None
+
+    def leash_in_pixels(self, radius=LEASH_RADIUS):
+        """The leash radius in minimap pixels, or None if the scale is unknown."""
+        return radius / self.world_per_px if self.world_per_px else None
 
     def start_scanning(self):
         """Rediscover units in the background, forever. Never blocks the bot.
@@ -990,9 +1014,14 @@ def main(port=None):
                     tapped = time.time()
                     if eyes is not None and tapped - last_toggle < DOUBLE_TAP_S:
                         spot = eyes.set_anchor()
-                        print(f"\nanchor set at ({spot[0]:.0f},{spot[1]:.0f}); "
-                              f"staying within {LEASH_RADIUS:g} of it"
-                              if spot else "\nanchor cleared; roaming freely")
+                        if spot:
+                            px_r = eyes.leash_in_pixels()
+                            reach = (f"{px_r:.0f} minimap px" if px_r
+                                     else f"{LEASH_RADIUS:g} world units")
+                            print(f"\nanchor set at ({spot[0]:.0f},{spot[1]:.0f})"
+                                  f" -- staying within {reach} of it")
+                        else:
+                            print("\nanchor cleared; roaming freely")
                     last_toggle = tapped
                     paused = toggle_running(paused, pad, pet_filter)
                     target_lock.reset()
@@ -1048,8 +1077,17 @@ def main(port=None):
                     # already been fighting on pixels rather than before it.
                     print("\nunit list ready -- calibrating (2s)")
                     if eyes.calibrate(pad):
+                        px_r = eyes.leash_in_pixels()
+                        half = minimap_region(win)["width"] / 2
+                        scale = (f"{eyes.world_per_px:.2f} world units per "
+                                 f"minimap pixel" if eyes.world_per_px
+                                 else "minimap scale unknown")
                         print(f"  locked on 0x{eyes.me:012X}; targeting monsters "
                               f"by what they are, not how they look")
+                        print(f"  {scale}; a {LEASH_RADIUS:g}-unit leash is "
+                              + (f"{px_r:.0f} minimap px, "
+                                 f"{100 * px_r / half:.0f}% of the way to the "
+                                 f"minimap edge" if px_r else "unmeasurable"))
                     else:
                         print("  could not tell which unit is ours -- "
                               "staying on pixels")
