@@ -6,6 +6,12 @@ README), because identity is not in the picture. This reads it from the process.
 
 Nothing here writes to the game -- ReadProcessMemory only.
 
+SOLVED, and not by scanning: Il2CppDumper on GameAssembly.dll plus
+global-metadata.dat gives the class and field layout outright. A pet is a
+MonsterController exactly like a monster is -- the difference is that its
+SummoningComponent._Summoner is set. See the offsets below. What follows is the
+history of getting there, kept because it says which roads are closed.
+
 READ THIS BEFORE EXTENDING THE SCANNING. The player position is found reliably
 (--track, fit 0.002-0.03 on a quiet map). The entity list is not, and scanning
 harder will not get it: 226,000 Vec3s sit within a 400-unit square around the
@@ -47,6 +53,26 @@ import numpy as np
 from ctypes import wintypes
 
 PROCESS_NAME = "SpiritVale.exe"
+
+# Field offsets from Il2CppDumper (GameAssembly.dll + global-metadata.dat,
+# metadata version 31). These are what the whole scanning detour was trying to
+# reconstruct, and they answer it outright.
+#
+# Every creature is a BaseUnitController. It has exactly two subclasses,
+# MonsterController and PlayerController -- so a pet is a MonsterController too,
+# which is why no amount of looking at red pixels could ever separate them, and
+# why the game itself carries a helper called IsMonsterNotSummon.
+#
+# What separates them is the summoner. Each unit owns a SummoningComponent, and
+# that component's _Summoner points at whoever summoned the unit: null for a real
+# monster, set for a pet. The player's own pets are also listed directly in their
+# own component's ActiveSummons.
+UNIT_POSITION = 0x190        # BaseUnitController._lastValidPosition, Vector3
+UNIT_SUMMONING = 0x148       # BaseUnitController.Summoning -> SummoningComponent
+SUMMONING_SUMMONER = 0x140   # SummoningComponent._Summoner -> BaseUnitController
+SUMMONING_ACTIVE = 0x118     # SummoningComponent.ActiveSummons -> List<Monster>
+MONSTER_ID = 0x218           # MonsterController.MonsterId, string
+MONSTER_SPAWNER = 0x288      # MonsterController.Spawner, null on a summon
 
 # Win32 constants, from memoryapi.h
 PROCESS_QUERY_INFORMATION = 0x0400
