@@ -931,11 +931,16 @@ def object_headers(mem, addr, back=0x600):
     return out
 
 
-def instances_of(mem, class_ptr, limit=4000):
-    """Addresses of every object whose header points at `class_ptr`."""
+def instances_of(mem, class_ptr, limit=4000, regions=None):
+    """Addresses of every object whose header points at `class_ptr`.
+
+    `regions` narrows the search to bases already known to hold instances. A full
+    sweep reads ~8 GB and takes about 14 seconds; the units live in a handful of
+    heap regions, so repeating the sweep is almost all waste.
+    """
     target = np.uint64(class_ptr)
     out = []
-    for base, size in mem.regions():
+    for base, size in (regions if regions is not None else mem.regions()):
         blob = mem.read(base, min(size, 1 << 24))
         if not blob:
             continue
@@ -1092,7 +1097,20 @@ def type_classes(mem):
     return {name: read_ptr(mem, base + rva) for name, rva in TYPE_RVA.items()}
 
 
-def world_units(mem):
+def unit_regions(mem, cls=None):
+    """The regions that actually hold units, for narrowing later sweeps."""
+    cls = cls or type_classes(mem)
+    hot = set()
+    for name in ("monster", "player"):
+        if not cls.get(name):
+            continue
+        for obj in instances_of(mem, cls[name], limit=8000):
+            hot.add(obj & ~0xFFFFFF)          # 16 MB granularity
+    return [(b, s) for b, s in mem.regions()
+            if any(b <= h + 0xFFFFFF and b + s > h for h in hot)]
+
+
+def world_units(mem, regions=None):
     """[(kind, unit, x, y, z)] for every unit the client is tracking.
 
     kind is 'monster', 'pet' or 'player'. No searching and no heuristics: the
@@ -1104,7 +1122,7 @@ def world_units(mem):
         return []
     out = []
     for name, kind in (("monster", None), ("player", "player")):
-        for obj in instances_of(mem, cls[name], limit=8000):
+        for obj in instances_of(mem, cls[name], limit=8000, regions=regions):
             if not unit_at(mem, obj):
                 continue
             pos = read_vec3(mem, obj + UNIT_POSITION)

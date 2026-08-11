@@ -43,7 +43,7 @@ ATTACK_PERIOD_S = 0.40   # mash cycle, ignored while ATTACK_MASH is False
 ATTACK_HOLD_S = 0.15     # how long L1 stays down each mash cycle
 BUFF_PERIOD_S = 60.0     # recast the buff sequence this often
 BUFF_SEQUENCE = ("up", "left", "down", "right")
-SPAM_BUTTON = None       # button tapped on its own timer while running; None = off
+SPAM_BUTTON = "y"       # button tapped on its own timer while running; None = off
 SPAM_PERIOD_S = 2
 SPAM_HOLD_S = 0.05
 WAKE_AMP = 0.5           # stick nudge that flips the game into controller mode
@@ -97,6 +97,15 @@ SEA_MATCH_MIN = 0.70
 MODAL_DARK = ((0.44, 0.093), (0.55, 0.093))
 PANEL_WHITE = (0.42, 0.60)    # white body of the server table
 CHAR_BG = ((0.30, 0.50), (0.50, 0.06), (0.70, 0.85), (0.06, 0.60))  # dark backdrop
+# Targeting from the game's own unit list rather than from red pixels. It knows
+# what a thing IS -- monster, pet, player -- so the pet, other players' pets,
+# mushroom terrain art and the minimap's rotation all stop mattering at once.
+# Falls back to the screen path when the offsets go stale, which a patch does.
+MEMORY_TARGETING = True
+MEM_REFRESH_S = 2.0      # rediscovering units scans GBs; positions are re-read
+MEM_RANGE = 70.0         # world units; roughly what the minimap used to cover
+MEM_CAL_PUSH_S = 0.7     # per calibration push, two of them
+MEM_CAL_MIN = 0.5        # world units a push must move us to count
 TOGGLE_VK = 0x23         # End, polled globally through GetAsyncKeyState
 START_PAUSED = True      # launching the script must never move the character
 LOOP_HZ = 20
@@ -579,6 +588,38 @@ def pick_target(img, pet_filter=None, target_lock=None,
     return (cx, cy), dots, chosen
 
 
+def stick_for(basis, dx, dz):
+    """Stick (sx, sy) that walks toward a world offset, or None if unsolvable.
+
+    `basis` maps a stick push to the world travel it produces, measured live:
+    [[wx_for_sx, wx_for_sy], [wz_for_sx, wz_for_sy]]. Inverting it answers the
+    question the bot actually has -- which way to push to go there. Doing it this
+    way means the world's axes and the camera's never have to be known.
+    """
+    (a, b), (c, d) = basis
+    det = a * d - b * c
+    if abs(det) < 1e-9:
+        return None                    # the two pushes were parallel: no basis
+    sx = (d * dx - b * dz) / det
+    sy = (-c * dx + a * dz) / det
+    n = (sx * sx + sy * sy) ** 0.5
+    if n < 1e-9:
+        return None
+    return sx / n * SPEED, sy / n * SPEED
+
+
+def nearest_monster(units, px, pz, reach=MEM_RANGE):
+    """Closest unit that is actually a monster. Pets are simply not monsters."""
+    best, best_d = None, reach
+    for kind, addr, x, y, z in units:
+        if kind != "monster":
+            continue
+        d = ((x - px) ** 2 + (z - pz) ** 2) ** 0.5
+        if d < best_d:
+            best, best_d = (addr, x, y, z), d
+    return (best, best_d) if best else (None, None)
+
+
 def stick_vector(dx, dy, radius):
     """Screen delta -> left-stick (x, y), y up positive.
 
@@ -589,6 +630,133 @@ def stick_vector(dx, dy, radius):
     n = max((dx * dx + dy * dy) ** 0.5, 1e-6)
     scale = SPEED / n
     return float(np.clip(dx * scale, -1, 1)), float(np.clip(-dy * scale, -1, 1))
+
+
+class MemoryEyes:
+    """Targets read from the game's unit list instead of inferred from pixels.
+
+    Discovery is slow -- finding every instance of a class means scanning GBs --
+    so it happens on a timer and each frame only re-reads the positions of units
+    already found. Spawns show up a refresh late, which at this range is nothing.
+    """
+
+    def __init__(self):
+        import memscan
+        self.ms = memscan
+        self.mem = memscan.Mem()
+        self.classes = memscan.type_classes(self.mem)
+        self.me = None            # our own BaseUnitController
+        self.basis = None         # stick push -> world travel
+        self.units = []           # cached (kind, addr, x, y, z)
+        self.hot = None           # regions worth sweeping
+        self.scanner = None
+        self.stop = None
+        import threading
+        self.lock = threading.Lock()
+
+    def available(self):
+        return bool(self.classes.get("monster"))
+
+    def close(self):
+        if self.stop is not None:
+            self.stop.set()
+        self.mem.close()
+
+    def _positions(self, addrs):
+        out = {}
+        for a in addrs:
+            p = self.ms.read_vec3(self.mem, a + self.ms.UNIT_POSITION)
+            if p and self.ms.looks_like_place(p):
+                out[a] = p
+        return out
+
+    def calibrate(self, pad):
+        """Find which unit is us, and how a stick push maps to world travel.
+
+        Both come from the same two pushes: our unit is the one that moves when
+        we push, which is a fact we can create on demand rather than infer. It
+        works mid-combat, unlike anything built on walking a clean line.
+        """
+        players = [u for k, u, *_ in self.ms.world_units(self.mem) if k == "player"]
+        if not players:
+            return False
+
+        def push(sx, sy):
+            before = self._positions(players)
+            t0 = time.time()
+            while time.time() - t0 < MEM_CAL_PUSH_S:
+                pad.stick(sx, sy, False)
+                time.sleep(0.05)
+            pad.stick(0.0, 0.0, False)
+            time.sleep(0.2)
+            after = self._positions(players)
+            return {a: (after[a][0] - before[a][0], after[a][2] - before[a][2])
+                    for a in before if a in after}
+
+        east, north = push(1.0, 0.0), push(0.0, 1.0)
+        best, best_score = None, MEM_CAL_MIN
+        for a, (ex, ez) in east.items():
+            nx, nz = north.get(a, (0.0, 0.0))
+            score = min((ex * ex + ez * ez) ** 0.5, (nx * nx + nz * nz) ** 0.5)
+            if score > best_score:
+                best, best_score = a, score
+        if best is None:
+            return False
+        self.me = best
+        ex, ez = east[best]
+        nx, nz = north[best]
+        self.basis = ((ex, nx), (ez, nz))
+        return stick_for(self.basis, 1.0, 0.0) is not None
+
+    def start_scanning(self):
+        """Rediscover units in the background, forever.
+
+        Even narrowed to the regions that hold units, a sweep takes about a
+        second -- a fifth of the loop's frames. It runs on its own thread with
+        its own handle so the bot keeps steering from the last list while the
+        next one is built.
+        """
+        import threading
+        self.hot = self.ms.unit_regions(self.mem, self.classes)
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+
+        def loop():
+            mem = self.ms.Mem(self.mem.pid)
+            try:
+                while not self.stop.is_set():
+                    found = self.ms.world_units(mem, regions=self.hot)
+                    with self.lock:
+                        self.units = found
+                    self.stop.wait(MEM_REFRESH_S)
+            finally:
+                mem.close()
+
+        self.scanner = threading.Thread(target=loop, daemon=True)
+        self.scanner.start()
+
+    def target(self, now):
+        """(sx, sy, distance) toward the nearest monster, or (None, None, None).
+
+        Positions come fresh every call; only the membership list is cached, so a
+        monster that walks is chased where it is now, not where it was.
+        """
+        if not (self.me and self.basis):
+            return None, None, None
+        with self.lock:
+            cached = list(self.units)
+        live = self._positions([u for _, u, *_ in cached] + [self.me])
+        here = live.get(self.me)
+        if not here:
+            self.me = None            # our unit was rebuilt: recalibrate
+            return None, None, None
+        px, _, pz = here
+        fresh = [(k, u, *live[u]) for k, u, *_ in cached if u in live]
+        hit, dist = nearest_monster(fresh, px, pz)
+        if not hit:
+            return None, None, None
+        s = stick_for(self.basis, hit[1] - px, hit[3] - pz)
+        return (s[0], s[1], dist) if s else (None, None, None)
 
 
 class VirtualPad:
@@ -721,6 +889,18 @@ def main(port=None):
           f" via {type(pad).__name__} -- End to start/stop, ctrl+c to exit")
 
     last = None  # (t, dist, sx, sy) of last seen dot
+    eyes = None
+    if MEMORY_TARGETING:
+        try:
+            eyes = MemoryEyes()
+            if not eyes.available():
+                print("memory targeting: classes did not resolve -- re-run "
+                      "Il2CppDumper and update TYPE_RVA; reading pixels instead")
+                eyes.close()
+                eyes = None
+        except Exception as e:                  # game closed, no rights, no dump
+            print(f"memory targeting unavailable ({e}); reading pixels instead")
+            eyes = None
     pet_filter = PetFilter()
     target_lock = TargetLock()
     target_blacklist = TargetBlacklist()
@@ -747,6 +927,22 @@ def main(port=None):
                     buff_queue = []
                     next_buff = next_press = next_spam = 0.0
                     print(f"\n{'STOPPED' if paused else 'STARTED'} (End)")
+                    if not paused and eyes is not None:
+                        # Two pushes tell us which unit is ours and how a stick
+                        # direction maps to world travel. Both are facts we make
+                        # rather than infer, so it works mid-fight.
+                        print("calibrating against the game's unit list...")
+                        if eyes.calibrate(pad):
+                            print(f"  locked on 0x{eyes.me:012X}; mapping out "
+                                  f"the heap once (~15s), then starting")
+                            eyes.start_scanning()
+                            print("  targeting monsters by what they are, "
+                                  "not how they look")
+                        else:
+                            print("  could not tell which unit is ours -- "
+                                  "reading pixels instead")
+                            eyes.close()
+                            eyes = None
                 if paused:
                     time.sleep(0.05)
                     continue
@@ -779,12 +975,36 @@ def main(port=None):
                 img = np.array(sct.grab(reg))[:, :, :3]
                 h, w = img.shape[:2]
                 now = time.time()
-                (cx, cy), dots, dot = pick_target(
-                    img, pet_filter, target_lock, target_blacklist, now)
+                sx = sy = None
+                if eyes is not None:
+                    # The unit list knows what each thing IS, so none of the
+                    # pixel machinery is needed here: no pet filter, no
+                    # saturation threshold for mushrooms, no minimap rotation.
+                    msx, msy, mdist = eyes.target(now)
+                    if msx is None and eyes.me is None:
+                        print("\nour unit was rebuilt (map change, death or "
+                              "relog) -- press End twice to recalibrate")
+                        eyes.close()
+                        eyes = None            # pixels until recalibrated
+                    elif msx is None:
+                        sx = sy = 0.0
+                        state = "no monster"
+                    else:
+                        sx, sy, state = msx, msy, f"dist {mdist:6.1f}"
 
-                stuck = (dot is not None and stuck_watchdog.update(
-                    target_lock.target_id, dot, cx, cy, now))
-                if stuck:
+                # Everything below is the pixel path, used when memory targeting
+                # is off or has gone stale. It is left exactly as it was.
+                if sx is None:
+                    (cx, cy), dots, dot = pick_target(
+                        img, pet_filter, target_lock, target_blacklist, now)
+                    stuck = (dot is not None and stuck_watchdog.update(
+                        target_lock.target_id, dot, cx, cy, now))
+                else:
+                    dot = stuck = None
+
+                if sx is not None:
+                    pass                    # the unit list already decided
+                elif stuck:
                     target_blacklist.block(dot, now)
                     target_lock.reset()
                     stuck_watchdog.reset()
@@ -905,6 +1125,27 @@ def demo():
                             now=TARGET_IGNORE_S + 0.01) == [moved_blocked, other]
 
     assert TOGGLE_VK == 0x23 and START_PAUSED
+
+    # Memory targeting. stick_for inverts a measured basis, so the world's axes
+    # and the camera's orientation never have to be known -- which is the point:
+    # a rotated minimap cannot mislead a heading computed this way.
+    ident = ((1.0, 0.0), (0.0, 1.0))          # stick east goes world +x
+    sx, sy = stick_for(ident, 3.0, 0.0)
+    assert sx > 0.99 and abs(sy) < 0.01, (sx, sy)
+    turned = ((0.0, -1.0), (1.0, 0.0))        # world rotated 90 degrees
+    sx, sy = stick_for(turned, 0.0, 5.0)      # want +z, must push east
+    assert sx > 0.99 and abs(sy) < 0.01, (sx, sy)
+    assert stick_for(((1.0, 2.0), (2.0, 4.0)), 1.0, 1.0) is None  # parallel pushes
+    assert abs((lambda s: (s[0] ** 2 + s[1] ** 2) ** 0.5)(
+        stick_for(ident, 900.0, 900.0)) - SPEED) < 1e-6   # always full tilt
+
+    # a pet is never a target, however close it sits
+    around = [("pet", 0xA, 1.0, 0.0, 0.0), ("monster", 0xB, 9.0, 0.0, 0.0),
+              ("player", 0xC, 2.0, 0.0, 0.0), ("monster", 0xD, 40.0, 0.0, 0.0)]
+    hit, dist = nearest_monster(around, 0.0, 0.0)
+    assert hit[0] == 0xB and abs(dist - 9.0) < 1e-6, (hit, dist)
+    assert nearest_monster(around, 0.0, 0.0, reach=5.0) == (None, None)
+    assert nearest_monster([("pet", 0xA, 1.0, 0.0, 0.0)], 0.0, 0.0) == (None, None)
     polled = []
     assert toggle_key_hit(lambda vk: polled.append(vk) or 1)
     assert polled == [0x23]
