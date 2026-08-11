@@ -117,7 +117,11 @@ MEM_CAL_MIN = 0.5        # world units a push must move us to count
 # scale has never been measured.
 LEASH_PX = 100.0         # minimap pixels from the anchor; the box half-width is 140
 LEASH_RADIUS = 45.0      # world units, used only when the scale is unknown
-LEASH_SLACK = 1.15       # walk home only past this much of the radius
+# Turning back happens AT the circle, not past it -- the circle is what you drew,
+# so it has to be the promise. The damping that stops it bouncing on the boundary
+# is on the way back in instead: once heading home it keeps going until it is
+# well inside, rather than re-engaging the moment it crosses the line.
+LEASH_RESUME = 0.85      # fraction of the radius to get back to before chasing
 DOUBLE_TAP_S = 0.6       # two End presses closer than this mean "anchor here"
 # The minimap scale is measured during calibration and kept here so --snap can
 # draw the leash without a pad or a running game. It is per map, so the file
@@ -667,16 +671,20 @@ def within_leash(units, anchor, radius=LEASH_RADIUS):
             if (u[2] - ax) ** 2 + (u[4] - az) ** 2 <= radius * radius]
 
 
-def strayed(px, pz, anchor, radius=LEASH_RADIUS, slack=LEASH_SLACK):
-    """True once the character is far enough out to be worth walking back.
+def strayed(px, pz, anchor, radius=LEASH_RADIUS, going_home=False,
+            resume=LEASH_RESUME):
+    """Should the bot be walking home right now?
 
-    The slack matters: a monster right on the boundary would otherwise have the
-    bot stepping over the line and back, chasing and returning forever.
+    Two thresholds, not one. It turns back the moment it crosses the circle, so
+    the circle drawn on --snap is the actual limit. But once turning back it
+    keeps going until it is `resume` of the way in, which is what stops it
+    bouncing along the boundary chasing a monster that sits on the line.
     """
     if anchor is None:
         return False
     ax, az = anchor
-    return ((px - ax) ** 2 + (pz - az) ** 2) ** 0.5 > radius * slack
+    out = ((px - ax) ** 2 + (pz - az) ** 2) ** 0.5
+    return out > radius * resume if going_home else out > radius
 
 
 def nearest_monster(units, px, pz, reach=MEM_RANGE):
@@ -806,6 +814,23 @@ class MemoryEyes:
         """The leash in world units, from the pixel radius the player set."""
         return leash_world(self.world_per_px)
 
+    def leash_status(self):
+        """A short readout of the leash, for the status line.
+
+        Worth showing every frame: 'no anchor' looks exactly like a leash that
+        is not working, and the difference is a double-tap.
+        """
+        if self.anchor is None:
+            return "no anchor"
+        here = self.ms.read_vec3(self.mem, self.me + self.ms.UNIT_POSITION) \
+            if self.me else None
+        if not here:
+            return "anchor?"
+        out = ((here[0] - self.anchor[0]) ** 2 +
+               (here[2] - self.anchor[1]) ** 2) ** 0.5
+        px = out / self.world_per_px if self.world_per_px else out
+        return f"leash {px:3.0f}/{LEASH_PX:g}px"
+
     def start_scanning(self):
         """Rediscover units in the background, forever. Never blocks the bot.
 
@@ -859,7 +884,8 @@ class MemoryEyes:
             self.me = None            # our unit was rebuilt: recalibrate
             return None, None, None
         px, _, pz = here
-        if strayed(px, pz, self.anchor, self.leash()):
+        heading_home = self.mode == "going home"
+        if strayed(px, pz, self.anchor, self.leash(), heading_home):
             # Too far from home: walk back before looking for anything else,
             # or a chain of kills tows the bot across the map.
             ax, az = self.anchor
@@ -878,16 +904,21 @@ class MemoryEyes:
         return (s[0], s[1], dist) if s else (None, None, None)
 
     def set_anchor(self):
-        """Drop the anchor where the character stands, or lift it if set."""
+        """Drop the anchor where the character stands, or lift it if set.
+
+        Returns ('set'|'cleared'|'not ready', position). The three cases were one
+        `None` before, so a bot that had not calibrated yet reported "anchor
+        cleared" and looked like it had a leash when it had nothing of the sort.
+        """
         if self.anchor is not None:
             self.anchor = None
-            return None
+            return "cleared", None
         here = self.ms.read_vec3(self.mem, self.me + self.ms.UNIT_POSITION) \
             if self.me else None
         if not here:
-            return None
+            return "not ready", None
         self.anchor = (here[0], here[2])
-        return self.anchor
+        return "set", self.anchor
 
 
 class VirtualPad:
@@ -1056,14 +1087,19 @@ def main(port=None):
                     # "anchor here" without deferring the first press, and the
                     # stop key stays instant.
                     tapped = time.time()
-                    if eyes is not None and tapped - last_toggle < DOUBLE_TAP_S:
-                        spot = eyes.set_anchor()
-                        if spot:
+                    if tapped - last_toggle < DOUBLE_TAP_S:
+                        what, spot = eyes.set_anchor() if eyes else \
+                            ("not ready", None)
+                        if what == "set":
                             print(f"\nanchor set at ({spot[0]:.0f},{spot[1]:.0f})"
                                   f" -- staying within {LEASH_PX:g} minimap px "
                                   f"({eyes.leash():.0f} world units) of it")
-                        else:
+                        elif what == "cleared":
                             print("\nanchor cleared; roaming freely")
+                        else:
+                            print("\nNO ANCHOR SET: the bot has not worked out "
+                                  "which unit it is yet. Wait for the "
+                                  "'calibrating' line, then double-tap again.")
                     last_toggle = tapped
                     paused = toggle_running(paused, pad, pet_filter)
                     target_lock.reset()
@@ -1215,8 +1251,10 @@ def main(port=None):
                     key = SPAM_BUTTON
                     next_spam = now + SPAM_PERIOD_S
 
-                print(f"{state:12} stick {sx:+.2f},{sy:+.2f} atk {'#' if atk else '.'}"
-                      f" {key:5}  ", end="\r")
+                leash_note = f" {eyes.leash_status()}" if eyes else " pixels"
+                print(f"{state:12} stick {sx:+.2f},{sy:+.2f} "
+                      f"atk {'#' if atk else '.'} {key:5}{leash_note}   ",
+                      end="\r")
                 time.sleep(1 / LOOP_HZ)
         except KeyboardInterrupt:
             print("\nstopped")
@@ -1318,10 +1356,33 @@ def demo():
     assert within_leash(far, (0.0, 0.0), 45.0) == []
     assert nearest_monster(within_leash(far, (0.0, 0.0), 45.0),
                            49.0, 0.0) == (None, None)
+    # set_anchor tells its three cases apart. They used to be one None, so a bot
+    # that had not calibrated reported "anchor cleared" and looked leashed.
+    class NoUnit:
+        me = None
+        anchor = None
+        ms = None
+        set_anchor = MemoryEyes.set_anchor
+
+    assert NoUnit().set_anchor() == ("not ready", None)
+
+    class Anchored(NoUnit):
+        anchor = (1.0, 2.0)
+
+    a = Anchored()
+    assert a.set_anchor() == ("cleared", None) and a.anchor is None
+
     # Walking home starts past the slack, not at the line, or the bot would step
     # over and back forever.
-    assert not strayed(46.0, 0.0, (0.0, 0.0), 45.0, 1.15)
-    assert strayed(60.0, 0.0, (0.0, 0.0), 45.0, 1.15)
+    # Out at all means turn back -- the drawn circle is the limit, not a
+    # suggestion. It was 15% past, which is exactly the overshoot that showed up
+    # as the bot leaving the circle on screen.
+    assert strayed(46.0, 0.0, (0.0, 0.0), 45.0)
+    assert not strayed(44.0, 0.0, (0.0, 0.0), 45.0)
+    # Already heading home: keep going until well inside, so a monster sitting on
+    # the line cannot make it bounce in and out.
+    assert strayed(44.0, 0.0, (0.0, 0.0), 45.0, going_home=True, resume=0.85)
+    assert not strayed(30.0, 0.0, (0.0, 0.0), 45.0, going_home=True, resume=0.85)
     assert not strayed(9999.0, 0.0, None)                # no anchor, never home
 
     # The leash drawn on --snap needs a scale, and says so rather than guessing
