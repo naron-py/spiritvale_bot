@@ -1057,8 +1057,13 @@ def main(port=None):
         try:
             eyes = MemoryEyes()
             if not eyes.available():
-                print("memory targeting: classes did not resolve -- re-run "
-                      "Il2CppDumper and update TYPE_RVA; reading pixels instead")
+                print("MEMORY TARGETING OFF: the class pointers did not resolve."
+                      "\n  Almost always a game update -- a patch moves every"
+                      " TYPE_RVA in memscan.py (the field offsets usually"
+                      " survive).\n  Re-run Il2CppDumper on GameAssembly.dll +"
+                      " global-metadata.dat and update those three lines."
+                      "\n  Until then: pixels, which means no leash and it will"
+                      " chase pets.")
                 eyes.close()
                 eyes = None
         except Exception as e:                  # game closed, no rights, no dump
@@ -1082,10 +1087,12 @@ def main(port=None):
         try:
             while True:
                 if toggle_key_hit():
-                    # Two taps inside DOUBLE_TAP_S toggle twice, which lands back
-                    # on the state you were in -- so the pair reads cleanly as
-                    # "anchor here" without deferring the first press, and the
-                    # stop key stays instant.
+                    # The second tap means "anchor here" and does NOT toggle, so
+                    # a double-tap from stopped leaves the bot running rather
+                    # than back where it started. The window is measured from
+                    # when the last toggle FINISHED: starting the bot sleeps
+                    # about a second inside wake_controller, and measuring from
+                    # the keypress put every second tap outside the window.
                     tapped = time.time()
                     if tapped - last_toggle < DOUBLE_TAP_S:
                         what, spot = eyes.set_anchor() if eyes else \
@@ -1097,10 +1104,11 @@ def main(port=None):
                         elif what == "cleared":
                             print("\nanchor cleared; roaming freely")
                         else:
-                            print("\nNO ANCHOR SET: the bot has not worked out "
-                                  "which unit it is yet. Wait for the "
-                                  "'calibrating' line, then double-tap again.")
-                    last_toggle = tapped
+                            print("\nNO ANCHOR SET: memory targeting is not "
+                                  "running, so there is nothing to anchor to. "
+                                  "The status line reads 'pixels' when so.")
+                        last_toggle = time.time()
+                        continue           # an anchor tap must not also toggle
                     paused = toggle_running(paused, pad, pet_filter)
                     target_lock.reset()
                     target_blacklist.reset()
@@ -1109,6 +1117,7 @@ def main(port=None):
                     buff_queue = []
                     next_buff = next_press = next_spam = 0.0
                     print(f"\n{'STOPPED' if paused else 'STARTED'} (End)")
+                    last_toggle = time.time()   # after the wake sleep, not before
                     if not paused and eyes is not None and eyes.scanner is None:
                         # Returns at once. The first sweep is slow, so the bot
                         # runs on pixels meanwhile and upgrades itself when the

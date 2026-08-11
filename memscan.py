@@ -79,7 +79,11 @@ MONSTER_SPAWNER = 0x288      # MonsterController.Spawner, null on a summon
 # GameAssembly.dll. From Il2CppDumper's script.json, the *_TypeInfo entries.
 # These move with every patch -- re-dump and update them. Everything else in this
 # file is a search; these three lines are what make it a lookup instead.
-TYPE_RVA = dict(monster=0x5D6F750, player=0x5D973D8, summoning=0x5DF95F0)
+TYPE_RVA = dict(monster=0x5D08E50, player=0x5C60880, summoning=0x5CC1C70)
+# Updated for the build of 2026-08-11 15:59. The previous values were
+# 0x5D6F750 / 0x5D973D8 / 0x5DF95F0 and a patch moved every one of them, which
+# is what "memory targeting unavailable" means in practice. The field offsets
+# above did NOT move across that patch -- only these three lines needed redoing.
 
 # Win32 constants, from memoryapi.h
 PROCESS_QUERY_INFORMATION = 0x0400
