@@ -677,7 +677,7 @@ class MemoryEyes:
         we push, which is a fact we can create on demand rather than infer. It
         works mid-combat, unlike anything built on walking a clean line.
         """
-        players = [u for k, u, *_ in self.ms.world_units(self.mem) if k == "player"]
+        players = self.known_players()   # from the background sweep, never blocks
         if not players:
             return False
 
@@ -709,16 +709,15 @@ class MemoryEyes:
         return stick_for(self.basis, 1.0, 0.0) is not None
 
     def start_scanning(self):
-        """Rediscover units in the background, forever.
+        """Rediscover units in the background, forever. Never blocks the bot.
 
-        Even narrowed to the regions that hold units, a sweep takes about a
-        second -- a fifth of the loop's frames. It runs on its own thread with
-        its own handle so the bot keeps steering from the last list while the
-        next one is built.
+        The first sweep has to read ~8 GB and takes about 14 seconds; narrowed
+        afterwards to the regions that actually held units, it drops to about
+        one. Both are far too slow for a 20 Hz loop, so this runs on its own
+        thread with its own handle and the bot works from pixels until the first
+        list lands. Nothing waits.
         """
         import threading
-        self.hot = self.ms.unit_regions(self.mem, self.classes)
-        self.lock = threading.Lock()
         self.stop = threading.Event()
 
         def loop():
@@ -728,12 +727,23 @@ class MemoryEyes:
                     found = self.ms.world_units(mem, regions=self.hot)
                     with self.lock:
                         self.units = found
+                    if self.hot is None and found:
+                        # Narrow the next sweep to where the units turned out to
+                        # be, rather than paying for the whole heap every time.
+                        spans = mem.regions()
+                        live = {u for _, u, *_ in found}
+                        self.hot = [(b, s) for b, s in spans
+                                    if any(b <= u < b + s for u in live)]
                     self.stop.wait(MEM_REFRESH_S)
             finally:
                 mem.close()
 
         self.scanner = threading.Thread(target=loop, daemon=True)
         self.scanner.start()
+
+    def known_players(self):
+        with self.lock:
+            return [u for k, u, *_ in self.units if k == "player"]
 
     def target(self, now):
         """(sx, sy, distance) toward the nearest monster, or (None, None, None).
@@ -927,22 +937,13 @@ def main(port=None):
                     buff_queue = []
                     next_buff = next_press = next_spam = 0.0
                     print(f"\n{'STOPPED' if paused else 'STARTED'} (End)")
-                    if not paused and eyes is not None:
-                        # Two pushes tell us which unit is ours and how a stick
-                        # direction maps to world travel. Both are facts we make
-                        # rather than infer, so it works mid-fight.
-                        print("calibrating against the game's unit list...")
-                        if eyes.calibrate(pad):
-                            print(f"  locked on 0x{eyes.me:012X}; mapping out "
-                                  f"the heap once (~15s), then starting")
-                            eyes.start_scanning()
-                            print("  targeting monsters by what they are, "
-                                  "not how they look")
-                        else:
-                            print("  could not tell which unit is ours -- "
-                                  "reading pixels instead")
-                            eyes.close()
-                            eyes = None
+                    if not paused and eyes is not None and eyes.scanner is None:
+                        # Returns at once. The first sweep is slow, so the bot
+                        # runs on pixels meanwhile and upgrades itself when the
+                        # unit list arrives -- nothing waits on it.
+                        eyes.start_scanning()
+                        print("scanning for units in the background; "
+                              "reading pixels until it lands")
                 if paused:
                     time.sleep(0.05)
                     continue
@@ -976,6 +977,20 @@ def main(port=None):
                 h, w = img.shape[:2]
                 now = time.time()
                 sx = sy = None
+                if eyes is not None and eyes.me is None and eyes.known_players():
+                    # The sweep has landed, so the two calibration pushes can
+                    # happen now. Two seconds, once, and only after the bot has
+                    # already been fighting on pixels rather than before it.
+                    print("\nunit list ready -- calibrating (2s)")
+                    if eyes.calibrate(pad):
+                        print(f"  locked on 0x{eyes.me:012X}; targeting monsters "
+                              f"by what they are, not how they look")
+                    else:
+                        print("  could not tell which unit is ours -- "
+                              "staying on pixels")
+                        eyes.close()
+                        eyes = None
+
                 if eyes is not None:
                     # The unit list knows what each thing IS, so none of the
                     # pixel machinery is needed here: no pet filter, no
