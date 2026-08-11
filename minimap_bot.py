@@ -111,7 +111,12 @@ MEM_CAL_MIN = 0.5        # world units a push must move us to count
 # so it farms one spot instead of being led across the map by a chain of kills.
 # Needs memory targeting: the pixel path has no idea where "here" is in world
 # terms, only what the minimap shows right now.
-LEASH_RADIUS = 45.0      # world units from the anchor
+# Set the leash in minimap PIXELS: that is the thing you can look at, and --snap
+# can draw it with no game running and nothing measured. The bot converts it to
+# world units when it calibrates. LEASH_RADIUS is only the fallback for when the
+# scale has never been measured.
+LEASH_PX = 100.0         # minimap pixels from the anchor; the box half-width is 140
+LEASH_RADIUS = 45.0      # world units, used only when the scale is unknown
 LEASH_SLACK = 1.15       # walk home only past this much of the radius
 DOUBLE_TAP_S = 0.6       # two End presses closer than this mean "anchor here"
 # The minimap scale is measured during calibration and kept here so --snap can
@@ -643,10 +648,14 @@ def load_scale():
         return None
 
 
-def leash_px(world_per_px=None, radius=LEASH_RADIUS):
-    """The leash radius in minimap pixels, or None without a scale."""
+def leash_world(world_per_px=None):
+    """The leash in world units, converted from the pixel radius that was set.
+
+    Falls back to LEASH_RADIUS when no scale has ever been measured, so the leash
+    still constrains something instead of silently becoming infinite.
+    """
     world_per_px = world_per_px or load_scale()
-    return radius / world_per_px if world_per_px else None
+    return LEASH_PX * world_per_px if world_per_px else LEASH_RADIUS
 
 
 def within_leash(units, anchor, radius=LEASH_RADIUS):
@@ -793,9 +802,9 @@ class MemoryEyes:
         save_scale(self.world_per_px)      # so --snap can draw the leash
         return stick_for(self.basis, 1.0, 0.0) is not None
 
-    def leash_in_pixels(self, radius=LEASH_RADIUS):
-        """The leash radius in minimap pixels, or None if the scale is unknown."""
-        return leash_px(self.world_per_px, radius)
+    def leash(self):
+        """The leash in world units, from the pixel radius the player set."""
+        return leash_world(self.world_per_px)
 
     def start_scanning(self):
         """Rediscover units in the background, forever. Never blocks the bot.
@@ -850,7 +859,7 @@ class MemoryEyes:
             self.me = None            # our unit was rebuilt: recalibrate
             return None, None, None
         px, _, pz = here
-        if strayed(px, pz, self.anchor):
+        if strayed(px, pz, self.anchor, self.leash()):
             # Too far from home: walk back before looking for anything else,
             # or a chain of kills tows the bot across the map.
             ax, az = self.anchor
@@ -861,7 +870,8 @@ class MemoryEyes:
 
         self.mode = "chasing"
         fresh = [(k, u, *live[u]) for k, u, *_ in cached if u in live]
-        hit, dist = nearest_monster(within_leash(fresh, self.anchor), px, pz)
+        hit, dist = nearest_monster(
+            within_leash(fresh, self.anchor, self.leash()), px, pz)
         if not hit:
             return None, None, None
         s = stick_for(self.basis, hit[1] - px, hit[3] - pz)
@@ -1049,11 +1059,9 @@ def main(port=None):
                     if eyes is not None and tapped - last_toggle < DOUBLE_TAP_S:
                         spot = eyes.set_anchor()
                         if spot:
-                            px_r = eyes.leash_in_pixels()
-                            reach = (f"{px_r:.0f} minimap px" if px_r
-                                     else f"{LEASH_RADIUS:g} world units")
                             print(f"\nanchor set at ({spot[0]:.0f},{spot[1]:.0f})"
-                                  f" -- staying within {reach} of it")
+                                  f" -- staying within {LEASH_PX:g} minimap px "
+                                  f"({eyes.leash():.0f} world units) of it")
                         else:
                             print("\nanchor cleared; roaming freely")
                     last_toggle = tapped
@@ -1111,17 +1119,16 @@ def main(port=None):
                     # already been fighting on pixels rather than before it.
                     print("\nunit list ready -- calibrating (2s)")
                     if eyes.calibrate(pad):
-                        px_r = eyes.leash_in_pixels()
                         half = minimap_region(win)["width"] / 2
                         scale = (f"{eyes.world_per_px:.2f} world units per "
                                  f"minimap pixel" if eyes.world_per_px
                                  else "minimap scale unknown")
                         print(f"  locked on 0x{eyes.me:012X}; targeting monsters "
                               f"by what they are, not how they look")
-                        print(f"  {scale}; a {LEASH_RADIUS:g}-unit leash is "
-                              + (f"{px_r:.0f} minimap px, "
-                                 f"{100 * px_r / half:.0f}% of the way to the "
-                                 f"minimap edge" if px_r else "unmeasurable"))
+                        print(f"  {scale}; the {LEASH_PX:g}px leash is "
+                              f"{eyes.leash():.0f} world units, "
+                              f"{100 * LEASH_PX / half:.0f}% of the way to the "
+                              f"minimap edge")
                     else:
                         print("  could not tell which unit is ours -- "
                               "staying on pixels")
@@ -1318,15 +1325,15 @@ def demo():
     assert not strayed(9999.0, 0.0, None)                # no anchor, never home
 
     # The leash drawn on --snap needs a scale, and says so rather than guessing
-    assert leash_px(0.5, 45.0) == 90.0                   # half a unit per pixel
-    assert leash_px(None, 45.0) in (None, leash_px(load_scale(), 45.0))
+    assert leash_world(0.5) == LEASH_PX * 0.5           # pixels times the scale
     import os as _os
     _keep, globals()["SCALE_FILE"] = SCALE_FILE, "test_scale_tmp.txt"
     try:
         assert load_scale() is None                      # nothing saved yet
+        assert leash_world() == LEASH_RADIUS             # falls back, not infinite
         save_scale(0.25)
         assert abs(load_scale() - 0.25) < 1e-9
-        assert leash_px(radius=45.0) == 180.0            # reads the saved scale
+        assert leash_world() == LEASH_PX * 0.25         # reads the saved scale
         save_scale(None)                                 # nothing to save, no-op
         assert abs(load_scale() - 0.25) < 1e-9
     finally:
@@ -1549,16 +1556,14 @@ def snap(path="minimap_snap.png"):
 
     # The leash, in red, so its size is something you can look at rather than a
     # number in world units. The scale comes from the last calibration.
-    r = leash_px()
-    if r:
-        cv2.circle(img, (cx, cy), int(round(r)), (0, 0, 255), 1)
-        edge = 100 * r / (w / 2)
-        print(f"  leash {LEASH_RADIUS:g} world units = {r:.0f} px "
-              f"({edge:.0f}% of the way to the minimap edge), drawn in red"
-              + ("  -- BIGGER THAN THE MINIMAP" if r > w / 2 else ""))
-    else:
-        print(f"  no leash circle: no minimap scale measured yet. Run the bot "
-              f"once and let it calibrate, which writes {SCALE_FILE}")
+    cv2.circle(img, (cx, cy), int(round(LEASH_PX)), (0, 0, 255), 1)
+    edge = 100 * LEASH_PX / (w / 2)
+    scale = load_scale()
+    worth = (f" = {leash_world(scale):.0f} world units" if scale
+             else " (world size unknown until the bot calibrates)")
+    print(f"  leash {LEASH_PX:g} px{worth}, {edge:.0f}% of the way to the "
+          f"minimap edge, drawn in red"
+          + ("  -- BIGGER THAN THE MINIMAP" if LEASH_PX > w / 2 else ""))
     cv2.imwrite(path, img)
     print(f"{w}x{h} region -> {path}")
 
