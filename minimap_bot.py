@@ -106,6 +106,14 @@ MEM_REFRESH_S = 2.0      # rediscovering units scans GBs; positions are re-read
 MEM_RANGE = 70.0         # world units; roughly what the minimap used to cover
 MEM_CAL_PUSH_S = 0.7     # per calibration push, two of them
 MEM_CAL_MIN = 0.5        # world units a push must move us to count
+# Double-tap End to drop an anchor where you stand. After that the bot only
+# chases monsters inside LEASH_RADIUS of it, and walks back if it drifts out --
+# so it farms one spot instead of being led across the map by a chain of kills.
+# Needs memory targeting: the pixel path has no idea where "here" is in world
+# terms, only what the minimap shows right now.
+LEASH_RADIUS = 45.0      # world units from the anchor
+LEASH_SLACK = 1.15       # walk home only past this much of the radius
+DOUBLE_TAP_S = 0.6       # two End presses closer than this mean "anchor here"
 TOGGLE_VK = 0x23         # End, polled globally through GetAsyncKeyState
 START_PAUSED = True      # launching the script must never move the character
 LOOP_HZ = 20
@@ -608,6 +616,27 @@ def stick_for(basis, dx, dz):
     return sx / n * SPEED, sy / n * SPEED
 
 
+def within_leash(units, anchor, radius=LEASH_RADIUS):
+    """Units inside the leash. No anchor means no leash, so everything passes."""
+    if anchor is None:
+        return units
+    ax, az = anchor
+    return [u for u in units
+            if (u[2] - ax) ** 2 + (u[4] - az) ** 2 <= radius * radius]
+
+
+def strayed(px, pz, anchor, radius=LEASH_RADIUS, slack=LEASH_SLACK):
+    """True once the character is far enough out to be worth walking back.
+
+    The slack matters: a monster right on the boundary would otherwise have the
+    bot stepping over the line and back, chasing and returning forever.
+    """
+    if anchor is None:
+        return False
+    ax, az = anchor
+    return ((px - ax) ** 2 + (pz - az) ** 2) ** 0.5 > radius * slack
+
+
 def nearest_monster(units, px, pz, reach=MEM_RANGE):
     """Closest unit that is actually a monster. Pets are simply not monsters."""
     best, best_d = None, reach
@@ -648,6 +677,8 @@ class MemoryEyes:
         self.me = None            # our own BaseUnitController
         self.basis = None         # stick push -> world travel
         self.units = []           # cached (kind, addr, x, y, z)
+        self.anchor = None        # (x, z) the leash is measured from
+        self.mode = "chasing"
         self.hot = None           # regions worth sweeping
         self.scanner = None
         self.stop = None
@@ -761,12 +792,34 @@ class MemoryEyes:
             self.me = None            # our unit was rebuilt: recalibrate
             return None, None, None
         px, _, pz = here
+        if strayed(px, pz, self.anchor):
+            # Too far from home: walk back before looking for anything else,
+            # or a chain of kills tows the bot across the map.
+            ax, az = self.anchor
+            s = stick_for(self.basis, ax - px, az - pz)
+            self.mode = "going home"
+            back = ((px - ax) ** 2 + (pz - az) ** 2) ** 0.5
+            return (s[0], s[1], back) if s else (None, None, None)
+
+        self.mode = "chasing"
         fresh = [(k, u, *live[u]) for k, u, *_ in cached if u in live]
-        hit, dist = nearest_monster(fresh, px, pz)
+        hit, dist = nearest_monster(within_leash(fresh, self.anchor), px, pz)
         if not hit:
             return None, None, None
         s = stick_for(self.basis, hit[1] - px, hit[3] - pz)
         return (s[0], s[1], dist) if s else (None, None, None)
+
+    def set_anchor(self):
+        """Drop the anchor where the character stands, or lift it if set."""
+        if self.anchor is not None:
+            self.anchor = None
+            return None
+        here = self.ms.read_vec3(self.mem, self.me + self.ms.UNIT_POSITION) \
+            if self.me else None
+        if not here:
+            return None
+        self.anchor = (here[0], here[2])
+        return self.anchor
 
 
 class VirtualPad:
@@ -899,6 +952,7 @@ def main(port=None):
           f" via {type(pad).__name__} -- End to start/stop, ctrl+c to exit")
 
     last = None  # (t, dist, sx, sy) of last seen dot
+    last_toggle = 0.0  # for spotting a double tap of End
     eyes = None
     if MEMORY_TARGETING:
         try:
@@ -929,6 +983,17 @@ def main(port=None):
         try:
             while True:
                 if toggle_key_hit():
+                    # Two taps inside DOUBLE_TAP_S toggle twice, which lands back
+                    # on the state you were in -- so the pair reads cleanly as
+                    # "anchor here" without deferring the first press, and the
+                    # stop key stays instant.
+                    tapped = time.time()
+                    if eyes is not None and tapped - last_toggle < DOUBLE_TAP_S:
+                        spot = eyes.set_anchor()
+                        print(f"\nanchor set at ({spot[0]:.0f},{spot[1]:.0f}); "
+                              f"staying within {LEASH_RADIUS:g} of it"
+                              if spot else "\nanchor cleared; roaming freely")
+                    last_toggle = tapped
                     paused = toggle_running(paused, pad, pet_filter)
                     target_lock.reset()
                     target_blacklist.reset()
@@ -1005,7 +1070,9 @@ def main(port=None):
                         sx = sy = 0.0
                         state = "no monster"
                     else:
-                        sx, sy, state = msx, msy, f"dist {mdist:6.1f}"
+                        sx, sy = msx, msy
+                        state = ("home in " if eyes.mode == "going home"
+                                 else "dist ") + f"{mdist:6.1f}"
 
                 # Everything below is the pixel path, used when memory targeting
                 # is off or has gone stale. It is left exactly as it was.
@@ -1161,6 +1228,22 @@ def demo():
     assert hit[0] == 0xB and abs(dist - 9.0) < 1e-6, (hit, dist)
     assert nearest_monster(around, 0.0, 0.0, reach=5.0) == (None, None)
     assert nearest_monster([("pet", 0xA, 1.0, 0.0, 0.0)], 0.0, 0.0) == (None, None)
+
+    # The leash. Monsters outside it are not targets, however close they are to
+    # the character -- otherwise a chain of kills tows the bot across the map.
+    spread = [("monster", 1, 10.0, 0.0, 0.0), ("monster", 2, 100.0, 0.0, 0.0)]
+    assert [u[1] for u in within_leash(spread, (0.0, 0.0), 45.0)] == [1]
+    assert within_leash(spread, None) == spread          # no anchor, no leash
+    # A monster just outside the line is not chased even while standing on it
+    far = [("monster", 3, 50.0, 0.0, 0.0)]
+    assert within_leash(far, (0.0, 0.0), 45.0) == []
+    assert nearest_monster(within_leash(far, (0.0, 0.0), 45.0),
+                           49.0, 0.0) == (None, None)
+    # Walking home starts past the slack, not at the line, or the bot would step
+    # over and back forever.
+    assert not strayed(46.0, 0.0, (0.0, 0.0), 45.0, 1.15)
+    assert strayed(60.0, 0.0, (0.0, 0.0), 45.0, 1.15)
+    assert not strayed(9999.0, 0.0, None)                # no anchor, never home
     polled = []
     assert toggle_key_hit(lambda vk: polled.append(vk) or 1)
     assert polled == [0x23]
