@@ -41,7 +41,8 @@ usage:
   python memscan.py --hunt       # iterative walk/stand scan only
   python memscan.py --findpos    # older one-shot scan, kept for reference
   python memscan.py --check 1A2B3C4 ...   # judge addresses found in Cheat Engine
-  python memscan.py --entities [addr]     # list entities near the player
+  python memscan.py --units [addr]        # monsters vs pets vs you
+  python memscan.py --entities [addr]     # older, superseded by --units
   python memscan.py --pos        # live position, once POSITION_CHAIN is set
   python memscan.py --demo       # offline self-check, no game needed
 """
@@ -73,6 +74,12 @@ SUMMONING_SUMMONER = 0x140   # SummoningComponent._Summoner -> BaseUnitControlle
 SUMMONING_ACTIVE = 0x118     # SummoningComponent.ActiveSummons -> List<Monster>
 MONSTER_ID = 0x218           # MonsterController.MonsterId, string
 MONSTER_SPAWNER = 0x288      # MonsterController.Spawner, null on a summon
+
+# Where each class's Il2CppClass pointer is kept, as an offset into
+# GameAssembly.dll. From Il2CppDumper's script.json, the *_TypeInfo entries.
+# These move with every patch -- re-dump and update them. Everything else in this
+# file is a search; these three lines are what make it a lookup instead.
+TYPE_RVA = dict(monster=0x5D6F750, player=0x5D973D8, summoning=0x5DF95F0)
 
 # Win32 constants, from memoryapi.h
 PROCESS_QUERY_INFORMATION = 0x0400
@@ -1017,6 +1024,176 @@ def show_entities(pos_addr=None):
             print(f"  0x{o:012X}  dist {d:6.1f}  ({x:8.1f},{y:6.1f},{z:8.1f})")
 
 
+SUMMONING_CONTROLLER = 0x100   # SummoningComponent.Controller, points back
+LIST_ITEMS = 0x10              # IL2CPP List<T>: _items array pointer
+LIST_SIZE = 0x18               # IL2CPP List<T>: _size
+ARRAY_DATA = 0x20              # IL2CPP array: first element
+
+
+def read_ptr(mem, addr):
+    blob = mem.read(addr, 8)
+    if not blob:
+        return 0
+    p = struct.unpack("<Q", blob)[0]
+    return p if 0x10000 < p < 0x7FFFFFFFFFFF else 0
+
+
+def unit_at(mem, obj):
+    """True if `obj` really is a BaseUnitController.
+
+    Checked by going out to its SummoningComponent and back: the component's
+    Controller field points at its owner, so obj -> Summoning -> Controller == obj
+    is a round trip that random memory does not survive.
+    """
+    comp = read_ptr(mem, obj + UNIT_SUMMONING)
+    return bool(comp) and read_ptr(mem, comp + SUMMONING_CONTROLLER) == obj
+
+
+def list_items(mem, lst, cap=64):
+    """Elements of an IL2CPP List<T> of references."""
+    if not lst:
+        return []
+    arr = read_ptr(mem, lst + LIST_ITEMS)
+    size = mem.read(lst + LIST_SIZE, 4)
+    if not arr or not size:
+        return []
+    n = min(struct.unpack("<i", size)[0], cap)
+    out = []
+    for i in range(max(n, 0)):
+        p = read_ptr(mem, arr + ARRAY_DATA + i * 8)
+        if p:
+            out.append(p)
+    return out
+
+
+def summoner_of(mem, unit):
+    """The unit that summoned this one, or 0 if it was not summoned."""
+    comp = read_ptr(mem, unit + UNIT_SUMMONING)
+    return read_ptr(mem, comp + SUMMONING_SUMMONER) if comp else 0
+
+
+def units_like(mem, sample, limit=4000):
+    """Every object sharing `sample`'s class that passes the round-trip check."""
+    cls = read_ptr(mem, sample)
+    if not cls:
+        return []
+    return [o for o in instances_of(mem, cls, limit) if unit_at(mem, o)]
+
+
+def type_classes(mem):
+    """{'monster': class_ptr, ...} resolved through GameAssembly.dll at runtime.
+
+    The RVAs come from the dump; ASLR moves the module, so each one is read from
+    wherever the module actually landed this session.
+    """
+    base = module_base(mem.pid, "GameAssembly.dll")
+    if base is None:
+        return {}
+    return {name: read_ptr(mem, base + rva) for name, rva in TYPE_RVA.items()}
+
+
+def world_units(mem):
+    """[(kind, unit, x, y, z)] for every unit the client is tracking.
+
+    kind is 'monster', 'pet' or 'player'. No searching and no heuristics: the
+    class pointers come from the dump, and a unit is a pet exactly when its
+    SummoningComponent names a summoner.
+    """
+    cls = type_classes(mem)
+    if not cls.get("monster"):
+        return []
+    out = []
+    for name, kind in (("monster", None), ("player", "player")):
+        for obj in instances_of(mem, cls[name], limit=8000):
+            if not unit_at(mem, obj):
+                continue
+            pos = read_vec3(mem, obj + UNIT_POSITION)
+            if not pos or not looks_like_place(pos):
+                continue
+            k = kind or ("pet" if summoner_of(mem, obj) else "monster")
+            out.append((k, obj, pos[0], pos[1], pos[2]))
+    return out
+
+
+def my_pets(mem, me):
+    """The player's own summons, straight off their SummoningComponent."""
+    comp = read_ptr(mem, me + UNIT_SUMMONING)
+    return set(list_items(mem, read_ptr(mem, comp + SUMMONING_ACTIVE))) if comp \
+        else set()
+
+
+def classify(mem, player_pos_addr):
+    """[(kind, unit, x, y, z)] for every unit sharing a class with a known one.
+
+    kind is 'you', 'your pet', 'pet' or 'monster'. Nothing here is a guess: a
+    summoned unit has a summoner and a monster does not, and the player's own
+    pets are the ones their SummoningComponent lists.
+    """
+    me = player_pos_addr - UNIT_POSITION
+    if not unit_at(mem, me):
+        return None, []
+    my_comp = read_ptr(mem, me + UNIT_SUMMONING)
+    mine = set(list_items(mem, read_ptr(mem, my_comp + SUMMONING_ACTIVE)))
+
+    seen = {me: "you"}
+    for pet in mine:
+        seen[pet] = "your pet"
+    # Pets are MonsterControllers, so one of ours names the monster class; the
+    # player's own class only ever finds other players.
+    for sample in list(mine) + [me]:
+        for u in units_like(mem, sample):
+            seen.setdefault(u, None)
+
+    out = []
+    for u, kind in seen.items():
+        if kind is None:
+            kind = "pet" if summoner_of(mem, u) else "monster"
+        p = read_vec3(mem, u + UNIT_POSITION)
+        if p:
+            out.append((kind, u, p[0], p[1], p[2]))
+    return me, out
+
+
+def show_units(pos_addr=None):
+    """List every unit, split into monsters, pets and players.
+
+    Needs no position hunt: the classes are looked up in the module. A position
+    address is only used, when given, to say which unit is you and which pets
+    are yours.
+    """
+    with Mem() as mem:
+        units = world_units(mem)
+        if not units:
+            print("no units -- are the TYPE_RVA offsets still right after the "
+                  "patch? re-run Il2CppDumper and update them")
+            return
+        me = pos_addr - UNIT_POSITION if pos_addr else None
+        if me is not None and not unit_at(mem, me):
+            print(f"0x{pos_addr:X} is not inside a unit; listing without 'you'")
+            me = None
+        mine = my_pets(mem, me) if me else set()
+
+        counts = {}
+        for k, *_ in units:
+            counts[k] = counts.get(k, 0) + 1
+        print(", ".join(f"{v} {k}" for k, v in sorted(counts.items())))
+        if me is None:
+            for k, u, x, y, z in units[:20]:
+                print(f"  {k:8} 0x{u:012X}  ({x:8.1f},{y:6.1f},{z:8.1f})")
+            return
+
+        p = read_vec3(mem, me + UNIT_POSITION)
+        px, py, pz = p
+        print(f"you: 0x{me:012X} at ({px:.1f},{py:.1f},{pz:.1f}), "
+              f"{len(mine)} pet(s) of your own\n")
+        rows = sorted((((x - px) ** 2 + (z - pz) ** 2) ** 0.5, k, u, x, y, z)
+                      for k, u, x, y, z in units if u != me)
+        for d, k, u, x, y, z in rows[:25]:
+            label = "YOUR PET" if u in mine else k
+            print(f"  {label:8} 0x{u:012X} dist {d:6.1f}  "
+                  f"({x:8.1f},{y:6.1f},{z:8.1f})")
+
+
 def check(addrs):
     """Judge hand-found addresses: which one is the player, and where are y/z?
 
@@ -1257,6 +1434,54 @@ def demo():
     assert resolve(cm, 0x1000, ()) == 0x1000          # no offsets is the base
     assert resolve(cm, 0x9999, (0x00, 0x10)) is None  # unreadable link gives up
 
+
+    # unit classification, against a fake heap laid out like the real one
+    heap = {}
+
+    def put(addr, val):
+        heap[addr] = struct.pack("<Q", val)
+
+    # above read_ptr's validity floor, or the round trip reads as invalid
+    ME, PET, MON, OTHER = 0x110000, 0x120000, 0x130000, 0x140000
+    COMPS = {ME: 0x111000, PET: 0x121000, MON: 0x131000, OTHER: 0x141000}
+    for unit, comp in COMPS.items():
+        put(unit + UNIT_SUMMONING, comp)
+        put(comp + SUMMONING_CONTROLLER, unit)       # the round trip
+        put(unit, 0xC1A55)                           # same class for all
+    put(COMPS[PET] + SUMMONING_SUMMONER, ME)        # our pet: we summoned it
+    put(COMPS[OTHER] + SUMMONING_SUMMONER, 0x900000)  # someone else's pet
+    put(COMPS[MON] + SUMMONING_SUMMONER, 0)         # a monster has no summoner
+    put(COMPS[ME] + SUMMONING_ACTIVE, 0x150000)     # our ActiveSummons list
+    put(0x150000 + LIST_ITEMS, 0x160000)
+    heap[0x150000 + LIST_SIZE] = struct.pack("<i", 1)
+    put(0x160000 + ARRAY_DATA, PET)
+
+    class UnitMem:
+        pid = 0
+
+        def read(self, addr, size):
+            if size == 12:
+                base = {ME: 1.0, PET: 2.0, MON: 3.0, OTHER: 4.0}
+                for u, v in base.items():
+                    if addr == u + UNIT_POSITION:
+                        return struct.pack("<fff", v, 10.0, v)
+                return None
+            return heap.get(addr, struct.pack("<Q", 0))[:size]
+
+        def regions(self):
+            return []
+
+    um = UnitMem()
+    assert unit_at(um, ME) and unit_at(um, MON)
+    assert not unit_at(um, 0x999000)                # no round trip, not a unit
+    assert list_items(um, 0x150000) == [PET]
+    assert summoner_of(um, PET) == ME and summoner_of(um, MON) == 0
+    me_obj, rows = classify(um, ME + UNIT_POSITION)
+    kinds = {u: k for k, u, *_ in rows}
+    assert me_obj == ME and kinds[ME] == "you", kinds
+    assert kinds[PET] == "your pet", kinds
+    assert kinds.get(MON) in (None, "monster"), kinds
+
     print("demo ok")
 
 
@@ -1302,6 +1527,10 @@ if __name__ == "__main__":
         rest = [a for a in sys.argv[sys.argv.index("--entities") + 1:]
                 if not a.startswith("--")]
         show_entities(int(rest[0], 16) if rest else None)
+    elif "--units" in sys.argv:
+        rest = [a for a in sys.argv[sys.argv.index("--units") + 1:]
+                if not a.startswith("--")]
+        show_units(int(rest[0], 16) if rest else None)
     elif "--check" in sys.argv:
         given = [int(a, 16) for a in sys.argv[sys.argv.index("--check") + 1:]
                  if not a.startswith("--")]
