@@ -107,6 +107,13 @@ MEM_RANGE = 70.0         # world units; roughly what the minimap used to cover
 MEM_CAL_PUSH_S = 0.7     # per calibration push, two of them
 MEM_CAL_MIN = 0.5        # world units a push must move us to count
 CAL_RETRY_S = 15.0       # wait this long before trying to calibrate again
+# The minimap can be zoomed while the bot runs, which changes how many world
+# units a pixel is worth. The leash is enforced in world units so the bot's
+# reach does not change -- but the circle --snap draws would stop matching it.
+# The scale is therefore re-measured as the character walks, needing no pushes:
+# world travel comes from memory, minimap travel from the picture.
+SCALE_CHECK_S = 3.0      # how often to re-measure while moving
+SCALE_MIN_PX = 12.0      # minimap travel needed for a sample to mean anything
 # Double-tap End to drop an anchor where you stand. After that the bot only
 # chases monsters inside LEASH_RADIUS of it, and walks back if it drifts out --
 # so it farms one spot instead of being led across the map by a chain of kills.
@@ -728,7 +735,10 @@ class MemoryEyes:
         self.me = None            # our own BaseUnitController
         self.basis = None         # stick push -> world travel
         self.units = []           # cached (kind, addr, x, y, z)
-        self.world_per_px = None  # minimap scale, measured during calibration
+        self.world_per_px = None  # minimap scale, re-measured as it walks
+        self.grab = None          # returns a greyscale minimap frame
+        self.scale_mark = None    # (frame, position) the last scale sample
+        self.next_scale = 0.0
         self.anchor = None        # (x, z) the leash is measured from
         self.mode = "chasing"
         self.hot = None           # regions worth sweeping
@@ -789,31 +799,81 @@ class MemoryEyes:
             return {a: (after[a][0] - before[a][0], after[a][2] - before[a][2])
                     for a in before if a in after}
 
-        east, north = push(1.0, 0.0), push(0.0, 1.0)
-        best, best_score = None, MEM_CAL_MIN
-        for a, (ex, ez) in east.items():
-            nx, nz = north.get(a, (0.0, 0.0))
-            score = min((ex * ex + ez * ez) ** 0.5, (nx * nx + nz * nz) ** 0.5)
-            if score > best_score:
-                best, best_score = a, score
-        if best is None:
-            return False
-        self.me = best
-        ex, ez = east[best]
-        nx, nz = north[best]
-        self.basis = ((ex, nx), (ez, nz))
-        # How many world units a minimap pixel is worth, so a leash radius can be
-        # quoted in something visible. It is per map -- the minimap zooms.
-        travel = [(ex * ex + ez * ez) ** 0.5, (nx * nx + nz * nz) ** 0.5]
-        pairs = [(w, m) for w, m in zip(travel, seen) if m > 3.0]
-        self.world_per_px = (sum(w / m for w, m in pairs) / len(pairs)
-                             if pairs else None)
-        save_scale(self.world_per_px)      # so --snap can draw the leash
-        return stick_for(self.basis, 1.0, 0.0) is not None
+        # Keep pushing different ways until two of them actually moved us. One
+        # blocked direction used to fail the whole calibration -- and a wall on
+        # one side is the normal case, not an unlucky one.
+        me, samples, travel = None, [], []
+        for sx, sy in ((1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0),
+                       (0.7, 0.7), (-0.7, 0.7)):
+            moved = push(sx, sy)
+            if not moved:
+                continue
+            addr, (dx, dz) = max(moved.items(),
+                                 key=lambda kv: kv[1][0] ** 2 + kv[1][1] ** 2)
+            dist = (dx * dx + dz * dz) ** 0.5
+            if dist < MEM_CAL_MIN:
+                continue                    # blocked, or something else moved
+            if me is None:
+                me = addr                   # the one that answers the stick is us
+            if addr != me:
+                continue
+            samples.append(((sx, sy), (dx, dz)))
+            travel.append(dist)
+            if len(samples) >= 2:
+                (s1, w1), (s2, w2) = samples[-2:]
+                det = s1[0] * s2[1] - s1[1] * s2[0]
+                if abs(det) < 1e-6:
+                    continue                # parallel pushes say nothing new
+                # basis maps a stick push to the world travel it produces
+                a11 = (w1[0] * s2[1] - w2[0] * s1[1]) / det
+                a12 = (w2[0] * s1[0] - w1[0] * s2[0]) / det
+                a21 = (w1[1] * s2[1] - w2[1] * s1[1]) / det
+                a22 = (w2[1] * s1[0] - w1[1] * s2[0]) / det
+                basis = ((a11, a12), (a21, a22))
+                if stick_for(basis, 1.0, 0.0) is None:
+                    continue
+                self.me, self.basis = me, basis
+                # world units per minimap pixel, so the leash can be drawn
+                pairs = [(w, m) for w, m in zip(travel, seen) if m > 3.0]
+                self.world_per_px = (sum(w / m for w, m in pairs) / len(pairs)
+                                     if pairs else None)
+                save_scale(self.world_per_px)
+                return True
+        return False
 
     def leash(self):
         """The leash in world units, from the pixel radius the player set."""
         return leash_world(self.world_per_px)
+
+    def watch_scale(self, now, here):
+        """Re-measure world units per minimap pixel from ordinary walking.
+
+        The minimap zooms, and a stale scale makes the drawn leash circle stop
+        describing the leash the bot enforces. No calibration pushes are needed
+        for this: the world distance travelled is in memory and the minimap
+        distance is in the picture, so both come free while the bot walks.
+        """
+        if self.grab is None or now < self.next_scale:
+            return
+        self.next_scale = now + SCALE_CHECK_S
+        gray = self.grab()
+        was = self.scale_mark
+        self.scale_mark = (gray, here)
+        if was is None:
+            return
+        old_gray, old_pos = was
+        han = cv2.createHanningWindow((gray.shape[1], gray.shape[0]), cv2.CV_32F)
+        (mx, my), _ = cv2.phaseCorrelate(old_gray, gray, han)
+        px = (mx * mx + my * my) ** 0.5
+        world = ((here[0] - old_pos[0]) ** 2 + (here[2] - old_pos[2]) ** 2) ** 0.5
+        if px < SCALE_MIN_PX or world < 1.0:
+            return                      # stood still; proves nothing either way
+        fresh = world / px
+        # Eased rather than replaced: one sample can catch a teleport or a
+        # stutter, and a wrong scale would resize the leash under the player.
+        self.world_per_px = (fresh if self.world_per_px is None
+                             else 0.7 * self.world_per_px + 0.3 * fresh)
+        save_scale(self.world_per_px)
 
     def leash_status(self):
         """A short readout of the leash, for the status line.
@@ -892,6 +952,7 @@ class MemoryEyes:
             with self.lock:
                 self.units = []
             return None, None, None
+        self.watch_scale(now, here)
         px, _, pz = here
         heading_home = self.mode == "going home"
         if strayed(px, pz, self.anchor, self.leash(), heading_home):
@@ -1182,6 +1243,7 @@ def main(port=None):
 
                     # The same pushes measure the minimap scale, which is what
                     # turns the leash from world units into something drawable.
+                    eyes.grab = _mini      # so the scale tracks the zoom
                     if eyes.calibrate(pad, grab=_mini):
                         half = minimap_region(win)["width"] / 2
                         scale = (f"{eyes.world_per_px:.2f} world units per "
@@ -1420,6 +1482,34 @@ def demo():
     assert strayed(44.0, 0.0, (0.0, 0.0), 45.0, going_home=True, resume=0.85)
     assert not strayed(30.0, 0.0, (0.0, 0.0), 45.0, going_home=True, resume=0.85)
     assert not strayed(9999.0, 0.0, None)                # no anchor, never home
+
+    # Scale tracking, so a zoom mid-run does not leave the drawn circle lying.
+    # Two frames of noise standing in for the minimap; only the shift matters.
+    class ScaleEyes:
+        ms = None
+        grab = staticmethod(lambda: ScaleEyes.frame)
+        frame = None
+        world_per_px = None
+        scale_mark = None
+        next_scale = 0.0
+        watch_scale = MemoryEyes.watch_scale
+
+    rng = np.random.default_rng(7)
+    base_img = rng.integers(0, 255, (64, 64), dtype=np.uint8).astype(np.float32)
+    se = ScaleEyes()
+    ScaleEyes.frame = base_img
+    se.watch_scale(0.0, (0.0, 0.0, 0.0))                 # first sample, no scale
+    assert se.world_per_px is None
+    # shifted 16px on the minimap while the world position moved 32 units
+    ScaleEyes.frame = np.roll(base_img, 16, axis=1)
+    se.watch_scale(SCALE_CHECK_S, (32.0, 0.0, 0.0))
+    assert se.world_per_px and abs(se.world_per_px - 2.0) < 0.2, se.world_per_px
+    # standing still proves nothing and must not move the estimate
+    held = se.world_per_px
+    se.watch_scale(2 * SCALE_CHECK_S, (32.0, 0.0, 0.0))
+    assert se.world_per_px == held
+    if os.path.exists(scale_path()):
+        os.remove(scale_path())
 
     # The leash drawn on --snap needs a scale, and says so rather than guessing
     assert leash_world(0.5) == LEASH_PX * 0.5           # pixels times the scale
