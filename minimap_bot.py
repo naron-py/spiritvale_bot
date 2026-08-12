@@ -106,6 +106,7 @@ MEM_REFRESH_S = 2.0      # rediscovering units scans GBs; positions are re-read
 MEM_RANGE = 70.0         # world units; roughly what the minimap used to cover
 MEM_CAL_PUSH_S = 0.7     # per calibration push, two of them
 MEM_CAL_MIN = 0.5        # world units a push must move us to count
+MEM_CAL_LEGS = 3         # pushes to fit the basis from; more resists shoving
 CAL_RETRY_S = 15.0       # wait this long before trying to calibrate again
 # The minimap can be zoomed while the bot runs, which changes how many world
 # units a pixel is worth. The leash is enforced in world units so the bot's
@@ -820,24 +821,26 @@ class MemoryEyes:
                 continue
             samples.append(((sx, sy), (dx, dz)))
             travel.append(dist)
-            if len(samples) >= 2:
-                (s1, w1), (s2, w2) = samples[-2:]
-                det = s1[0] * s2[1] - s1[1] * s2[0]
-                if abs(det) < 1e-6:
-                    continue                # parallel pushes say nothing new
-                # basis maps a stick push to the world travel it produces
-                a11 = (w1[0] * s2[1] - w2[0] * s1[1]) / det
-                a12 = (w2[0] * s1[0] - w1[0] * s2[0]) / det
-                a21 = (w1[1] * s2[1] - w2[1] * s1[1]) / det
-                a22 = (w2[1] * s1[0] - w1[1] * s2[0]) / det
-                basis = ((a11, a12), (a21, a22))
+            if len(samples) >= MEM_CAL_LEGS:
+                # Least squares over every leg that moved, not just two of them.
+                # In a fight the character gets shoved and stunned, so a single
+                # leg can be well off -- one bad push used to become the whole
+                # basis, and the scale with it.
+                S = np.array([s for s, _ in samples], dtype=float)
+                W = np.array([w for _, w in samples], dtype=float)
+                if np.linalg.matrix_rank(S) < 2:
+                    continue                # all pushes along one line so far
+                fit, *_ = np.linalg.lstsq(S, W, rcond=None)
+                basis = ((float(fit[0][0]), float(fit[1][0])),
+                         (float(fit[0][1]), float(fit[1][1])))
                 if stick_for(basis, 1.0, 0.0) is None:
                     continue
                 self.me, self.basis = me, basis
                 # world units per minimap pixel, so the leash can be drawn
-                pairs = [(w, m) for w, m in zip(travel, seen) if m > 3.0]
-                self.world_per_px = (sum(w / m for w, m in pairs) / len(pairs)
-                                     if pairs else None)
+                ratios = sorted(w / m for w, m in zip(travel, seen) if m > 3.0)
+                # median, because a leg that was shoved or stunned is wrong in
+                # one direction and would drag an average with it
+                self.world_per_px = (ratios[len(ratios) // 2] if ratios else None)
                 save_scale(self.world_per_px)
                 if self.anchor_pending:
                     self.anchor_pending = False
