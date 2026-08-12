@@ -74,6 +74,17 @@ SUMMONING_SUMMONER = 0x140   # SummoningComponent._Summoner -> BaseUnitControlle
 SUMMONING_ACTIVE = 0x118     # SummoningComponent.ActiveSummons -> List<Monster>
 MONSTER_ID = 0x218           # MonsterController.MonsterId, string
 MONSTER_SPAWNER = 0x288      # MonsterController.Spawner, null on a summon
+# The unit list holds every monster the client knows about, and most of them are
+# not there to be fought: pooled or despawned objects keep their last position
+# and get their health reset to full, so they look exactly like a healthy
+# monster standing still. Measured on a live map: 516 monster entries, 468 with
+# a position that had not changed in 2 seconds, and the bot swinging at one of
+# them 1.3 units away. Two fields tell them apart -- a pooled object is not
+# rendered, and a corpse has no health. Filtering on both took 161 entries
+# within 98 units down to 20, against 13 red dots on the minimap.
+UNIT_VISIBLE = 0x18D         # BaseUnitController.IsVisible, bool
+UNIT_HEALTH = 0x128          # BaseUnitController.Health -> HealthComponent
+HEALTH_CURRENT = 0x138       # HealthComponent._health, int
 
 # Where each class's Il2CppClass pointer is kept, as an offset into
 # GameAssembly.dll. From Il2CppDumper's script.json, the *_TypeInfo entries.
@@ -1045,6 +1056,24 @@ def read_ptr(mem, addr):
         return 0
     p = struct.unpack("<Q", blob)[0]
     return p if 0x10000 < p < 0x7FFFFFFFFFFF else 0
+
+
+def worth_fighting(mem, unit):
+    """Is this unit actually there to be fought?
+
+    Rendered and with health left. Pooled and despawned monsters keep their
+    last position and a full health bar, so distance and health alone cannot
+    tell them from a live one standing still -- being drawn is what separates
+    them.
+    """
+    blob = mem.read(unit + UNIT_VISIBLE, 1)
+    if not blob or not blob[0]:
+        return False
+    health = read_ptr(mem, unit + UNIT_HEALTH)
+    if not health:
+        return False
+    blob = mem.read(health + HEALTH_CURRENT, 4)
+    return bool(blob) and struct.unpack("<i", blob)[0] > 0
 
 
 def unit_at(mem, obj):

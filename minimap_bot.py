@@ -935,9 +935,21 @@ class MemoryEyes:
             return None, None, None
         self.misses = 0
         px, _, pz = here
+        if not self.ms.worth_fighting(self.mem, self.me):
+            # We are dead (or not rendered). Swinging at things from a corpse
+            # looks exactly like a bot that cannot kill anything -- it cost a
+            # whole debugging session once, with the conclusion that melee
+            # range was wrong when the character was simply lying down.
+            self.mode = "dead"
+            return None, None, None
         self.mode = "chasing"
         fresh = [(k, u, *live[u]) for k, u, *_ in cached if u in live]
-        allowed = [e for e in fresh if self.ignored.get(e[1], 0.0) < now]
+        # Most of the list is pooled or dead objects that keep their position
+        # and full health. Without this the bot parks in a pile of them,
+        # swinging at each for MEM_ENGAGE_MAX_S in turn and never leaving --
+        # and walking straight back if you drag the character away.
+        allowed = [e for e in fresh if self.ignored.get(e[1], 0.0) < now
+                   and self.ms.worth_fighting(self.mem, e[1])]
 
         # Hold the current target rather than re-picking the nearest every
         # frame. Two monsters a similar distance away swap which is closer
@@ -957,14 +969,15 @@ class MemoryEyes:
             # because main() reads a zero stick as "handled" and never falls
             # through to the pixel path. Memory knows where they all are, so
             # there is no reason to only look as far as melee range.
-            self.chasing = self.engaged_since = None
             hit, dist = nearest_monster(allowed, px, pz, reach=float("inf"))
             if not hit:
+                self.chasing = self.engaged_since = None
                 self.mode = "no monster"     # genuinely none on the map
                 return None, None, None
             self.mode = "far"
-            s = stick_for(self.basis, hit[1] - px, hit[3] - pz)
-            return (s[0], s[1], dist) if s else (None, None, None)
+            # Fall through rather than return: a far target needs the same
+            # engagement clock as a near one, or an unreachable monster across
+            # a wall is walked at forever.
         if hit[0] != self.chasing:
             self.chasing, self.engaged_since = hit[0], now
         elif stale_target(now, self.engaged_since):
@@ -1255,6 +1268,7 @@ def main(port=None):
                         # a message that reads like a quiet patch of map.
                         state = {"no unit": "no unit  ",
                                  "lost": "lost     ",
+                                 "dead": "DEAD     ",
                                  "gave up": "gave up  "}.get(eyes.mode,
                                                              "no monster")
                     else:
@@ -1439,19 +1453,32 @@ def demo():
     # A monster beyond MEM_RANGE must still be walked to. Returning nothing
     # here stands the bot still forever: main() treats a zero stick as handled
     # and never falls through to the pixel path.
+    class _Fights:
+        """Stands in for memscan: says which stub units are worth fighting."""
+        def __init__(self, real, standing=True):
+            self.real, self.standing = set(real), standing
+
+        def worth_fighting(self, _mem, unit):
+            if unit == 0x1000:              # 0x1000 is us; alive unless a corpse
+                return self.standing
+            return unit in self.real
+
     class _Far(MemoryEyes):
-        def __init__(self, at):
+        def __init__(self, at, extra=(), real=(0x2000,)):
             self.me, self.basis = 0x1000, [[1.0, 0.0], [0.0, 1.0]]
-            self.units = [("monster", 0x2000, at, 0.0, 0.0)]
+            self.units = [("monster", 0x2000, at, 0.0, 0.0)] + list(extra)
             self.chasing = self.engaged_since = None
             self.ignored = {}
             self.mode, self.misses, self.hot = "chasing", 0, None
-            self.at = at
+            self.at, self.mem = at, None
+            self.ms = _Fights(real)
             import threading
             self.lock = threading.Lock()
 
         def _positions(self, addrs):
-            return {a: ((self.at, 0.0, 0.0) if a == 0x2000 else (0.0, 0.0, 0.0))
+            return {a: ((self.at, 0.0, 0.0) if a == 0x2000
+                        else (self.spots.get(a, 0.0), 0.0, 0.0)
+                        if hasattr(self, "spots") else (0.0, 0.0, 0.0))
                     for a in addrs}
 
     far_off = _Far(MEM_RANGE * 3)              # way outside melee range
@@ -1459,6 +1486,31 @@ def demo():
     assert far_off.mode == "far", far_off.mode
     assert fsx is not None and (fsx or fsy), "must walk to it, not stand still"
     assert abs(fd - MEM_RANGE * 3) < 1.0, fd
+    # A pooled or dead monster sitting on top of us must not be a target, or
+    # the bot parks in the pile and swings at it -- the exact symptom that had
+    # it standing still and walking back when dragged away.
+    pooled = _Far(MEM_RANGE * 3, extra=[("monster", 0x3000, 1.0, 0.0, 0.0)],
+                  real=(0x2000,))
+    pooled.spots = {0x3000: 1.0}
+    psx, psy, pd = pooled.target(1.0)
+    assert pooled.chasing == 0x2000, "must skip the pooled one right beside us"
+    assert pd > MEM_RANGE, pd
+    only_pooled = _Far(MEM_RANGE * 3, real=())     # nothing real at all
+    assert only_pooled.target(1.0) == (None, None, None)
+    assert only_pooled.mode == "no monster", only_pooled.mode
+
+    # A dead character must be reported as such, not left swinging: a corpse
+    # that keeps attacking reads as "melee range is wrong" and sends the next
+    # debugging session somewhere it should not go.
+    class _Corpse(_Far):
+        def __init__(self):
+            _Far.__init__(self, 5.0)
+            self.ms = _Fights((), standing=False)   # we are the dead one
+
+    corpse = _Corpse()
+    assert corpse.target(1.0) == (None, None, None)
+    assert corpse.mode == "dead", corpse.mode
+
     near = _Far(MEM_RANGE / 2)                 # inside range: ordinary chase
     near.target(1.0)
     assert near.mode == "chasing", near.mode
