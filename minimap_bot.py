@@ -43,7 +43,7 @@ ATTACK_PERIOD_S = 0.40   # mash cycle, ignored while ATTACK_MASH is False
 ATTACK_HOLD_S = 0.15     # how long L1 stays down each mash cycle
 BUFF_PERIOD_S = 60.0     # recast the buff sequence this often
 BUFF_SEQUENCE = ("up", "left", "down", "right")
-SPAM_BUTTON = None       # button tapped on its own timer while running; None = off
+SPAM_BUTTON = "y"       # button tapped on its own timer while running; None = off
 SPAM_PERIOD_S = 2
 SPAM_HOLD_S = 0.05
 WAKE_AMP = 0.5           # stick nudge that flips the game into controller mode
@@ -804,20 +804,20 @@ def main(port=None):
                     buff_queue = []
                     next_buff = next_press = next_spam = 0.0
                     print(f"\n{'STOPPED' if paused else 'STARTED'} (End)")
-                    if not paused and CAMERA_CHECK:
-                        deg = camera_rotation(pad, sct, win)
-                        if deg is None:
-                            print("camera check: character never moved -- "
-                                  "blocked, or the pad is not reaching the game")
-                        elif abs(deg) > CAMERA_MAX_DEG:
-                            # Running on would look like a broken bot: it would
-                            # steer off at an angle and circle every target.
-                            print(f"camera is rotated {deg:+.0f} degrees -- "
-                                  f"relog to reset it to north, then press End")
-                            pad.stick(0.0, 0.0, False)
-                            paused = True
-                        else:
-                            print(f"camera check: {deg:+.0f} degrees, good")
+                    # if not paused and CAMERA_CHECK:
+                    #     deg = camera_rotation(pad, sct, win)
+                    #     if deg is None:
+                    #         print("camera check: character never moved -- "
+                    #               "blocked, or the pad is not reaching the game")
+                    #     elif abs(deg) > CAMERA_MAX_DEG:
+                    #         # Running on would look like a broken bot: it would
+                    #         # steer off at an angle and circle every target.
+                    #         print(f"camera is rotated {deg:+.0f} degrees -- "
+                    #               f"relog to reset it to north, then press End")
+                    #         pad.stick(0.0, 0.0, False)
+                    #         paused = True
+                    #     else:
+                    #         print(f"camera check: {deg:+.0f} degrees, good")
                 if paused:
                     time.sleep(0.05)
                     continue
