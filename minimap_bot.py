@@ -128,6 +128,14 @@ MEM_LOST_FRAMES = 5
 # circle in world units was the only thing it was ever for.
 TOGGLE_VK = 0x23         # End, polled globally through GetAsyncKeyState
 START_PAUSED = True      # launching the script must never move the character
+# The bot steers by feeding a minimap delta straight to the stick, which is only
+# right while the two frames agree. They do not always: the minimap rotates with
+# the camera, measured at 0 degrees on one map and 90 on another, and at 90 every
+# heading the bot takes is wrong -- it circles a monster instead of reaching it.
+# Relogging resets the camera to north, so this checks rather than corrects.
+CAMERA_CHECK = True      # False skips the startup measurement entirely
+CAMERA_MAX_DEG = 20      # refuse to run past this; relog to reset the camera
+CAMERA_LEG_S = 0.8       # per direction, four of them
 LOOP_HZ = 20
 
 
@@ -162,6 +170,55 @@ def toggle_running(paused, pad, pet_filter, wake=wake_controller):
     if not paused:
         wake(pad)
     return paused
+
+
+def heading_error(pairs):
+    """Degrees between where the stick points and where the character goes.
+
+    `pairs` is [((sx, sy), (mx, my))]: the stick vector pushed, and the terrain
+    shift the minimap showed. Terrain slides opposite to travel, and image y runs
+    downward while stick y runs up, so the character's own motion in stick terms
+    is (-mx, +my). Averaged as unit vectors, which a plain mean of angles cannot
+    do without wrapping wrongly at 180.
+    """
+    import math
+    sx_sum = sy_sum = 0.0
+    for (sx, sy), (mx, my) in pairs:
+        cx, cy = -mx, my
+        if (cx * cx + cy * cy) ** 0.5 < 1.0 or (sx * sx + sy * sy) ** 0.5 < 1e-6:
+            continue                       # blocked, or no push: proves nothing
+        dot = sx * cx + sy * cy
+        cross = sx * cy - sy * cx
+        ang = math.atan2(cross, dot)
+        sx_sum += math.cos(ang)
+        sy_sum += math.sin(ang)
+    if sx_sum == 0.0 and sy_sum == 0.0:
+        return None                        # nothing usable
+    return math.degrees(math.atan2(sy_sum, sx_sum))
+
+
+def camera_rotation(pad, sct, win, legs=((1.0, 0.0), (0.0, 1.0),
+                                         (-1.0, 0.0), (0.0, -1.0))):
+    """Measure heading_error live, or None if the character never moved."""
+    reg = minimap_region(win)
+    han = cv2.createHanningWindow((reg["width"], reg["height"]), cv2.CV_32F)
+
+    def gray():
+        img = np.array(sct.grab(reg))[:, :, :3]
+        return np.float32(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+
+    pairs = []
+    for sx, sy in legs:
+        before = gray()
+        t0 = time.time()
+        while time.time() - t0 < CAMERA_LEG_S:
+            pad.stick(sx, sy, False)
+            time.sleep(0.05)
+        pad.stick(0.0, 0.0, False)
+        time.sleep(0.2)
+        (mx, my), _ = cv2.phaseCorrelate(before, gray(), han)
+        pairs.append(((sx, sy), (mx, my)))
+    return heading_error(pairs)
 
 
 def find_window():
@@ -1106,6 +1163,24 @@ def main(port=None):
                         eyes.start_scanning()
                         print("scanning for units in the background; "
                               "reading pixels until it lands")
+                    # Left commented as it came from main -- the camera check is
+                    # off there, and memory targeting does not need it: the basis
+                    # is measured from real travel, so a rotated camera is
+                    # already accounted for.
+                    # if not paused and CAMERA_CHECK:
+                    #     deg = camera_rotation(pad, sct, win)
+                    #     if deg is None:
+                    #         print("camera check: character never moved -- "
+                    #               "blocked, or the pad is not reaching the game")
+                    #     elif abs(deg) > CAMERA_MAX_DEG:
+                    #         # Running on would look like a broken bot: it would
+                    #         # steer off at an angle and circle every target.
+                    #         print(f"camera is rotated {deg:+.0f} degrees -- "
+                    #               f"relog to reset it to north, then press End")
+                    #         pad.stick(0.0, 0.0, False)
+                    #         paused = True
+                    #     else:
+                    #         print(f"camera check: {deg:+.0f} degrees, good")
                 if paused:
                     time.sleep(0.05)
                     continue
@@ -1427,6 +1502,20 @@ def demo():
     assert not rival_d < held_d * TARGET_SWITCH, "a 4% gain must not switch"
     assert 3.0 < 10.4 * TARGET_SWITCH, "but a much nearer one still wins"
 
+    # Camera check. Walking north scrolls the terrain down the image, and image y
+    # runs downward, so an aligned camera turns a stick push of (0,1) into a
+    # measured shift of (0,+8). Pushing east scrolls the terrain left: (-8,0).
+    aligned = [((0.0, 1.0), (0.0, 8.0)), ((1.0, 0.0), (-8.0, 0.0)),
+               ((0.0, -1.0), (0.0, -8.0)), ((-1.0, 0.0), (8.0, 0.0))]
+    assert abs(heading_error(aligned)) < 1.0, heading_error(aligned)
+    # rotated 90: pushing up sends the character right across the minimap, so the
+    # terrain scrolls left instead of down
+    turned = [((0.0, 1.0), (-8.0, 0.0)), ((1.0, 0.0), (0.0, -8.0)),
+              ((0.0, -1.0), (8.0, 0.0)), ((-1.0, 0.0), (0.0, 8.0))]
+    assert abs(abs(heading_error(turned)) - 90.0) < 1.0, heading_error(turned)
+    # legs where nothing moved carry no information and must not drag the mean
+    assert abs(heading_error(aligned + [((1.0, 0.0), (0.0, 0.0))])) < 1.0
+    assert heading_error([((1.0, 0.0), (0.0, 0.0))]) is None
     polled = []
     assert toggle_key_hit(lambda vk: polled.append(vk) or 1)
     assert polled == [0x23]
