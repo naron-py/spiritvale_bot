@@ -112,6 +112,11 @@ TARGET_SWITCH = 0.7      # only swap targets for one this much nearer
 # median of 0.4 world units, which is the bot wiggling left and right on the
 # spot. Inside this, stop steering and just hit it.
 MEM_ARRIVE = 2.5         # world units
+# A target that will not die -- already dead and still listed, unreachable, or
+# simply not attackable -- otherwise parks the bot on the spot forever, swinging
+# at it. Give up on one after this long and leave it alone for a while.
+MEM_ENGAGE_MAX_S = 8.0
+MEM_IGNORE_S = 20.0
 CAL_RETRY_S = 15.0       # wait this long before trying to calibrate again
 # The minimap can be zoomed while the bot runs, which changes how many world
 # units a pixel is worth. The leash is enforced in world units so the bot's
@@ -676,6 +681,16 @@ def leash_world(world_per_px=None):
     return LEASH_PX * world_per_px if world_per_px else LEASH_RADIUS
 
 
+def stale_target(now, engaged_since, limit=MEM_ENGAGE_MAX_S):
+    """True once we have been on one target longer than it should take to die.
+
+    Something that will not die -- already dead and still listed, unreachable,
+    not attackable -- parks the bot on the spot swinging at it, which is the one
+    failure mode that looks exactly like a hung bot from the outside.
+    """
+    return engaged_since is not None and now - engaged_since > limit
+
+
 def within_leash(units, anchor, radius=LEASH_RADIUS):
     """Units inside the leash. No anchor means no leash, so everything passes."""
     if anchor is None:
@@ -748,6 +763,8 @@ class MemoryEyes:
         self.anchor = None        # (x, z) the leash is measured from
         self.anchor_pending = False  # asked for before we knew our own unit
         self.chasing = None       # unit held between frames, so it does not flap
+        self.engaged_since = None # when we started on the current target
+        self.ignored = {}         # unit -> time it becomes fair game again
         self.mode = "chasing"
         self.hot = None           # regions worth sweeping
         self.scanner = None
@@ -967,7 +984,8 @@ class MemoryEyes:
             # the whole heap, because the new objects need not be where the old
             # ones were.
             self.me = self.basis = self.anchor = self.hot = None
-            self.chasing = None
+            self.chasing = self.engaged_since = None
+            self.ignored = {}
             with self.lock:
                 self.units = []
             return None, None, None
@@ -985,7 +1003,8 @@ class MemoryEyes:
 
         self.mode = "chasing"
         fresh = [(k, u, *live[u]) for k, u, *_ in cached if u in live]
-        allowed = within_leash(fresh, self.anchor, self.leash())
+        allowed = [e for e in within_leash(fresh, self.anchor, self.leash())
+                   if self.ignored.get(e[1], 0.0) < now]
 
         # Hold the current target rather than re-picking the nearest every
         # frame. Two monsters a similar distance away swap which is closer
@@ -1002,7 +1021,16 @@ class MemoryEyes:
         if not hit:
             self.chasing = None
             return None, None, None
-        self.chasing = hit[0]
+        if hit[0] != self.chasing:
+            self.chasing, self.engaged_since = hit[0], now
+        elif stale_target(now, self.engaged_since):
+            # Long enough on one target that it is not going to die: already
+            # dead and still listed, unreachable, or not attackable. Parking on
+            # it forever is the one failure that looks exactly like a hung bot.
+            self.ignored[hit[0]] = now + MEM_IGNORE_S
+            self.chasing = self.engaged_since = None
+            self.mode = "gave up"
+            return None, None, None
         if dist <= MEM_ARRIVE:
             self.mode = "on it"
             return 0.0, 0.0, dist        # arrived: hold still and swing
@@ -1484,6 +1512,13 @@ def demo():
     assert hit[0] == 0xB and abs(dist - 9.0) < 1e-6, (hit, dist)
     assert nearest_monster(around, 0.0, 0.0, reach=5.0) == (None, None)
     assert nearest_monster([("pet", 0xA, 1.0, 0.0, 0.0)], 0.0, 0.0) == (None, None)
+
+    # Giving up on a target that will not die. Without this the bot parks on the
+    # spot swinging forever, which is indistinguishable from a hung bot.
+    assert not stale_target(5.0, None)                   # nothing engaged
+    assert not stale_target(5.0, 0.0, limit=8.0)         # still within its time
+    assert stale_target(9.0, 0.0, limit=8.0)             # long enough, drop it
+    assert MEM_IGNORE_S > MEM_ENGAGE_MAX_S, "must stay ignored longer than tried"
 
     # Two monsters at nearly the same distance: whichever is chosen must be kept
     # while it stays close, or the bot walks left, right, left, right as they
