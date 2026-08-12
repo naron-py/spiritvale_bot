@@ -117,45 +117,15 @@ MEM_ARRIVE = 2.5         # world units
 # at it. Give up on one after this long and leave it alone for a while.
 MEM_ENGAGE_MAX_S = 8.0
 MEM_IGNORE_S = 20.0
-# With nothing to chase inside the leash the bot used to stand still until a
-# monster wandered in. It patrols instead: monsters respawn and roam, so moving
-# around the circle finds them, and standing on the spot never does.
-PATROL_HOLD_S = 6.0      # give up on one patrol point after this
-PATROL_REACHED = 4.0     # world units that count as arriving at one
-PATROL_SPREAD = 0.8      # keep patrol points this far inside the leash
 CAL_RETRY_S = 15.0       # wait this long before trying to calibrate again
 # A position read can come back empty for a frame without our unit being gone.
 # Tearing the calibration down on the first miss cost a whole run: the bot went
 # silent and only a double-End brought it back. Insist on a run of misses.
 MEM_LOST_FRAMES = 5
-# The minimap can be zoomed while the bot runs, which changes how many world
-# units a pixel is worth. The leash is enforced in world units so the bot's
-# reach does not change -- but the circle --snap draws would stop matching it.
-# The scale is therefore re-measured as the character walks, needing no pushes:
-# world travel comes from memory, minimap travel from the picture.
-SCALE_CHECK_S = 3.0      # how often to re-measure while moving
-SCALE_MIN_PX = 12.0      # minimap travel needed for a sample to mean anything
-# Double-tap End to drop an anchor where you stand. After that the bot only
-# chases monsters inside LEASH_RADIUS of it, and walks back if it drifts out --
-# so it farms one spot instead of being led across the map by a chain of kills.
-# Needs memory targeting: the pixel path has no idea where "here" is in world
-# terms, only what the minimap shows right now.
-# Set the leash in minimap PIXELS: that is the thing you can look at, and --snap
-# can draw it with no game running and nothing measured. The bot converts it to
-# world units when it calibrates. LEASH_RADIUS is only the fallback for when the
-# scale has never been measured.
-LEASH_PX = 100.0         # minimap pixels from the anchor; the box half-width is 140
-LEASH_RADIUS = 45.0      # world units, used only when the scale is unknown
-# Turning back happens AT the circle, not past it -- the circle is what you drew,
-# so it has to be the promise. The damping that stops it bouncing on the boundary
-# is on the way back in instead: once heading home it keeps going until it is
-# well inside, rather than re-engaging the moment it crosses the line.
-LEASH_RESUME = 0.85      # fraction of the radius to get back to before chasing
-DOUBLE_TAP_S = 0.6       # two End presses closer than this mean "anchor here"
-# The minimap scale is measured during calibration and kept here so --snap can
-# draw the leash without a pad or a running game. It is per map, so the file
-# holds whatever the last calibration saw.
-SCALE_FILE = "minimap_scale.txt"
+# The anchor/leash/patrol feature was cut as buggy: End is a plain toggle again
+# and the bot roams wherever the kills lead. It is in git history if the idea is
+# revisited -- the minimap scale tracking went with it, since sizing the leash
+# circle in world units was the only thing it was ever for.
 TOGGLE_VK = 0x23         # End, polled globally through GetAsyncKeyState
 START_PAUSED = True      # launching the script must never move the character
 LOOP_HZ = 20
@@ -658,54 +628,6 @@ def stick_for(basis, dx, dz):
     return sx / n * SPEED, sy / n * SPEED
 
 
-def scale_path():
-    import os
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), SCALE_FILE)
-
-
-def save_scale(world_per_px):
-    """Remember the minimap scale so read-only tools can use it."""
-    if not world_per_px:
-        return
-    with open(scale_path(), "w") as fh:
-        fh.write(f"{world_per_px:.6f}")
-
-
-def load_scale():
-    """Last measured world units per minimap pixel, or None if never measured."""
-    try:
-        with open(scale_path()) as fh:
-            v = float(fh.read().strip())
-        return v if v > 0 else None
-    except (OSError, ValueError):
-        return None
-
-
-def leash_world(world_per_px=None):
-    """The leash in world units, converted from the pixel radius that was set.
-
-    Falls back to LEASH_RADIUS when no scale has ever been measured, so the leash
-    still constrains something instead of silently becoming infinite.
-    """
-    world_per_px = world_per_px or load_scale()
-    return LEASH_PX * world_per_px if world_per_px else LEASH_RADIUS
-
-
-def patrol_point(anchor, radius, rng=None):
-    """A spot to wander to inside the leash, biased outward.
-
-    Uniform-in-disc would cluster near the middle, where the bot already is and
-    has already cleared. sqrt() spreads points by area instead, so it sweeps the
-    ring where monsters it has not killed yet actually are.
-    """
-    import math
-    import random
-    rng = rng or random
-    ang = rng.uniform(0.0, 2.0 * math.pi)
-    r = radius * PATROL_SPREAD * (rng.uniform(0.15, 1.0) ** 0.5)
-    return anchor[0] + r * math.cos(ang), anchor[1] + r * math.sin(ang)
-
-
 def stale_target(now, engaged_since, limit=MEM_ENGAGE_MAX_S):
     """True once we have been on one target longer than it should take to die.
 
@@ -714,31 +636,6 @@ def stale_target(now, engaged_since, limit=MEM_ENGAGE_MAX_S):
     failure mode that looks exactly like a hung bot from the outside.
     """
     return engaged_since is not None and now - engaged_since > limit
-
-
-def within_leash(units, anchor, radius=LEASH_RADIUS):
-    """Units inside the leash. No anchor means no leash, so everything passes."""
-    if anchor is None:
-        return units
-    ax, az = anchor
-    return [u for u in units
-            if (u[2] - ax) ** 2 + (u[4] - az) ** 2 <= radius * radius]
-
-
-def strayed(px, pz, anchor, radius=LEASH_RADIUS, going_home=False,
-            resume=LEASH_RESUME):
-    """Should the bot be walking home right now?
-
-    Two thresholds, not one. It turns back the moment it crosses the circle, so
-    the circle drawn on --snap is the actual limit. But once turning back it
-    keeps going until it is `resume` of the way in, which is what stops it
-    bouncing along the boundary chasing a monster that sits on the line.
-    """
-    if anchor is None:
-        return False
-    ax, az = anchor
-    out = ((px - ax) ** 2 + (pz - az) ** 2) ** 0.5
-    return out > radius * resume if going_home else out > radius
 
 
 def nearest_monster(units, px, pz, reach=MEM_RANGE):
@@ -756,8 +653,7 @@ def nearest_monster(units, px, pz, reach=MEM_RANGE):
 def pick_me(legs, floor=MEM_CAL_MIN, need=MEM_CAL_LEGS):
     """Which unit is the one answering the stick?
 
-    `legs` is [((sx, sy), {addr: (dx, dz)}, minimap_px)] from the calibration
-    pushes. The obvious test -- whoever moved furthest -- is wrong on a busy
+    `legs` is [((sx, sy), {addr: (dx, dz)})] from the calibration pushes. The obvious test -- whoever moved furthest -- is wrong on a busy
     map, where another player simply walks faster than our pushes and steals
     the identification. What is true of us and of nobody else is that our
     travel is a *linear function of the stick*: push east twice as hard, go
@@ -767,7 +663,7 @@ def pick_me(legs, floor=MEM_CAL_MIN, need=MEM_CAL_LEGS):
     take the best fit.
     """
     per = {}
-    for stick, moved, _ in legs:
+    for stick, moved in legs:
         for addr, d in moved.items():
             per.setdefault(addr, []).append((stick, d))
     best, best_err = None, None
@@ -815,17 +711,9 @@ class MemoryEyes:
         self.me = None            # our own BaseUnitController
         self.basis = None         # stick push -> world travel
         self.units = []           # cached (kind, addr, x, y, z)
-        self.world_per_px = None  # minimap scale, re-measured as it walks
-        self.grab = None          # returns a greyscale minimap frame
-        self.scale_mark = None    # (frame, position) the last scale sample
-        self.next_scale = 0.0
-        self.anchor = None        # (x, z) the leash is measured from
-        self.anchor_pending = False  # asked for before we knew our own unit
         self.chasing = None       # unit held between frames, so it does not flap
         self.engaged_since = None # when we started on the current target
         self.ignored = {}         # unit -> time it becomes fair game again
-        self.patrol = None        # (x, z) being wandered to when nothing to kill
-        self.patrol_until = 0.0
         self.mode = "no unit"
         self.misses = 0           # consecutive frames our position did not read
         self.hot = None           # regions worth sweeping
@@ -850,15 +738,11 @@ class MemoryEyes:
                 out[a] = p
         return out
 
-    def calibrate(self, pad, grab=None):      
+    def calibrate(self, pad):
         """Find which unit is us, and how a stick push maps to world travel.
 
-        `grab` returns a greyscale minimap frame. Given one, the same two pushes
-        also measure how many world units a minimap pixel is worth, which is what
-        lets a leash radius be quoted in something the player can see.
-
-        Both come from the same two pushes: our unit is the one that moves when
-        we push, which is a fact we can create on demand rather than infer. It
+        Our unit is the one that moves when we push, which is a fact we can
+        create on demand rather than infer. It
         works mid-combat, unlike anything built on walking a clean line.
         """
         players = self.known_players()   # from the background sweep, never blocks
@@ -866,9 +750,8 @@ class MemoryEyes:
             return False
 
         def push(sx, sy):
-            """(world deltas per unit, minimap pixels the view slid)."""
+            """World delta per unit over one push."""
             before = self._positions(players)
-            g0 = grab() if grab else None
             t0 = time.time()
             while time.time() - t0 < MEM_CAL_PUSH_S:
                 pad.stick(sx, sy, False)
@@ -876,15 +759,8 @@ class MemoryEyes:
             pad.stick(0.0, 0.0, False)
             time.sleep(0.2)
             after = self._positions(players)
-            mpx = None
-            if g0 is not None:
-                # the same push, measured on the minimap: world units per pixel
-                han = cv2.createHanningWindow((g0.shape[1], g0.shape[0]),
-                                              cv2.CV_32F)
-                (mx, my), _ = cv2.phaseCorrelate(g0, grab(), han)
-                mpx = (mx * mx + my * my) ** 0.5
-            return ({a: (after[a][0] - before[a][0], after[a][2] - before[a][2])
-                     for a in before if a in after}, mpx)
+            return {a: (after[a][0] - before[a][0], after[a][2] - before[a][2])
+                    for a in before if a in after}
 
         # Push every direction first, then work out which unit was answering.
         # Picking the biggest mover in a leg does not do it: on a busy map
@@ -894,15 +770,15 @@ class MemoryEyes:
         legs = []
         for sx, sy in ((1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0),
                        (0.7, 0.7), (-0.7, 0.7)):
-            moved, mpx = push(sx, sy)
+            moved = push(sx, sy)
             if moved:
-                legs.append(((sx, sy), moved, mpx))
+                legs.append(((sx, sy), moved))
         me = pick_me(legs)
         if me is None:
             return False
 
-        samples, travel, seen = [], [], []
-        for (sx, sy), moved, mpx in legs:
+        samples = []
+        for (sx, sy), moved in legs:
             if me not in moved:
                 continue
             dx, dz = moved[me]
@@ -910,8 +786,6 @@ class MemoryEyes:
             if dist < MEM_CAL_MIN:
                 continue                    # blocked that way; the wall is fine
             samples.append(((sx, sy), (dx, dz)))
-            travel.append(dist)
-            seen.append(mpx if mpx is not None else 0.0)
             if len(samples) >= MEM_CAL_LEGS:
                 # Least squares over every leg that moved, not just two of them.
                 # In a fight the character gets shoved and stunned, so a single
@@ -927,73 +801,8 @@ class MemoryEyes:
                 if stick_for(basis, 1.0, 0.0) is None:
                     continue
                 self.me, self.basis = me, basis
-                # world units per minimap pixel, so the leash can be drawn
-                ratios = sorted(w / m for w, m in zip(travel, seen) if m > 3.0)
-                # median, because a leg that was shoved or stunned is wrong in
-                # one direction and would drag an average with it
-                self.world_per_px = (ratios[len(ratios) // 2] if ratios else None)
-                save_scale(self.world_per_px)
-                if self.anchor_pending:
-                    self.anchor_pending = False
-                    here = self.ms.read_vec3(self.mem,
-                                             self.me + self.ms.UNIT_POSITION)
-                    if here:
-                        self.anchor = (here[0], here[2])
                 return True
         return False
-
-    def leash(self):
-        """The leash in world units, from the pixel radius the player set."""
-        return leash_world(self.world_per_px)
-
-    def watch_scale(self, now, here):
-        """Re-measure world units per minimap pixel from ordinary walking.
-
-        The minimap zooms, and a stale scale makes the drawn leash circle stop
-        describing the leash the bot enforces. No calibration pushes are needed
-        for this: the world distance travelled is in memory and the minimap
-        distance is in the picture, so both come free while the bot walks.
-        """
-        if self.grab is None or now < self.next_scale:
-            return
-        self.next_scale = now + SCALE_CHECK_S
-        gray = self.grab()
-        was = self.scale_mark
-        self.scale_mark = (gray, here)
-        if was is None:
-            return
-        old_gray, old_pos = was
-        han = cv2.createHanningWindow((gray.shape[1], gray.shape[0]), cv2.CV_32F)
-        (mx, my), _ = cv2.phaseCorrelate(old_gray, gray, han)
-        px = (mx * mx + my * my) ** 0.5
-        world = ((here[0] - old_pos[0]) ** 2 + (here[2] - old_pos[2]) ** 2) ** 0.5
-        if px < SCALE_MIN_PX or world < 1.0:
-            return                      # stood still; proves nothing either way
-        fresh = world / px
-        # Eased rather than replaced: one sample can catch a teleport or a
-        # stutter, and a wrong scale would resize the leash under the player.
-        self.world_per_px = (fresh if self.world_per_px is None
-                             else 0.7 * self.world_per_px + 0.3 * fresh)
-        save_scale(self.world_per_px)
-
-    def leash_status(self):
-        """A short readout of the leash, for the status line.
-
-        Worth showing every frame: 'no anchor' looks exactly like a leash that
-        is not working, and the difference is a double-tap.
-        """
-        if self.me is None:
-            return "calibrating"
-        if self.anchor is None:
-            return "no anchor"
-        here = self.ms.read_vec3(self.mem, self.me + self.ms.UNIT_POSITION) \
-            if self.me else None
-        if not here:
-            return "anchor?"
-        out = ((here[0] - self.anchor[0]) ** 2 +
-               (here[2] - self.anchor[1]) ** 2) ** 0.5
-        px = out / self.world_per_px if self.world_per_px else out
-        return f"leash {px:3.0f}/{LEASH_PX:g}px"
 
     def start_scanning(self):
         """Rediscover units in the background, forever. Never blocks the bot.
@@ -1056,34 +865,22 @@ class MemoryEyes:
         if not here:
             # Our unit was rebuilt -- map change, death or relog. Everything
             # derived from it is now meaningless: the basis was measured for a
-            # unit that no longer exists, and the anchor is a coordinate on a map
-            # we may have left. Dropping `hot` forces the next sweep to search
+            # unit that no longer exists. Dropping `hot` forces the next sweep
+            # to search
             # the whole heap, because the new objects need not be where the old
             # ones were.
-            self.me = self.basis = self.anchor = self.hot = None
-            self.chasing = self.engaged_since = self.patrol = None
+            self.me = self.basis = self.hot = None
+            self.chasing = self.engaged_since = None
             self.ignored = {}
             self.mode = "no unit"
             with self.lock:
                 self.units = []
             return None, None, None
         self.misses = 0
-        self.watch_scale(now, here)
         px, _, pz = here
-        heading_home = self.mode == "going home"
-        if strayed(px, pz, self.anchor, self.leash(), heading_home):
-            # Too far from home: walk back before looking for anything else,
-            # or a chain of kills tows the bot across the map.
-            ax, az = self.anchor
-            s = stick_for(self.basis, ax - px, az - pz)
-            self.mode = "going home"
-            back = ((px - ax) ** 2 + (pz - az) ** 2) ** 0.5
-            return (s[0], s[1], back) if s else (None, None, None)
-
         self.mode = "chasing"
         fresh = [(k, u, *live[u]) for k, u, *_ in cached if u in live]
-        allowed = [e for e in within_leash(fresh, self.anchor, self.leash())
-                   if self.ignored.get(e[1], 0.0) < now]
+        allowed = [e for e in fresh if self.ignored.get(e[1], 0.0) < now]
 
         # Hold the current target rather than re-picking the nearest every
         # frame. Two monsters a similar distance away swap which is closer
@@ -1098,21 +895,9 @@ class MemoryEyes:
             if hd <= MEM_RANGE and (not hit or dist > hd * TARGET_SWITCH):
                 hit, dist = (held[1], held[2], held[3], held[4]), hd
         if not hit:
-            # Nothing to kill inside the leash. Walk the circle rather than
-            # stand in it: monsters respawn and roam, and standing still never
-            # finds them. Without an anchor there is no circle to walk.
             self.chasing = self.engaged_since = None
-            if self.anchor is None:
-                return None, None, None
-            if (self.patrol is None or now > self.patrol_until
-                    or ((px - self.patrol[0]) ** 2 +
-                        (pz - self.patrol[1]) ** 2) ** 0.5 < PATROL_REACHED):
-                self.patrol = patrol_point(self.anchor, self.leash())
-                self.patrol_until = now + PATROL_HOLD_S
-            self.mode = "patrol"
-            s = stick_for(self.basis, self.patrol[0] - px, self.patrol[1] - pz)
-            away = ((px - self.patrol[0]) ** 2 + (pz - self.patrol[1]) ** 2) ** 0.5
-            return (s[0], s[1], away) if s else (None, None, None)
+            self.mode = "no monster"
+            return None, None, None
         if hit[0] != self.chasing:
             self.chasing, self.engaged_since = hit[0], now
         elif stale_target(now, self.engaged_since):
@@ -1128,27 +913,6 @@ class MemoryEyes:
             return 0.0, 0.0, dist        # arrived: hold still and swing
         s = stick_for(self.basis, hit[1] - px, hit[3] - pz)
         return (s[0], s[1], dist) if s else (None, None, None)
-
-    def set_anchor(self):
-        """Drop the anchor where the character stands, or lift it if set.
-
-        Returns ('set'|'cleared'|'not ready', position). The three cases were one
-        `None` before, so a bot that had not calibrated yet reported "anchor
-        cleared" and looked like it had a leash when it had nothing of the sort.
-        """
-        if self.anchor is not None:
-            self.anchor = None
-            return "cleared", None
-        here = self.ms.read_vec3(self.mem, self.me + self.ms.UNIT_POSITION) \
-            if self.me else None
-        if not here:
-            # Asked before we know which unit we are. Remember it and drop the
-            # anchor the moment calibration finishes, rather than making the
-            # player watch for a log line and try again.
-            self.anchor_pending = True
-            return "pending", None
-        self.anchor = (here[0], here[2])
-        return "set", self.anchor
 
 
 class VirtualPad:
@@ -1281,7 +1045,6 @@ def main(port=None):
           f" via {type(pad).__name__} -- End to start/stop, ctrl+c to exit")
 
     last = None  # (t, dist, sx, sy) of last seen dot
-    last_toggle = 0.0  # for spotting a double tap of End
     had_unit = False   # so the 'unit rebuilt' notice prints once
     next_cal = 0.0     # earliest retry after a failed calibration
     eyes = None
@@ -1294,8 +1057,7 @@ def main(port=None):
                       " TYPE_RVA in memscan.py (the field offsets usually"
                       " survive).\n  Re-run Il2CppDumper on GameAssembly.dll +"
                       " global-metadata.dat and update those three lines."
-                      "\n  Until then: pixels, which means no leash and it will"
-                      " chase pets.")
+                      "\n  Until then: pixels, which means it will chase pets.")
                 eyes.close()
                 eyes = None
         except Exception as e:                  # game closed, no rights, no dump
@@ -1319,35 +1081,6 @@ def main(port=None):
         try:
             while True:
                 if toggle_key_hit():
-                    # The second tap means "anchor here" and does NOT toggle, so
-                    # a double-tap from stopped leaves the bot running rather
-                    # than back where it started. The window is measured from
-                    # when the last toggle FINISHED: starting the bot sleeps
-                    # about a second inside wake_controller, and measuring from
-                    # the keypress put every second tap outside the window.
-                    tapped = time.time()
-                    if tapped - last_toggle < DOUBLE_TAP_S:
-                        what, spot = eyes.set_anchor() if eyes else \
-                            ("not ready", None)
-                        if what == "set":
-                            print(f"\nanchor set at ({spot[0]:.0f},{spot[1]:.0f})"
-                                  f" -- staying within {LEASH_PX:g} minimap px "
-                                  f"({eyes.leash():.0f} world units) of it")
-                        elif what == "cleared":
-                            print("\nanchor cleared; roaming freely")
-                        elif what == "pending":
-                            # Tapped before calibration knows which unit we are.
-                            # It is remembered and dropped the moment it does --
-                            # saying "NO ANCHOR SET" here was a plain lie, and
-                            # the anchor then appeared seconds later anyway.
-                            print("\nanchor requested -- it drops where you "
-                                  "stand as soon as calibration lands")
-                        else:
-                            print("\nNO ANCHOR SET: memory targeting is not "
-                                  "running, so there is nothing to anchor to. "
-                                  "The status line reads 'pixels' when so.")
-                        last_toggle = time.time()
-                        continue           # an anchor tap must not also toggle
                     paused = toggle_running(paused, pad, pet_filter)
                     target_lock.reset()
                     target_blacklist.reset()
@@ -1356,7 +1089,6 @@ def main(port=None):
                     buff_queue = []
                     next_buff = next_press = next_spam = 0.0
                     print(f"\n{'STOPPED' if paused else 'STARTED'} (End)")
-                    last_toggle = time.time()   # after the wake sleep, not before
                     if not paused and eyes is not None and eyes.scanner is None:
                         # Returns at once. The first sweep is slow, so the bot
                         # runs on pixels meanwhile and upgrades itself when the
@@ -1404,25 +1136,10 @@ def main(port=None):
                     # already been fighting on pixels rather than before it.
                     print("\nunit list ready -- calibrating (2s)")
 
-                    def _mini():
-                        g = np.array(sct.grab(minimap_region(win)))[:, :, :3]
-                        return np.float32(cv2.cvtColor(g, cv2.COLOR_BGR2GRAY))
-
-                    # The same pushes measure the minimap scale, which is what
-                    # turns the leash from world units into something drawable.
-                    eyes.grab = _mini      # so the scale tracks the zoom
-                    if eyes.calibrate(pad, grab=_mini):
-                        half = minimap_region(win)["width"] / 2
-                        scale = (f"{eyes.world_per_px:.2f} world units per "
-                                 f"minimap pixel" if eyes.world_per_px
-                                 else "minimap scale unknown")
+                    if eyes.calibrate(pad):
                         had_unit = True
                         print(f"  locked on 0x{eyes.me:012X}; targeting monsters "
                               f"by what they are, not how they look")
-                        print(f"  {scale}; the {LEASH_PX:g}px leash is "
-                              f"{eyes.leash():.0f} world units, "
-                              f"{100 * LEASH_PX / half:.0f}% of the way to the "
-                              f"minimap edge")
                     else:
                         # Usually the character was blocked or stunned and the
                         # pushes moved nothing. Retry later rather than giving up
@@ -1443,8 +1160,8 @@ def main(port=None):
                         # pixels for the rest of the session.
                         if had_unit:
                             print("\nour unit was rebuilt (map change, death or "
-                                  "relog) -- anchor cleared, rediscovering "
-                                  "(~15s), pixels until then")
+                                  "relog) -- rediscovering (~15s), pixels "
+                                  "until then")
                             had_unit = False
                     elif msx is None:
                         sx = sy = 0.0
@@ -1457,10 +1174,8 @@ def main(port=None):
                                                              "no monster")
                     else:
                         sx, sy = msx, msy
-                        state = {"going home": "home in ",
-                                 "on it": "on it  ",
-                                 "patrol": "patrol "}.get(eyes.mode,
-                                                          "dist ") +                             f"{mdist:6.1f}"
+                        state = ("on it  " if eyes.mode == "on it"
+                                 else "dist  ") + f"{mdist:6.1f}"
 
                 # Everything below is the pixel path, used when memory targeting
                 # is off or has gone stale. It is left exactly as it was.
@@ -1524,9 +1239,9 @@ def main(port=None):
                     key = SPAM_BUTTON
                     next_spam = now + SPAM_PERIOD_S
 
-                leash_note = f" {eyes.leash_status()}" if eyes else " pixels"
+                how = "  memory" if (eyes and eyes.me) else "  pixels"
                 print(f"{state:12} stick {sx:+.2f},{sy:+.2f} "
-                      f"atk {'#' if atk else '.'} {key:5}{leash_note}   ",
+                      f"atk {'#' if atk else '.'} {key:5}{how}   ",
                       end="\r")
                 time.sleep(1 / LOOP_HZ)
         except KeyboardInterrupt:
@@ -1619,16 +1334,6 @@ def demo():
     assert nearest_monster(around, 0.0, 0.0, reach=5.0) == (None, None)
     assert nearest_monster([("pet", 0xA, 1.0, 0.0, 0.0)], 0.0, 0.0) == (None, None)
 
-    # Patrol points must land inside the leash, or the bot would walk out and be
-    # dragged back every time, and they must spread rather than cluster at the
-    # anchor, where it has already killed everything.
-    import random as _rnd
-    spots = [patrol_point((10.0, -5.0), 40.0, _rnd.Random(n)) for n in range(200)]
-    out = [((x - 10.0) ** 2 + (z + 5.0) ** 2) ** 0.5 for x, z in spots]
-    assert max(out) <= 40.0, max(out)                    # never outside
-    assert max(out) > 40.0 * 0.5, max(out)               # but does reach out
-    assert len({(round(x), round(z)) for x, z in spots}) > 50, "should spread"
-
     # Identifying our own unit among a crowd. The decoy walks further on every
     # single leg -- which is exactly how a busy map broke calibration -- but its
     # travel has nothing to do with the stick, so it must never be chosen.
@@ -1641,26 +1346,23 @@ def demo():
                  _sx * _basis[0][1] + _sy * _basis[1][1])
         _wander = (14.0, -9.0) if _i % 2 else (-3.0, 15.0)   # always bigger
         _legs.append(((_sx, _sy), {_me: _mine, _decoy: _wander,
-                                   _idle: (0.01, 0.0)}, 10.0))
+                                   _idle: (0.01, 0.0)}))
     assert pick_me(_legs) == _me, hex(pick_me(_legs) or 0)
     assert pick_me([_legs[0]]) is None, "one leg cannot identify anyone"
 
     # A blank position read must not throw the calibration away: the bot goes
-    # silent until someone notices and presses End twice. Coast, then give up.
+    # silent until someone notices and restarts it. Coast, then give up.
     class _Blind(MemoryEyes):
         def __init__(self):
-            self.me, self.basis, self.anchor = 0x1000, [[1.0, 0.0], [0.0, 1.0]], (0.0, 0.0)
+            self.me, self.basis = 0x1000, [[1.0, 0.0], [0.0, 1.0]]
             self.units, self.chasing, self.engaged_since = [], None, None
-            self.ignored, self.patrol, self.patrol_until = {}, None, 0.0
+            self.ignored = {}
             self.mode, self.misses, self.hot = "chasing", 0, None
             import threading
             self.lock = threading.Lock()
 
         def _positions(self, _):
             return {}                          # every read comes back empty
-
-        def watch_scale(self, *a):
-            pass
 
     blind = _Blind()
     for i in range(MEM_LOST_FRAMES):
@@ -1687,93 +1389,6 @@ def demo():
     assert not rival_d < held_d * TARGET_SWITCH, "a 4% gain must not switch"
     assert 3.0 < 10.4 * TARGET_SWITCH, "but a much nearer one still wins"
 
-    # The leash. Monsters outside it are not targets, however close they are to
-    # the character -- otherwise a chain of kills tows the bot across the map.
-    spread = [("monster", 1, 10.0, 0.0, 0.0), ("monster", 2, 100.0, 0.0, 0.0)]
-    assert [u[1] for u in within_leash(spread, (0.0, 0.0), 45.0)] == [1]
-    assert within_leash(spread, None) == spread          # no anchor, no leash
-    # A monster just outside the line is not chased even while standing on it
-    far = [("monster", 3, 50.0, 0.0, 0.0)]
-    assert within_leash(far, (0.0, 0.0), 45.0) == []
-    assert nearest_monster(within_leash(far, (0.0, 0.0), 45.0),
-                           49.0, 0.0) == (None, None)
-    # set_anchor tells its three cases apart. They used to be one None, so a bot
-    # that had not calibrated reported "anchor cleared" and looked leashed.
-    class NoUnit:
-        me = None
-        anchor = None
-        ms = None
-        set_anchor = MemoryEyes.set_anchor
-
-    # Asked before calibration: remembered, not refused, so an early double-tap
-    # still gets an anchor instead of a message telling you to try again.
-    early = NoUnit()
-    assert early.set_anchor() == ("pending", None)
-    assert early.anchor_pending
-
-    class Anchored(NoUnit):
-        anchor = (1.0, 2.0)
-
-    a = Anchored()
-    assert a.set_anchor() == ("cleared", None) and a.anchor is None
-
-    # Walking home starts past the slack, not at the line, or the bot would step
-    # over and back forever.
-    # Out at all means turn back -- the drawn circle is the limit, not a
-    # suggestion. It was 15% past, which is exactly the overshoot that showed up
-    # as the bot leaving the circle on screen.
-    assert strayed(46.0, 0.0, (0.0, 0.0), 45.0)
-    assert not strayed(44.0, 0.0, (0.0, 0.0), 45.0)
-    # Already heading home: keep going until well inside, so a monster sitting on
-    # the line cannot make it bounce in and out.
-    assert strayed(44.0, 0.0, (0.0, 0.0), 45.0, going_home=True, resume=0.85)
-    assert not strayed(30.0, 0.0, (0.0, 0.0), 45.0, going_home=True, resume=0.85)
-    assert not strayed(9999.0, 0.0, None)                # no anchor, never home
-
-    # Scale tracking, so a zoom mid-run does not leave the drawn circle lying.
-    # Two frames of noise standing in for the minimap; only the shift matters.
-    class ScaleEyes:
-        ms = None
-        grab = staticmethod(lambda: ScaleEyes.frame)
-        frame = None
-        world_per_px = None
-        scale_mark = None
-        next_scale = 0.0
-        watch_scale = MemoryEyes.watch_scale
-
-    rng = np.random.default_rng(7)
-    base_img = rng.integers(0, 255, (64, 64), dtype=np.uint8).astype(np.float32)
-    se = ScaleEyes()
-    ScaleEyes.frame = base_img
-    se.watch_scale(0.0, (0.0, 0.0, 0.0))                 # first sample, no scale
-    assert se.world_per_px is None
-    # shifted 16px on the minimap while the world position moved 32 units
-    ScaleEyes.frame = np.roll(base_img, 16, axis=1)
-    se.watch_scale(SCALE_CHECK_S, (32.0, 0.0, 0.0))
-    assert se.world_per_px and abs(se.world_per_px - 2.0) < 0.2, se.world_per_px
-    # standing still proves nothing and must not move the estimate
-    held = se.world_per_px
-    se.watch_scale(2 * SCALE_CHECK_S, (32.0, 0.0, 0.0))
-    assert se.world_per_px == held
-    if os.path.exists(scale_path()):
-        os.remove(scale_path())
-
-    # The leash drawn on --snap needs a scale, and says so rather than guessing
-    assert leash_world(0.5) == LEASH_PX * 0.5           # pixels times the scale
-    import os as _os
-    _keep, globals()["SCALE_FILE"] = SCALE_FILE, "test_scale_tmp.txt"
-    try:
-        assert load_scale() is None                      # nothing saved yet
-        assert leash_world() == LEASH_RADIUS             # falls back, not infinite
-        save_scale(0.25)
-        assert abs(load_scale() - 0.25) < 1e-9
-        assert leash_world() == LEASH_PX * 0.25         # reads the saved scale
-        save_scale(None)                                 # nothing to save, no-op
-        assert abs(load_scale() - 0.25) < 1e-9
-    finally:
-        if _os.path.exists(scale_path()):
-            _os.remove(scale_path())
-        globals()["SCALE_FILE"] = _keep
     polled = []
     assert toggle_key_hit(lambda vk: polled.append(vk) or 1)
     assert polled == [0x23]
@@ -1988,16 +1603,6 @@ def snap(path="minimap_snap.png"):
     cv2.drawMarker(img, (cx, cy), (255, 255, 0), cv2.MARKER_CROSS, 14, 1)
     cv2.circle(img, (cx, cy), CONCEAL_PX, (255, 255, 0), 1)
 
-    # The leash, in red, so its size is something you can look at rather than a
-    # number in world units. The scale comes from the last calibration.
-    cv2.circle(img, (cx, cy), int(round(LEASH_PX)), (0, 0, 255), 1)
-    edge = 100 * LEASH_PX / (w / 2)
-    scale = load_scale()
-    worth = (f" = {leash_world(scale):.0f} world units" if scale
-             else " (world size unknown until the bot calibrates)")
-    print(f"  leash {LEASH_PX:g} px{worth}, {edge:.0f}% of the way to the "
-          f"minimap edge, drawn in red"
-          + ("  -- BIGGER THAN THE MINIMAP" if LEASH_PX > w / 2 else ""))
     cv2.imwrite(path, img)
     print(f"{w}x{h} region -> {path}")
 
