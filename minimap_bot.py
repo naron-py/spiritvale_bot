@@ -107,6 +107,11 @@ MEM_RANGE = 70.0         # world units; roughly what the minimap used to cover
 MEM_CAL_PUSH_S = 0.7     # per calibration push, two of them
 MEM_CAL_MIN = 0.5        # world units a push must move us to count
 MEM_CAL_LEGS = 3         # pushes to fit the basis from; more resists shoving
+TARGET_SWITCH = 0.7      # only swap targets for one this much nearer
+# Standing on the monster, the direction to it flips every frame -- measured at a
+# median of 0.4 world units, which is the bot wiggling left and right on the
+# spot. Inside this, stop steering and just hit it.
+MEM_ARRIVE = 2.5         # world units
 CAL_RETRY_S = 15.0       # wait this long before trying to calibrate again
 # The minimap can be zoomed while the bot runs, which changes how many world
 # units a pixel is worth. The leash is enforced in world units so the bot's
@@ -742,6 +747,7 @@ class MemoryEyes:
         self.next_scale = 0.0
         self.anchor = None        # (x, z) the leash is measured from
         self.anchor_pending = False  # asked for before we knew our own unit
+        self.chasing = None       # unit held between frames, so it does not flap
         self.mode = "chasing"
         self.hot = None           # regions worth sweeping
         self.scanner = None
@@ -961,6 +967,7 @@ class MemoryEyes:
             # the whole heap, because the new objects need not be where the old
             # ones were.
             self.me = self.basis = self.anchor = self.hot = None
+            self.chasing = None
             with self.lock:
                 self.units = []
             return None, None, None
@@ -978,10 +985,27 @@ class MemoryEyes:
 
         self.mode = "chasing"
         fresh = [(k, u, *live[u]) for k, u, *_ in cached if u in live]
-        hit, dist = nearest_monster(
-            within_leash(fresh, self.anchor, self.leash()), px, pz)
+        allowed = within_leash(fresh, self.anchor, self.leash())
+
+        # Hold the current target rather than re-picking the nearest every
+        # frame. Two monsters a similar distance away swap which is closer
+        # constantly, and the bot answers by walking left, right, left, right
+        # instead of going to either. It only switches for something clearly
+        # nearer, or when this one is gone.
+        held = next(((k, u, x, y, z) for k, u, x, y, z in allowed
+                     if u == self.chasing), None)
+        hit, dist = nearest_monster(allowed, px, pz)
+        if held:
+            hd = ((held[2] - px) ** 2 + (held[4] - pz) ** 2) ** 0.5
+            if hd <= MEM_RANGE and (not hit or dist > hd * TARGET_SWITCH):
+                hit, dist = (held[1], held[2], held[3], held[4]), hd
         if not hit:
+            self.chasing = None
             return None, None, None
+        self.chasing = hit[0]
+        if dist <= MEM_ARRIVE:
+            self.mode = "on it"
+            return 0.0, 0.0, dist        # arrived: hold still and swing
         s = stick_for(self.basis, hit[1] - px, hit[3] - pz)
         return (s[0], s[1], dist) if s else (None, None, None)
 
@@ -1300,8 +1324,9 @@ def main(port=None):
                         state = "no monster"
                     else:
                         sx, sy = msx, msy
-                        state = ("home in " if eyes.mode == "going home"
-                                 else "dist ") + f"{mdist:6.1f}"
+                        state = {"going home": "home in ",
+                                 "on it": "on it  "}.get(eyes.mode,
+                                                         "dist ") +                             f"{mdist:6.1f}"
 
                 # Everything below is the pixel path, used when memory targeting
                 # is off or has gone stale. It is left exactly as it was.
@@ -1459,6 +1484,17 @@ def demo():
     assert hit[0] == 0xB and abs(dist - 9.0) < 1e-6, (hit, dist)
     assert nearest_monster(around, 0.0, 0.0, reach=5.0) == (None, None)
     assert nearest_monster([("pet", 0xA, 1.0, 0.0, 0.0)], 0.0, 0.0) == (None, None)
+
+    # Two monsters at nearly the same distance: whichever is chosen must be kept
+    # while it stays close, or the bot walks left, right, left, right as they
+    # swap which is nearer. TARGET_SWITCH is how much better a rival must be.
+    a_closer = [("monster", 1, 10.0, 0.0, 0.0), ("monster", 2, 10.4, 0.0, 0.0)]
+    b_closer = [("monster", 1, 10.4, 0.0, 0.0), ("monster", 2, 10.0, 0.0, 0.0)]
+    assert nearest_monster(a_closer, 0.0, 0.0)[0][0] == 1
+    assert nearest_monster(b_closer, 0.0, 0.0)[0][0] == 2   # bare pick flaps
+    held_d, rival_d = 10.4, 10.0                            # holding 1, 2 nearer
+    assert not rival_d < held_d * TARGET_SWITCH, "a 4% gain must not switch"
+    assert 3.0 < 10.4 * TARGET_SWITCH, "but a much nearer one still wins"
 
     # The leash. Monsters outside it are not targets, however close they are to
     # the character -- otherwise a chain of kills tows the bot across the map.
