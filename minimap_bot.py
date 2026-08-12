@@ -1335,6 +1335,13 @@ def main(port=None):
                                   f"({eyes.leash():.0f} world units) of it")
                         elif what == "cleared":
                             print("\nanchor cleared; roaming freely")
+                        elif what == "pending":
+                            # Tapped before calibration knows which unit we are.
+                            # It is remembered and dropped the moment it does --
+                            # saying "NO ANCHOR SET" here was a plain lie, and
+                            # the anchor then appeared seconds later anyway.
+                            print("\nanchor requested -- it drops where you "
+                                  "stand as soon as calibration lands")
                         else:
                             print("\nNO ANCHOR SET: memory targeting is not "
                                   "running, so there is nothing to anchor to. "
