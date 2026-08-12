@@ -740,6 +740,7 @@ class MemoryEyes:
         self.scale_mark = None    # (frame, position) the last scale sample
         self.next_scale = 0.0
         self.anchor = None        # (x, z) the leash is measured from
+        self.anchor_pending = False  # asked for before we knew our own unit
         self.mode = "chasing"
         self.hot = None           # regions worth sweeping
         self.scanner = None
@@ -838,6 +839,12 @@ class MemoryEyes:
                 self.world_per_px = (sum(w / m for w, m in pairs) / len(pairs)
                                      if pairs else None)
                 save_scale(self.world_per_px)
+                if self.anchor_pending:
+                    self.anchor_pending = False
+                    here = self.ms.read_vec3(self.mem,
+                                             self.me + self.ms.UNIT_POSITION)
+                    if here:
+                        self.anchor = (here[0], here[2])
                 return True
         return False
 
@@ -881,6 +888,8 @@ class MemoryEyes:
         Worth showing every frame: 'no anchor' looks exactly like a leash that
         is not working, and the difference is a double-tap.
         """
+        if self.me is None:
+            return "calibrating"
         if self.anchor is None:
             return "no anchor"
         here = self.ms.read_vec3(self.mem, self.me + self.ms.UNIT_POSITION) \
@@ -986,7 +995,11 @@ class MemoryEyes:
         here = self.ms.read_vec3(self.mem, self.me + self.ms.UNIT_POSITION) \
             if self.me else None
         if not here:
-            return "not ready", None
+            # Asked before we know which unit we are. Remember it and drop the
+            # anchor the moment calibration finishes, rather than making the
+            # player watch for a log line and try again.
+            self.anchor_pending = True
+            return "pending", None
         self.anchor = (here[0], here[2])
         return "set", self.anchor
 
@@ -1462,7 +1475,11 @@ def demo():
         ms = None
         set_anchor = MemoryEyes.set_anchor
 
-    assert NoUnit().set_anchor() == ("not ready", None)
+    # Asked before calibration: remembered, not refused, so an early double-tap
+    # still gets an anchor instead of a message telling you to try again.
+    early = NoUnit()
+    assert early.set_anchor() == ("pending", None)
+    assert early.anchor_pending
 
     class Anchored(NoUnit):
         anchor = (1.0, 2.0)
