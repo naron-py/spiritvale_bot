@@ -895,9 +895,19 @@ class MemoryEyes:
             if hd <= MEM_RANGE and (not hit or dist > hd * TARGET_SWITCH):
                 hit, dist = (held[1], held[2], held[3], held[4]), hd
         if not hit:
+            # Nothing within MEM_RANGE. Walk to the nearest monster anywhere
+            # rather than stand: returning nothing here parks the bot forever,
+            # because main() reads a zero stick as "handled" and never falls
+            # through to the pixel path. Memory knows where they all are, so
+            # there is no reason to only look as far as melee range.
             self.chasing = self.engaged_since = None
-            self.mode = "no monster"
-            return None, None, None
+            hit, dist = nearest_monster(allowed, px, pz, reach=float("inf"))
+            if not hit:
+                self.mode = "no monster"     # genuinely none on the map
+                return None, None, None
+            self.mode = "far"
+            s = stick_for(self.basis, hit[1] - px, hit[3] - pz)
+            return (s[0], s[1], dist) if s else (None, None, None)
         if hit[0] != self.chasing:
             self.chasing, self.engaged_since = hit[0], now
         elif stale_target(now, self.engaged_since):
@@ -1174,8 +1184,9 @@ def main(port=None):
                                                              "no monster")
                     else:
                         sx, sy = msx, msy
-                        state = ("on it  " if eyes.mode == "on it"
-                                 else "dist  ") + f"{mdist:6.1f}"
+                        state = {"on it": "on it  ",
+                                 "far": "far    "}.get(eyes.mode,
+                                                       "dist  ") + f"{mdist:6.1f}"
 
                 # Everything below is the pixel path, used when memory targeting
                 # is off or has gone stale. It is left exactly as it was.
@@ -1349,6 +1360,33 @@ def demo():
                                    _idle: (0.01, 0.0)}))
     assert pick_me(_legs) == _me, hex(pick_me(_legs) or 0)
     assert pick_me([_legs[0]]) is None, "one leg cannot identify anyone"
+
+    # A monster beyond MEM_RANGE must still be walked to. Returning nothing
+    # here stands the bot still forever: main() treats a zero stick as handled
+    # and never falls through to the pixel path.
+    class _Far(MemoryEyes):
+        def __init__(self, at):
+            self.me, self.basis = 0x1000, [[1.0, 0.0], [0.0, 1.0]]
+            self.units = [("monster", 0x2000, at, 0.0, 0.0)]
+            self.chasing = self.engaged_since = None
+            self.ignored = {}
+            self.mode, self.misses, self.hot = "chasing", 0, None
+            self.at = at
+            import threading
+            self.lock = threading.Lock()
+
+        def _positions(self, addrs):
+            return {a: ((self.at, 0.0, 0.0) if a == 0x2000 else (0.0, 0.0, 0.0))
+                    for a in addrs}
+
+    far_off = _Far(MEM_RANGE * 3)              # way outside melee range
+    fsx, fsy, fd = far_off.target(1.0)
+    assert far_off.mode == "far", far_off.mode
+    assert fsx is not None and (fsx or fsy), "must walk to it, not stand still"
+    assert abs(fd - MEM_RANGE * 3) < 1.0, fd
+    near = _Far(MEM_RANGE / 2)                 # inside range: ordinary chase
+    near.target(1.0)
+    assert near.mode == "chasing", near.mode
 
     # A blank position read must not throw the calibration away: the bot goes
     # silent until someone notices and restarts it. Coast, then give up.
