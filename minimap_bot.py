@@ -117,7 +117,17 @@ MEM_ARRIVE = 2.5         # world units
 # at it. Give up on one after this long and leave it alone for a while.
 MEM_ENGAGE_MAX_S = 8.0
 MEM_IGNORE_S = 20.0
+# With nothing to chase inside the leash the bot used to stand still until a
+# monster wandered in. It patrols instead: monsters respawn and roam, so moving
+# around the circle finds them, and standing on the spot never does.
+PATROL_HOLD_S = 6.0      # give up on one patrol point after this
+PATROL_REACHED = 4.0     # world units that count as arriving at one
+PATROL_SPREAD = 0.8      # keep patrol points this far inside the leash
 CAL_RETRY_S = 15.0       # wait this long before trying to calibrate again
+# A position read can come back empty for a frame without our unit being gone.
+# Tearing the calibration down on the first miss cost a whole run: the bot went
+# silent and only a double-End brought it back. Insist on a run of misses.
+MEM_LOST_FRAMES = 5
 # The minimap can be zoomed while the bot runs, which changes how many world
 # units a pixel is worth. The leash is enforced in world units so the bot's
 # reach does not change -- but the circle --snap draws would stop matching it.
@@ -681,6 +691,21 @@ def leash_world(world_per_px=None):
     return LEASH_PX * world_per_px if world_per_px else LEASH_RADIUS
 
 
+def patrol_point(anchor, radius, rng=None):
+    """A spot to wander to inside the leash, biased outward.
+
+    Uniform-in-disc would cluster near the middle, where the bot already is and
+    has already cleared. sqrt() spreads points by area instead, so it sweeps the
+    ring where monsters it has not killed yet actually are.
+    """
+    import math
+    import random
+    rng = rng or random
+    ang = rng.uniform(0.0, 2.0 * math.pi)
+    r = radius * PATROL_SPREAD * (rng.uniform(0.15, 1.0) ** 0.5)
+    return anchor[0] + r * math.cos(ang), anchor[1] + r * math.sin(ang)
+
+
 def stale_target(now, engaged_since, limit=MEM_ENGAGE_MAX_S):
     """True once we have been on one target longer than it should take to die.
 
@@ -728,6 +753,40 @@ def nearest_monster(units, px, pz, reach=MEM_RANGE):
     return (best, best_d) if best else (None, None)
 
 
+def pick_me(legs, floor=MEM_CAL_MIN, need=MEM_CAL_LEGS):
+    """Which unit is the one answering the stick?
+
+    `legs` is [((sx, sy), {addr: (dx, dz)}, minimap_px)] from the calibration
+    pushes. The obvious test -- whoever moved furthest -- is wrong on a busy
+    map, where another player simply walks faster than our pushes and steals
+    the identification. What is true of us and of nobody else is that our
+    travel is a *linear function of the stick*: push east twice as hard, go
+    twice as far; push the other way, come back. A player going about their
+    own business fits that badly no matter how fast they move, so score every
+    unit by how well a single 2x2 basis explains all of its legs at once and
+    take the best fit.
+    """
+    per = {}
+    for stick, moved, _ in legs:
+        for addr, d in moved.items():
+            per.setdefault(addr, []).append((stick, d))
+    best, best_err = None, None
+    for addr, obs in per.items():
+        live = [(s, d) for s, d in obs if (d[0] ** 2 + d[1] ** 2) ** 0.5 >= floor]
+        if len(live) < need:
+            continue                    # too little to tell motion from noise
+        S = np.array([s for s, _ in live], dtype=float)
+        W = np.array([d for _, d in live], dtype=float)
+        if np.linalg.matrix_rank(S) < 2:
+            continue
+        fit, *_ = np.linalg.lstsq(S, W, rcond=None)
+        # relative residual, so a unit is not rewarded for barely moving
+        err = float(np.linalg.norm(S @ fit - W) / max(np.linalg.norm(W), 1e-6))
+        if best_err is None or err < best_err:
+            best, best_err = addr, err
+    return best
+
+
 def stick_vector(dx, dy, radius):
     """Screen delta -> left-stick (x, y), y up positive.
 
@@ -765,7 +824,10 @@ class MemoryEyes:
         self.chasing = None       # unit held between frames, so it does not flap
         self.engaged_since = None # when we started on the current target
         self.ignored = {}         # unit -> time it becomes fair game again
-        self.mode = "chasing"
+        self.patrol = None        # (x, z) being wandered to when nothing to kill
+        self.patrol_until = 0.0
+        self.mode = "no unit"
+        self.misses = 0           # consecutive frames our position did not read
         self.hot = None           # regions worth sweeping
         self.scanner = None
         self.stop = None
@@ -803,9 +865,8 @@ class MemoryEyes:
         if not players:
             return False
 
-        seen = []
-
         def push(sx, sy):
+            """(world deltas per unit, minimap pixels the view slid)."""
             before = self._positions(players)
             g0 = grab() if grab else None
             t0 = time.time()
@@ -815,35 +876,42 @@ class MemoryEyes:
             pad.stick(0.0, 0.0, False)
             time.sleep(0.2)
             after = self._positions(players)
+            mpx = None
             if g0 is not None:
                 # the same push, measured on the minimap: world units per pixel
                 han = cv2.createHanningWindow((g0.shape[1], g0.shape[0]),
                                               cv2.CV_32F)
                 (mx, my), _ = cv2.phaseCorrelate(g0, grab(), han)
-                seen.append((mx * mx + my * my) ** 0.5)
-            return {a: (after[a][0] - before[a][0], after[a][2] - before[a][2])
-                    for a in before if a in after}
+                mpx = (mx * mx + my * my) ** 0.5
+            return ({a: (after[a][0] - before[a][0], after[a][2] - before[a][2])
+                     for a in before if a in after}, mpx)
 
-        # Keep pushing different ways until two of them actually moved us. One
-        # blocked direction used to fail the whole calibration -- and a wall on
-        # one side is the normal case, not an unlucky one.
-        me, samples, travel = None, [], []
+        # Push every direction first, then work out which unit was answering.
+        # Picking the biggest mover in a leg does not do it: on a busy map
+        # another player out-walks us, calibration locks onto them, and every
+        # later leg is thrown away as "not us" -- the whole thing then fails
+        # with a healthy character standing right there.
+        legs = []
         for sx, sy in ((1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0),
                        (0.7, 0.7), (-0.7, 0.7)):
-            moved = push(sx, sy)
-            if not moved:
+            moved, mpx = push(sx, sy)
+            if moved:
+                legs.append(((sx, sy), moved, mpx))
+        me = pick_me(legs)
+        if me is None:
+            return False
+
+        samples, travel, seen = [], [], []
+        for (sx, sy), moved, mpx in legs:
+            if me not in moved:
                 continue
-            addr, (dx, dz) = max(moved.items(),
-                                 key=lambda kv: kv[1][0] ** 2 + kv[1][1] ** 2)
+            dx, dz = moved[me]
             dist = (dx * dx + dz * dz) ** 0.5
             if dist < MEM_CAL_MIN:
-                continue                    # blocked, or something else moved
-            if me is None:
-                me = addr                   # the one that answers the stick is us
-            if addr != me:
-                continue
+                continue                    # blocked that way; the wall is fine
             samples.append(((sx, sy), (dx, dz)))
             travel.append(dist)
+            seen.append(mpx if mpx is not None else 0.0)
             if len(samples) >= MEM_CAL_LEGS:
                 # Least squares over every leg that moved, not just two of them.
                 # In a fight the character gets shoved and stunned, so a single
@@ -971,11 +1039,20 @@ class MemoryEyes:
         monster that walks is chased where it is now, not where it was.
         """
         if not (self.me and self.basis):
+            # Say so. Leaving the old mode standing made a bot with no unit at
+            # all report whatever it was doing when it still had one, which read
+            # as "chasing, but motionless" and sent the hunt to the wrong place.
+            self.mode = "no unit"
             return None, None, None
         with self.lock:
             cached = list(self.units)
         live = self._positions([u for _, u, *_ in cached] + [self.me])
         here = live.get(self.me)
+        if not here and self.misses < MEM_LOST_FRAMES:
+            # One empty read is not a death. Coast on the last known state.
+            self.misses += 1
+            self.mode = "lost"
+            return None, None, None
         if not here:
             # Our unit was rebuilt -- map change, death or relog. Everything
             # derived from it is now meaningless: the basis was measured for a
@@ -984,11 +1061,13 @@ class MemoryEyes:
             # the whole heap, because the new objects need not be where the old
             # ones were.
             self.me = self.basis = self.anchor = self.hot = None
-            self.chasing = self.engaged_since = None
+            self.chasing = self.engaged_since = self.patrol = None
             self.ignored = {}
+            self.mode = "no unit"
             with self.lock:
                 self.units = []
             return None, None, None
+        self.misses = 0
         self.watch_scale(now, here)
         px, _, pz = here
         heading_home = self.mode == "going home"
@@ -1019,8 +1098,21 @@ class MemoryEyes:
             if hd <= MEM_RANGE and (not hit or dist > hd * TARGET_SWITCH):
                 hit, dist = (held[1], held[2], held[3], held[4]), hd
         if not hit:
-            self.chasing = None
-            return None, None, None
+            # Nothing to kill inside the leash. Walk the circle rather than
+            # stand in it: monsters respawn and roam, and standing still never
+            # finds them. Without an anchor there is no circle to walk.
+            self.chasing = self.engaged_since = None
+            if self.anchor is None:
+                return None, None, None
+            if (self.patrol is None or now > self.patrol_until
+                    or ((px - self.patrol[0]) ** 2 +
+                        (pz - self.patrol[1]) ** 2) ** 0.5 < PATROL_REACHED):
+                self.patrol = patrol_point(self.anchor, self.leash())
+                self.patrol_until = now + PATROL_HOLD_S
+            self.mode = "patrol"
+            s = stick_for(self.basis, self.patrol[0] - px, self.patrol[1] - pz)
+            away = ((px - self.patrol[0]) ** 2 + (pz - self.patrol[1]) ** 2) ** 0.5
+            return (s[0], s[1], away) if s else (None, None, None)
         if hit[0] != self.chasing:
             self.chasing, self.engaged_since = hit[0], now
         elif stale_target(now, self.engaged_since):
@@ -1349,12 +1441,19 @@ def main(port=None):
                             had_unit = False
                     elif msx is None:
                         sx = sy = 0.0
-                        state = "no monster"
+                        # Name which kind of nothing this is: "no monster" was
+                        # printed for a lost unit too, hiding a dead bot behind
+                        # a message that reads like a quiet patch of map.
+                        state = {"no unit": "no unit  ",
+                                 "lost": "lost     ",
+                                 "gave up": "gave up  "}.get(eyes.mode,
+                                                             "no monster")
                     else:
                         sx, sy = msx, msy
                         state = {"going home": "home in ",
-                                 "on it": "on it  "}.get(eyes.mode,
-                                                         "dist ") +                             f"{mdist:6.1f}"
+                                 "on it": "on it  ",
+                                 "patrol": "patrol "}.get(eyes.mode,
+                                                          "dist ") +                             f"{mdist:6.1f}"
 
                 # Everything below is the pixel path, used when memory targeting
                 # is off or has gone stale. It is left exactly as it was.
@@ -1512,6 +1611,56 @@ def demo():
     assert hit[0] == 0xB and abs(dist - 9.0) < 1e-6, (hit, dist)
     assert nearest_monster(around, 0.0, 0.0, reach=5.0) == (None, None)
     assert nearest_monster([("pet", 0xA, 1.0, 0.0, 0.0)], 0.0, 0.0) == (None, None)
+
+    # Patrol points must land inside the leash, or the bot would walk out and be
+    # dragged back every time, and they must spread rather than cluster at the
+    # anchor, where it has already killed everything.
+    import random as _rnd
+    spots = [patrol_point((10.0, -5.0), 40.0, _rnd.Random(n)) for n in range(200)]
+    out = [((x - 10.0) ** 2 + (z + 5.0) ** 2) ** 0.5 for x, z in spots]
+    assert max(out) <= 40.0, max(out)                    # never outside
+    assert max(out) > 40.0 * 0.5, max(out)               # but does reach out
+    assert len({(round(x), round(z)) for x, z in spots}) > 50, "should spread"
+
+    # Identifying our own unit among a crowd. The decoy walks further on every
+    # single leg -- which is exactly how a busy map broke calibration -- but its
+    # travel has nothing to do with the stick, so it must never be chosen.
+    _me, _decoy, _idle = 0xAA, 0xBB, 0xCC
+    _basis = ((6.0, 1.0), (-1.0, 5.0))
+    _legs = []
+    for _i, (_sx, _sy) in enumerate(((1.0, 0.0), (0.0, 1.0), (-1.0, 0.0),
+                                     (0.0, -1.0))):
+        _mine = (_sx * _basis[0][0] + _sy * _basis[1][0],
+                 _sx * _basis[0][1] + _sy * _basis[1][1])
+        _wander = (14.0, -9.0) if _i % 2 else (-3.0, 15.0)   # always bigger
+        _legs.append(((_sx, _sy), {_me: _mine, _decoy: _wander,
+                                   _idle: (0.01, 0.0)}, 10.0))
+    assert pick_me(_legs) == _me, hex(pick_me(_legs) or 0)
+    assert pick_me([_legs[0]]) is None, "one leg cannot identify anyone"
+
+    # A blank position read must not throw the calibration away: the bot goes
+    # silent until someone notices and presses End twice. Coast, then give up.
+    class _Blind(MemoryEyes):
+        def __init__(self):
+            self.me, self.basis, self.anchor = 0x1000, [[1.0, 0.0], [0.0, 1.0]], (0.0, 0.0)
+            self.units, self.chasing, self.engaged_since = [], None, None
+            self.ignored, self.patrol, self.patrol_until = {}, None, 0.0
+            self.mode, self.misses, self.hot = "chasing", 0, None
+            import threading
+            self.lock = threading.Lock()
+
+        def _positions(self, _):
+            return {}                          # every read comes back empty
+
+        def watch_scale(self, *a):
+            pass
+
+    blind = _Blind()
+    for i in range(MEM_LOST_FRAMES):
+        blind.target(1.0 + i)
+        assert blind.me and blind.mode == "lost", (i, blind.mode)
+    blind.target(99.0)                         # one miss too many: unit is gone
+    assert blind.me is None and blind.mode == "no unit", blind.mode
 
     # Giving up on a target that will not die. Without this the bot parks on the
     # spot swinging forever, which is indistinguishable from a hung bot.
