@@ -106,6 +106,7 @@ MEM_REFRESH_S = 2.0      # rediscovering units scans GBs; positions are re-read
 MEM_RANGE = 70.0         # world units; roughly what the minimap used to cover
 MEM_CAL_PUSH_S = 0.7     # per calibration push, two of them
 MEM_CAL_MIN = 0.5        # world units a push must move us to count
+CAL_RETRY_S = 15.0       # wait this long before trying to calibrate again
 # Double-tap End to drop an anchor where you stand. After that the bot only
 # chases monsters inside LEASH_RADIUS of it, and walks back if it drifts out --
 # so it farms one spot instead of being led across the map by a chain of kills.
@@ -881,7 +882,15 @@ class MemoryEyes:
         live = self._positions([u for _, u, *_ in cached] + [self.me])
         here = live.get(self.me)
         if not here:
-            self.me = None            # our unit was rebuilt: recalibrate
+            # Our unit was rebuilt -- map change, death or relog. Everything
+            # derived from it is now meaningless: the basis was measured for a
+            # unit that no longer exists, and the anchor is a coordinate on a map
+            # we may have left. Dropping `hot` forces the next sweep to search
+            # the whole heap, because the new objects need not be where the old
+            # ones were.
+            self.me = self.basis = self.anchor = self.hot = None
+            with self.lock:
+                self.units = []
             return None, None, None
         px, _, pz = here
         heading_home = self.mode == "going home"
@@ -1052,6 +1061,8 @@ def main(port=None):
 
     last = None  # (t, dist, sx, sy) of last seen dot
     last_toggle = 0.0  # for spotting a double tap of End
+    had_unit = False   # so the 'unit rebuilt' notice prints once
+    next_cal = 0.0     # earliest retry after a failed calibration
     eyes = None
     if MEMORY_TARGETING:
         try:
@@ -1158,16 +1169,25 @@ def main(port=None):
                 h, w = img.shape[:2]
                 now = time.time()
                 sx = sy = None
-                if eyes is not None and eyes.me is None and eyes.known_players():
+                if (eyes is not None and eyes.me is None
+                        and now >= next_cal and eyes.known_players()):
                     # The sweep has landed, so the two calibration pushes can
                     # happen now. Two seconds, once, and only after the bot has
                     # already been fighting on pixels rather than before it.
                     print("\nunit list ready -- calibrating (2s)")
-                    if eyes.calibrate(pad):
+
+                    def _mini():
+                        g = np.array(sct.grab(minimap_region(win)))[:, :, :3]
+                        return np.float32(cv2.cvtColor(g, cv2.COLOR_BGR2GRAY))
+
+                    # The same pushes measure the minimap scale, which is what
+                    # turns the leash from world units into something drawable.
+                    if eyes.calibrate(pad, grab=_mini):
                         half = minimap_region(win)["width"] / 2
                         scale = (f"{eyes.world_per_px:.2f} world units per "
                                  f"minimap pixel" if eyes.world_per_px
                                  else "minimap scale unknown")
+                        had_unit = True
                         print(f"  locked on 0x{eyes.me:012X}; targeting monsters "
                               f"by what they are, not how they look")
                         print(f"  {scale}; the {LEASH_PX:g}px leash is "
@@ -1175,21 +1195,28 @@ def main(port=None):
                               f"{100 * LEASH_PX / half:.0f}% of the way to the "
                               f"minimap edge")
                     else:
-                        print("  could not tell which unit is ours -- "
-                              "staying on pixels")
-                        eyes.close()
-                        eyes = None
+                        # Usually the character was blocked or stunned and the
+                        # pushes moved nothing. Retry later rather than giving up
+                        # on memory targeting for the rest of the session.
+                        next_cal = now + CAL_RETRY_S
+                        print(f"  no unit moved when pushed -- retrying in "
+                              f"{CAL_RETRY_S:g}s, pixels until then")
 
                 if eyes is not None:
                     # The unit list knows what each thing IS, so none of the
                     # pixel machinery is needed here: no pet filter, no
                     # saturation threshold for mushrooms, no minimap rotation.
                     msx, msy, mdist = eyes.target(now)
-                    if msx is None and eyes.me is None:
-                        print("\nour unit was rebuilt (map change, death or "
-                              "relog) -- press End twice to recalibrate")
-                        eyes.close()
-                        eyes = None            # pixels until recalibrated
+                    if eyes.me is None:
+                        # Do not shut memory targeting down for this: it comes
+                        # back on its own once the sweep finds the new unit, and
+                        # closing it meant one map change dropped the bot onto
+                        # pixels for the rest of the session.
+                        if had_unit:
+                            print("\nour unit was rebuilt (map change, death or "
+                                  "relog) -- anchor cleared, rediscovering "
+                                  "(~15s), pixels until then")
+                            had_unit = False
                     elif msx is None:
                         sx = sy = 0.0
                         state = "no monster"
