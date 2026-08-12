@@ -9,8 +9,11 @@ usage:
   python minimap_bot.py --port COM5   # Arduino Leonardo
   python minimap_bot.py --demo        # offline self-check
 """
+import math
 import os
+import struct
 import sys
+import threading
 import time
 
 import cv2
@@ -122,6 +125,18 @@ CAL_RETRY_S = 15.0       # wait this long before trying to calibrate again
 # Tearing the calibration down on the first miss cost a whole run: the bot went
 # silent and only a double-End brought it back. Insist on a run of misses.
 MEM_LOST_FRAMES = 5
+# Reading every unit's position every frame cost 9 ms with 1237 of them on the
+# map. Units far away cannot become the nearest one within a frame, so they are
+# refreshed on a timer and only the near ones every frame.
+NEAR_KEEP = 100.0        # world units; refreshed every frame inside this
+# Everything outside NEAR_KEEP is refreshed a slice at a time rather than all at
+# once: one big sweep put a 77 ms spike in a 50 ms frame budget, which is a
+# visible stutter in the stick. Spread over this many frames it is invisible.
+SWEEP_FRAMES = 20
+# Whether a unit is rendered and alive barely changes between frames, and the
+# pooled ones never do. Re-asking every frame walked hundreds of dead entries
+# looking for the first live one; a short cache makes that a handful of reads.
+LIVE_TTL_S = 0.4
 # The anchor/leash/patrol feature was cut as buggy: End is a plain toggle again
 # and the bot roams wherever the kills lead. It is in git history if the idea is
 # revisited -- the minimap scale tracking went with it, since sizing the leash
@@ -181,7 +196,6 @@ def heading_error(pairs):
     is (-mx, +my). Averaged as unit vectors, which a plain mean of angles cannot
     do without wrapping wrongly at 180.
     """
-    import math
     sx_sum = sy_sum = 0.0
     for (sx, sy), (mx, my) in pairs:
         cx, cy = -mx, my
@@ -740,7 +754,7 @@ def pick_me(legs, floor=MEM_CAL_MIN, need=MEM_CAL_LEGS):
     return best
 
 
-def stick_vector(dx, dy, radius):
+def stick_vector(dx, dy):
     """Screen delta -> left-stick (x, y), y up positive.
 
     Direction only, magnitude SPEED. A minimap pixel is many world metres, so
@@ -773,10 +787,12 @@ class MemoryEyes:
         self.ignored = {}         # unit -> time it becomes fair game again
         self.mode = "no unit"
         self.misses = 0           # consecutive frames our position did not read
+        self.seen_at = {}         # last known position per unit
+        self.sweep_at = 0         # cursor into the far units, a slice per frame
+        self.fight_ok = {}        # unit -> (expiry, is it worth fighting)
         self.hot = None           # regions worth sweeping
         self.scanner = None
         self.stop = None
-        import threading
         self.lock = threading.Lock()
 
     def available(self):
@@ -788,12 +804,69 @@ class MemoryEyes:
         self.mem.close()
 
     def _positions(self, addrs):
+        # Hot path: a few hundred of these per frame, so the read and the
+        # sanity check are inline rather than three function calls deep.
         out = {}
+        read, off = self.mem.read, self.ms.UNIT_POSITION
+        limit = self.ms.POS_MAX
         for a in addrs:
-            p = self.ms.read_vec3(self.mem, a + self.ms.UNIT_POSITION)
-            if p and self.ms.looks_like_place(p):
-                out[a] = p
+            blob = read(a + off, 12)
+            if not blob:
+                continue
+            x, y, z = struct.unpack("<fff", blob)
+            # NaN fails every comparison, which is what excludes it here, and a
+            # zeroed triple is recycled memory rather than a place.
+            if -limit < x < limit and -limit < y < limit and -limit < z < limit                     and (x > 1e-3 or x < -1e-3) and (z > 1e-3 or z < -1e-3):
+                out[a] = (x, y, z)
         return out
+
+    def _fightable(self, unit, now=None):
+        """Cached worth_fighting. Short TTL: it must still notice a death."""
+        now = time.time() if now is None else now
+        hit = self.fight_ok.get(unit)
+        if hit and hit[0] > now:
+            return hit[1]
+        ok = self.ms.worth_fighting(self.mem, unit)
+        self.fight_ok[unit] = (now + LIVE_TTL_S, ok)
+        return ok
+
+    def _first_fightable(self, ranked):
+        """Nearest entry that is really there. `ranked` is sorted by distance."""
+        for d, u, x, y, z in ranked:
+            if self._fightable(u):
+                return (u, x, y, z), d
+        return None, None
+
+    def _live_positions(self, addrs):
+        """Positions, reading only the units that could matter this frame.
+
+        Reading all 1473 units every frame cost 16 ms, and most of them are the
+        other side of the map: nothing a monster does in 50 ms makes it the
+        nearest one from 200 units away. Near units are re-read every frame and
+        the rest a slice at a time, for the same answer at a fraction of the
+        syscalls.
+        """
+        me = self.seen_at.get(self.me)
+        if not me:                       # nothing to measure distance from yet
+            self.seen_at = self._positions(addrs)
+            return self.seen_at
+        near, far = [], []
+        for a in addrs:
+            was = self.seen_at.get(a)
+            if a == self.me or was is None:
+                near.append(a)
+            elif ((was[0] - me[0]) ** 2 + (was[2] - me[2]) ** 2) ** 0.5 < NEAR_KEEP:
+                near.append(a)
+            else:
+                far.append(a)
+        # one slice of the far ones per frame, cycling through them
+        if far:
+            step = max(1, -(-len(far) // SWEEP_FRAMES))
+            start = self.sweep_at % len(far)
+            near += far[start:start + step] or far[:step]
+            self.sweep_at = start + step
+        self.seen_at.update(self._positions(near))
+        return self.seen_at
 
     def calibrate(self, pad):
         """Find which unit is us, and how a stick push maps to world travel.
@@ -911,8 +984,10 @@ class MemoryEyes:
             self.mode = "no unit"
             return None, None, None
         with self.lock:
-            cached = list(self.units)
-        live = self._positions([u for _, u, *_ in cached] + [self.me])
+            cached = [e for e in self.units if e[0] == "monster"]
+        # Only monsters and ourselves: reading every player and pet position
+        # each frame was a quarter of the work for something never targeted.
+        live = self._live_positions([u for _, u, *_ in cached] + [self.me])
         here = live.get(self.me)
         if not here and self.misses < MEM_LOST_FRAMES:
             # One empty read is not a death. Coast on the last known state.
@@ -929,6 +1004,7 @@ class MemoryEyes:
             self.me = self.basis = self.hot = None
             self.chasing = self.engaged_since = None
             self.ignored = {}
+            self.seen_at, self.fight_ok = {}, {}
             self.mode = "no unit"
             with self.lock:
                 self.units = []
@@ -948,32 +1024,35 @@ class MemoryEyes:
         # and full health. Without this the bot parks in a pile of them,
         # swinging at each for MEM_ENGAGE_MAX_S in turn and never leaving --
         # and walking straight back if you drag the character away.
-        allowed = [e for e in fresh if self.ignored.get(e[1], 0.0) < now
-                   and self.ms.worth_fighting(self.mem, e[1])]
+        ranked = sorted(((((x - px) ** 2 + (z - pz) ** 2) ** 0.5, u, x, y, z)
+                         for k, u, x, y, z in fresh if k == "monster"
+                         and self.ignored.get(u, 0.0) < now),
+                        key=lambda e: e[0])
 
         # Hold the current target rather than re-picking the nearest every
         # frame. Two monsters a similar distance away swap which is closer
         # constantly, and the bot answers by walking left, right, left, right
         # instead of going to either. It only switches for something clearly
         # nearer, or when this one is gone.
-        held = next(((k, u, x, y, z) for k, u, x, y, z in allowed
-                     if u == self.chasing), None)
-        hit, dist = nearest_monster(allowed, px, pz)
-        if held:
-            hd = ((held[2] - px) ** 2 + (held[4] - pz) ** 2) ** 0.5
-            if hd <= MEM_RANGE and (not hit or dist > hd * TARGET_SWITCH):
-                hit, dist = (held[1], held[2], held[3], held[4]), hd
+        held = next((e for e in ranked if e[1] == self.chasing), None)
+        if held and held[0] <= MEM_RANGE and self._fightable(held[1]):
+            hit, dist = (held[1], held[2], held[3], held[4]), held[0]
+        else:
+            # Checked in distance order and stopped at the first one that is
+            # really there, so the liveness reads cost a handful per frame
+            # rather than one per monster on the map.
+            hit, dist = self._first_fightable(ranked)
+            if hit and held and held[0] <= MEM_RANGE                     and dist > held[0] * TARGET_SWITCH and self._fightable(held[1]):
+                hit, dist = (held[1], held[2], held[3], held[4]), held[0]
         if not hit:
-            # Nothing within MEM_RANGE. Walk to the nearest monster anywhere
-            # rather than stand: returning nothing here parks the bot forever,
+            self.chasing = self.engaged_since = None
+            self.mode = "no monster"        # nothing real left anywhere
+            return None, None, None
+        if dist > MEM_RANGE:
+            # Nothing within melee reach. Walk to the nearest real monster
+            # anywhere rather than stand: returning nothing here parks the bot,
             # because main() reads a zero stick as "handled" and never falls
-            # through to the pixel path. Memory knows where they all are, so
-            # there is no reason to only look as far as melee range.
-            hit, dist = nearest_monster(allowed, px, pz, reach=float("inf"))
-            if not hit:
-                self.chasing = self.engaged_since = None
-                self.mode = "no monster"     # genuinely none on the map
-                return None, None, None
+            # through to the pixel path.
             self.mode = "far"
             # Fall through rather than return: a far target needs the same
             # engagement clock as a near one, or an unreachable monster across
@@ -1280,7 +1359,7 @@ def main(port=None):
                 # Everything below is the pixel path, used when memory targeting
                 # is off or has gone stale. It is left exactly as it was.
                 if sx is None:
-                    (cx, cy), dots, dot = pick_target(
+                    (cx, cy), _, dot = pick_target(
                         img, pet_filter, target_lock, target_blacklist, now)
                     stuck = (dot is not None and stuck_watchdog.update(
                         target_lock.target_id, dot, cx, cy, now))
@@ -1300,7 +1379,7 @@ def main(port=None):
                 elif dot is not None:
                     dx, dy = dot[0] - cx, dot[1] - cy
                     dist = (dx * dx + dy * dy) ** 0.5
-                    sx, sy = stick_vector(dx, dy, min(w, h) / 2)
+                    sx, sy = stick_vector(dx, dy)
                     last = (now, dist, sx, sy)
                     if dist < DEADZONE_PX:
                         sx = sy = 0.0
@@ -1458,7 +1537,7 @@ def demo():
         def __init__(self, real, standing=True):
             self.real, self.standing = set(real), standing
 
-        def worth_fighting(self, _mem, unit):
+        def worth_fighting(self, _, unit):
             if unit == 0x1000:              # 0x1000 is us; alive unless a corpse
                 return self.standing
             return unit in self.real
@@ -1471,8 +1550,8 @@ def demo():
             self.ignored = {}
             self.mode, self.misses, self.hot = "chasing", 0, None
             self.at, self.mem = at, None
+            self.seen_at, self.sweep_at, self.fight_ok = {}, 0, {}
             self.ms = _Fights(real)
-            import threading
             self.lock = threading.Lock()
 
         def _positions(self, addrs):
@@ -1492,7 +1571,7 @@ def demo():
     pooled = _Far(MEM_RANGE * 3, extra=[("monster", 0x3000, 1.0, 0.0, 0.0)],
                   real=(0x2000,))
     pooled.spots = {0x3000: 1.0}
-    psx, psy, pd = pooled.target(1.0)
+    _, _, pd = pooled.target(1.0)
     assert pooled.chasing == 0x2000, "must skip the pooled one right beside us"
     assert pd > MEM_RANGE, pd
     only_pooled = _Far(MEM_RANGE * 3, real=())     # nothing real at all
@@ -1523,7 +1602,8 @@ def demo():
             self.units, self.chasing, self.engaged_since = [], None, None
             self.ignored = {}
             self.mode, self.misses, self.hot = "chasing", 0, None
-            import threading
+            self.seen_at, self.sweep_at, self.fight_ok = {}, 0, {}
+            self.ms, self.mem = _Fights((0x1000,)), None
             self.lock = threading.Lock()
 
         def _positions(self, _):
@@ -1646,11 +1726,11 @@ def demo():
     _, far_after, chosen = pick_target(far_pet_img, pets)
     assert len(far_after) == 1 and chosen[0] > 100, (far_after, chosen)
 
-    sx, sy = stick_vector(x - 100, y - 100, 100)
+    sx, sy = stick_vector(x - 100, y - 100)
     assert sx > 0.95 and abs(sy) < 0.05, (sx, sy)      # push right, full tilt
-    sx, sy = stick_vector(0, -50, 100)
+    sx, sy = stick_vector(0, -50)
     assert sy > 0.95 and abs(sx) < 0.05, (sx, sy)      # up = +y
-    sx, sy = stick_vector(3, -4, 100)                  # near target, still full
+    sx, sy = stick_vector(3, -4)                  # near target, still full
     assert abs((sx * sx + sy * sy) ** 0.5 - 1.0) < 0.01, (sx, sy)
 
     # Login screens. Built at an odd size on purpose: every coordinate is a
@@ -1807,7 +1887,7 @@ def draw_tracking(img, pet_filter=None, target_lock=None):
     tgt = (int(dot[0]), int(dot[1]))
     cv2.line(img, ipx, tgt, (0, 255, 255), 1)
     cv2.circle(img, tgt, 10, (0, 255, 255), 2)
-    sx, sy = stick_vector(dot[0] - cx, dot[1] - cy, 1)
+    sx, sy = stick_vector(dot[0] - cx, dot[1] - cy)
     # stick vector as an arrow from the player, y flipped back to screen sense
     cv2.arrowedLine(img, ipx, (int(cx + sx * 30), int(cy - sy * 30)),
                     (255, 0, 255), 2, tipLength=0.3)

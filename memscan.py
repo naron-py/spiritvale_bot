@@ -91,6 +91,14 @@ HEALTH_CURRENT = 0x138       # HealthComponent._health, int
 # These move with every patch -- re-dump and update them. Everything else in this
 # file is a search; these three lines are what make it a lookup instead.
 TYPE_RVA = dict(monster=0x5D08E50, player=0x5C60880, summoning=0x5CC1C70)
+# What each of those slots is supposed to contain. An Il2CppClass carries its own
+# name, so the RVAs can be checked rather than trusted -- and rediscovered from
+# these names when a patch moves them, which is what makes an update survivable
+# without a re-dump. See find_classes().
+CLASS_NAMES = dict(monster="MonsterController", player="PlayerController",
+                   summoning="SummoningComponent")
+CLASS_NAME_OFF = 0x10        # Il2CppClass.name, char*
+RVA_CACHE = "il2cpp_rva.json"  # rediscovered slots, so it is slow only once
 # Updated for the build of 2026-08-11 15:59. The previous values were
 # 0x5D6F750 / 0x5D973D8 / 0x5DF95F0 and a patch moved every one of them, which
 # is what "memory targeting unavailable" means in practice. The field offsets
@@ -175,6 +183,8 @@ class Mem:
             raise RuntimeError(
                 f"cannot open pid {self.pid} (error {ctypes.get_last_error()}) -- "
                 f"run this from an elevated shell if the game is elevated")
+        self._bufs = {}          # size -> reusable read buffer
+        self._got = ctypes.c_size_t()
 
     def close(self):
         if self.h:
@@ -212,8 +222,13 @@ class Mem:
 
     def read(self, addr, size):
         """Bytes at addr, or None if the region went away mid-scan."""
-        buf = ctypes.create_string_buffer(size)
-        got = ctypes.c_size_t()
+        # One buffer per size, reused: the bot reads a few hundred 12-byte
+        # positions per frame and allocating a fresh ctypes buffer for each was
+        # measurable next to the syscall itself.
+        buf = self._bufs.get(size)
+        if buf is None:
+            buf = self._bufs[size] = ctypes.create_string_buffer(size)
+        got = self._got
         ok = self.k32.ReadProcessMemory(self.h, ctypes.c_void_p(addr), buf, size,
                                         ctypes.byref(got))
         return buf.raw[:got.value] if ok and got.value else None
