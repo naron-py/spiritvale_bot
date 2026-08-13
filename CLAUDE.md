@@ -4,10 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A screen-reading combat bot for the game **SpiritVale** (Windows). It captures the
-game's minimap, finds red monster dots, and drives a gamepad left stick toward the
-nearest one while holding the attack button and recasting a d-pad buff on a timer.
-No game memory reading, no injection — pure screen capture + synthetic input.
+A combat bot for the game **SpiritVale** (Windows). It drives a gamepad left stick
+toward the nearest monster while holding the attack button and recasting a d-pad
+buff on a timer.
+
+It picks targets two ways. The **memory** path reads the game's unit list and knows
+what each thing *is* — monster, player, or pet — which the screen cannot tell. The
+**pixel** path finds red dots on the minimap and is the fallback: it runs during the
+first background sweep, and whenever memory targeting is unavailable. Memory access
+is read-only (`ReadProcessMemory`); nothing is written and nothing is injected.
 
 ## Commands
 
@@ -22,6 +27,10 @@ python minimap_bot.py --snap       # dump minimap_snap.png with detections drawn
 python minimap_bot.py --test       # walk a blind circle: isolates pad vs vision
 python minimap_bot.py --buff [hold] [gap]   # fire buff sequence once
 python minimap_bot.py --probe      # press every X360 button in turn, named
+
+python memscan.py --demo           # memory layer self-check, no game needed
+python memscan.py --units          # list what the unit sweep classifies right now
+python memscan.py --check <addr>   # inspect one unit object
 ```
 
 There is no test framework. `demo()` in `minimap_bot.py` **is** the test suite: an
@@ -32,7 +41,9 @@ scanning at the bottom of the file — no argparse in `minimap_bot.py`.
 
 ## Architecture
 
-`minimap_bot.py` is the whole bot, single file, three layers:
+`minimap_bot.py` is the bot; `memscan.py` is the memory layer it sits on.
+
+`minimap_bot.py`, four layers:
 
 1. **Vision** — `find_red_dots` runs an HSV threshold + contour centroids over an
    `mss` grab of `minimap_region(win)`. The capture box is `MINIMAP = dict(cx, cy,
@@ -50,10 +61,25 @@ scanning at the bottom of the file — no argparse in `minimap_bot.py`.
    proportional tilt lands inside the game's own deadzone. `main()` holds the last
    heading for `LOST_HOLD_S` when a dot flickers out ("coasting"), and treats a
    dot vanishing under the arrow as arrival ("concealed").
-3. **Pad backends** — `VirtualPad` (vgamepad/ViGEmBus, XInput) and `ArduinoPad`
+3. **Memory targeting** — `MemoryEyes` wraps `memscan.py`. A background thread
+   sweeps the heap for units and caches the membership list (`MEM_REFRESH_S`);
+   positions are read fresh per frame, so a monster is chased where it is now.
+   `calibrate(pad)` learns two things at once by pushing the stick six ways:
+   which unit is ours, and the 2x2 `basis` mapping a stick push to world travel —
+   so no world axis, camera angle or minimap rotation is ever assumed.
+   `target(now)` returns a stick vector and reports a `mode` the status line
+   prints: `chasing`, `far`, `on it`, `gave up`, `no monster`, `lost`, `no unit`,
+   `DEAD`. Everything it depends on is checked rather than trusted — see the
+   constraints below.
+4. **Pad backends** — `VirtualPad` (vgamepad/ViGEmBus, XInput) and `ArduinoPad`
    (serial to a Leonardo). Duck-typed, same three methods: `stick(sx, sy, attack)`,
    `tap_dpad(name, hold)`, `close()`. Pick a backend by adding a class with those
    three methods; nothing else in the file knows the difference.
+
+`memscan.py` is the memory layer: region enumeration, the heap sweep
+(`world_units`), the IL2CPP object walk, and class resolution. Field offsets and
+`TYPE_RVA` sit in one block at its top. It is read-only by construction — it opens
+the process with `PROCESS_VM_READ` and never calls `WriteProcessMemory`.
 
 Tuning constants all sit in one block at the top of `minimap_bot.py`. Prefer
 adjusting them over adding code paths.
