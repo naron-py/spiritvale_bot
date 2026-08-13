@@ -115,12 +115,15 @@ TARGET_SWITCH = 0.7      # only swap targets for one this much nearer
 # median of 0.4 world units, which is the bot wiggling left and right on the
 # spot. Inside this, stop steering and just hit it.
 MEM_ARRIVE = 2.5         # world units
-# Game mechanic: standing exactly on the monster, the attack does nothing at all.
-# The character has to be a step off the spot to swing. Monsters walk into us, so
-# arriving is not enough -- below this, back off. The band between the two is
-# where the bot stands and hits, and it is what stops an in/out oscillation.
-# ponytail: calibration knob, verify live and nudge.
-MEM_TOOCLOSE = 1.2       # world units; must stay below MEM_ARRIVE
+# Arriving used to mean a stick of exactly zero, and the damage stopped a couple
+# of seconds later with the target still standing: measured 46474 -> 37502 and
+# then frozen for dozens of frames at an unchanging 2.02 units, attack still
+# held. The game sits in keyboard mode until it sees stick motion, and with a
+# dead stick it goes back there, so the held attack stops landing. Distance was
+# never the problem -- damage landed fine at 0.30. Keep the stick alive instead:
+# alternate a push either side of the approach heading, which nets out to
+# standing still. ponytail: calibration knob, raise if the damage still stalls.
+MEM_HOLD_WIGGLE = 0.5    # stick magnitude while holding on a target
 # --fightlog: print distance against the target's health every frame we are on
 # one. Which distances actually take health off is the only way to set the two
 # constants above, and guessing them is what this exists to stop.
@@ -794,6 +797,7 @@ class MemoryEyes:
         self.units = []           # cached (kind, addr, x, y, z)
         self.chasing = None       # unit held between frames, so it does not flap
         self.approach = None      # last heading that closed on a target
+        self.wiggle = 1           # which side the holding push goes, flips
         self.engaged_since = None # when we started on the current target
         self.ignored = {}         # unit -> time it becomes fair game again
         self.mode = "no unit"
@@ -1130,16 +1134,18 @@ class MemoryEyes:
             hp = self.ms.unit_health(self.mem, hit[0])
             print(f"\nfightlog {hit[0]:012X} dist {dist:5.2f} hp {hp}")
         if dist <= MEM_ARRIVE:
-            # Standing on the spot, the game refuses to swing at all, and the
-            # monster closes the gap itself. Back off along the reverse of the
-            # heading that got us here rather than away from the target: at this
-            # distance the direction to it is noise, measured flipping every
-            # frame at 0.4 units, so steering by it would be a jitter.
-            if dist < MEM_TOOCLOSE and self.approach:
-                self.mode = "backing off"
-                return -self.approach[0], -self.approach[1], dist
+            # Arrived: stay put but never go still, or the game drops back to
+            # keyboard mode and the held attack stops landing. Sideways to the
+            # approach heading and alternating, so the two frames cancel and the
+            # character holds its ground. Not towards the target: at this range
+            # its direction flips every frame, measured at 0.4 units.
             self.mode = "on it"
-            return 0.0, 0.0, dist        # in the band: hold still and swing
+            if not self.approach:
+                return 0.0, 0.0, dist
+            self.wiggle = -self.wiggle
+            ax, ay = self.approach
+            return (-ay * MEM_HOLD_WIGGLE * self.wiggle,
+                    ax * MEM_HOLD_WIGGLE * self.wiggle, dist)
         s = stick_for(self.basis, hit[1] - px, hit[3] - pz)
         if not s:
             return None, None, None
@@ -1428,7 +1434,6 @@ def main(port=None):
                     else:
                         sx, sy = msx, msy
                         state = {"on it": "on it  ",
-                                 "backing off": "back off",
                                  "far": "far    "}.get(eyes.mode,
                                                        "dist  ") + f"{mdist:6.1f}"
 
@@ -1628,6 +1633,7 @@ def demo():
             self.chasing = self.engaged_since = self.approach = None
             self.ignored = {}
             self.mode, self.misses, self.hot = "chasing", 0, None
+            self.wiggle = 1
             self.at, self.mem = at, None
             self.seen_at, self.sweep_at, self.fight_ok = {}, 0, {}
             self.ms = _Fights(real)
@@ -1692,21 +1698,19 @@ def demo():
     assert near.mode == "chasing", near.mode
     assert near.approach, "the chase heading is what the back-off reverses"
 
-    # Game mechanic: the attack does nothing while the character stands exactly
-    # on the monster, so arriving is not the end of it -- the bot has to step
-    # back off the spot or it swings at nothing until it gives up.
-    onto = _Far(0.4)                           # standing on it: cannot attack
-    onto.approach = (0.6, -0.8)                # how it got there
-    bsx, bsy, _ = onto.target(1.0)
-    assert onto.mode == "backing off", onto.mode
-    assert (bsx, bsy) == (-0.6, 0.8), (bsx, bsy)
-    # ...and stops backing off inside the band, or it oscillates in and out.
-    band = _Far((MEM_TOOCLOSE + MEM_ARRIVE) / 2)
-    band.approach = (0.6, -0.8)
-    hsx, hsy, _ = band.target(1.0)
-    assert band.mode == "on it", band.mode
-    assert (hsx, hsy) == (0.0, 0.0), (hsx, hsy)
-    assert MEM_TOOCLOSE < MEM_ARRIVE, "the band has to exist"
+    # Holding on a target must never send an exactly zero stick: the game falls
+    # back to keyboard mode and the held attack quietly stops landing, measured
+    # as a target frozen at 37502 hp for dozens of frames while the bot reported
+    # "on it". The two frames must cancel, or the bot walks off the monster.
+    onto = _Far(MEM_ARRIVE / 2)
+    onto.approach = (0.6, -0.8)
+    one = onto.target(1.0)
+    two = onto.target(1.0)
+    assert onto.mode == "on it", onto.mode
+    assert one[0] or one[1], "a dead stick loses the attack"
+    assert abs(one[0] + two[0]) < 1e-9 and abs(one[1] + two[1]) < 1e-9, (one, two)
+    # Sideways, so holding does not close or open the distance.
+    assert abs(one[0] * 0.6 + one[1] * -0.8) < 1e-9, one
 
     # A blank position read must not throw the calibration away: the bot goes
     # silent until someone notices and restarts it. Coast, then give up.
