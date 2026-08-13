@@ -1096,6 +1096,15 @@ def read_ptr(mem, addr):
     return p if 0x10000 < p < 0x7FFFFFFFFFFF else 0
 
 
+def unit_health(mem, unit):
+    """Current health, or None. Damage landing is the only proof of a hit."""
+    health = read_ptr(mem, unit + UNIT_HEALTH)
+    if not health:
+        return None
+    blob = mem.read(health + HEALTH_CURRENT, 4)
+    return struct.unpack("<i", blob)[0] if blob else None
+
+
 def worth_fighting(mem, unit):
     """Is this unit actually there to be fought?
 

@@ -115,6 +115,16 @@ TARGET_SWITCH = 0.7      # only swap targets for one this much nearer
 # median of 0.4 world units, which is the bot wiggling left and right on the
 # spot. Inside this, stop steering and just hit it.
 MEM_ARRIVE = 2.5         # world units
+# Game mechanic: standing exactly on the monster, the attack does nothing at all.
+# The character has to be a step off the spot to swing. Monsters walk into us, so
+# arriving is not enough -- below this, back off. The band between the two is
+# where the bot stands and hits, and it is what stops an in/out oscillation.
+# ponytail: calibration knob, verify live and nudge.
+MEM_TOOCLOSE = 1.2       # world units; must stay below MEM_ARRIVE
+# --fightlog: print distance against the target's health every frame we are on
+# one. Which distances actually take health off is the only way to set the two
+# constants above, and guessing them is what this exists to stop.
+FIGHT_LOG = "--fightlog" in sys.argv
 # A target that will not die -- already dead and still listed, unreachable, or
 # simply not attackable -- otherwise parks the bot on the spot forever, swinging
 # at it. Give up on one after this long and leave it alone for a while.
@@ -783,6 +793,7 @@ class MemoryEyes:
         self.basis = None         # stick push -> world travel
         self.units = []           # cached (kind, addr, x, y, z)
         self.chasing = None       # unit held between frames, so it does not flap
+        self.approach = None      # last heading that closed on a target
         self.engaged_since = None # when we started on the current target
         self.ignored = {}         # unit -> time it becomes fair game again
         self.mode = "no unit"
@@ -1047,7 +1058,7 @@ class MemoryEyes:
             # to search
             # the whole heap, because the new objects need not be where the old
             # ones were.
-            self.me = self.basis = self.hot = None
+            self.me = self.basis = self.hot = self.approach = None
             self.chasing = self.engaged_since = None
             self.ignored = {}
             self.seen_at, self.fight_ok = {}, {}
@@ -1113,11 +1124,27 @@ class MemoryEyes:
             self.chasing = self.engaged_since = None
             self.mode = "gave up"
             return None, None, None
+        if FIGHT_LOG and self.mem and dist <= MEM_RANGE:
+            # Distance only: self.mode is still last frame's here, and the band
+            # is what the distance says anyway.
+            hp = self.ms.unit_health(self.mem, hit[0])
+            print(f"\nfightlog {hit[0]:012X} dist {dist:5.2f} hp {hp}")
         if dist <= MEM_ARRIVE:
+            # Standing on the spot, the game refuses to swing at all, and the
+            # monster closes the gap itself. Back off along the reverse of the
+            # heading that got us here rather than away from the target: at this
+            # distance the direction to it is noise, measured flipping every
+            # frame at 0.4 units, so steering by it would be a jitter.
+            if dist < MEM_TOOCLOSE and self.approach:
+                self.mode = "backing off"
+                return -self.approach[0], -self.approach[1], dist
             self.mode = "on it"
-            return 0.0, 0.0, dist        # arrived: hold still and swing
+            return 0.0, 0.0, dist        # in the band: hold still and swing
         s = stick_for(self.basis, hit[1] - px, hit[3] - pz)
-        return (s[0], s[1], dist) if s else (None, None, None)
+        if not s:
+            return None, None, None
+        self.approach = s                # remembered for the back-off above
+        return s[0], s[1], dist
 
 
 class VirtualPad:
@@ -1257,14 +1284,16 @@ def main(port=None):
         try:
             eyes = MemoryEyes()
             if not eyes.available():
-                print("MEMORY TARGETING OFF: the class pointers did not resolve."
-                      "\n  Almost always a game update -- a patch moves every"
-                      " TYPE_RVA in memscan.py (the field offsets usually"
-                      " survive).\n  Re-run Il2CppDumper on GameAssembly.dll +"
-                      " global-metadata.dat and update those three lines."
-                      "\n  Until then: pixels, which means it will chase pets.")
-                eyes.close()
-                eyes = None
+                # Do NOT drop eyes here. This is precisely the case heal() was
+                # written for, and it runs on the scanner thread -- tearing the
+                # object down made that recovery unreachable and left the bot on
+                # pixels (chasing pets) for the whole session.
+                print("MEMORY TARGETING STALE: the class pointers did not"
+                      " resolve, which means the game was patched."
+                      "\n  Searching for the classes by name once the bot"
+                      " starts (2-4 minutes, in the background)."
+                      "\n  Until it lands: pixels, which means it will chase"
+                      " pets.")
         except Exception as e:                  # game closed, no rights, no dump
             print(f"memory targeting unavailable ({e}); reading pixels instead")
             eyes = None
@@ -1399,6 +1428,7 @@ def main(port=None):
                     else:
                         sx, sy = msx, msy
                         state = {"on it": "on it  ",
+                                 "backing off": "back off",
                                  "far": "far    "}.get(eyes.mode,
                                                        "dist  ") + f"{mdist:6.1f}"
 
@@ -1595,7 +1625,7 @@ def demo():
         def __init__(self, at, extra=(), real=(0x2000,)):
             self.me, self.basis = 0x1000, [[1.0, 0.0], [0.0, 1.0]]
             self.units = [("monster", 0x2000, at, 0.0, 0.0)] + list(extra)
-            self.chasing = self.engaged_since = None
+            self.chasing = self.engaged_since = self.approach = None
             self.ignored = {}
             self.mode, self.misses, self.hot = "chasing", 0, None
             self.at, self.mem = at, None
@@ -1660,6 +1690,23 @@ def demo():
     near = _Far(MEM_RANGE / 2)                 # inside range: ordinary chase
     near.target(1.0)
     assert near.mode == "chasing", near.mode
+    assert near.approach, "the chase heading is what the back-off reverses"
+
+    # Game mechanic: the attack does nothing while the character stands exactly
+    # on the monster, so arriving is not the end of it -- the bot has to step
+    # back off the spot or it swings at nothing until it gives up.
+    onto = _Far(0.4)                           # standing on it: cannot attack
+    onto.approach = (0.6, -0.8)                # how it got there
+    bsx, bsy, _ = onto.target(1.0)
+    assert onto.mode == "backing off", onto.mode
+    assert (bsx, bsy) == (-0.6, 0.8), (bsx, bsy)
+    # ...and stops backing off inside the band, or it oscillates in and out.
+    band = _Far((MEM_TOOCLOSE + MEM_ARRIVE) / 2)
+    band.approach = (0.6, -0.8)
+    hsx, hsy, _ = band.target(1.0)
+    assert band.mode == "on it", band.mode
+    assert (hsx, hsy) == (0.0, 0.0), (hsx, hsy)
+    assert MEM_TOOCLOSE < MEM_ARRIVE, "the band has to exist"
 
     # A blank position read must not throw the calibration away: the bot goes
     # silent until someone notices and restarts it. Coast, then give up.
