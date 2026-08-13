@@ -1,13 +1,20 @@
 # spiritvale-bot
 
-Screen-reading combat bot for SpiritVale. Watches the minimap, walks the character
-to the nearest red monster dot with the left stick, holds the attack button, taps
-a spam button on a fast timer, and recasts a d-pad buff sequence on a slow one.
-Everything runs while the chase continues — the bot never stands still to cast.
+Combat bot for SpiritVale. Walks the character to the nearest monster with the left
+stick, holds the attack button, taps a spam button on a fast timer, and recasts a
+d-pad buff sequence on a slow one. Everything runs while the chase continues — the
+bot never stands still to cast.
 
-It keeps hold of one target rather than re-picking the nearest every frame, skips
-other players' pets, never stands still between kills, and gives up on a monster it
-cannot reach instead of walking into a wall forever.
+It finds targets two ways. **Memory targeting** reads the game's unit list and knows
+what each thing *is*, so it never chases a pet — yours or anyone else's — and never
+swings at a corpse or a despawned object. The **minimap** path finds red dots on
+screen and is the fallback, used during the first background sweep and whenever the
+memory path is unavailable. Memory access is read-only; nothing is written into the
+game and nothing is injected.
+
+It keeps hold of one target rather than re-picking the nearest every frame, never
+stands still between kills, and gives up on a monster it cannot reach instead of
+walking into a wall forever.
 
 If the server drops you it logs back in by itself: **Ok** on the disconnect modal,
 then the **SEA** server, then **Play Character** — with the mouse, since those
@@ -49,6 +56,47 @@ Green circles are targetable dots, red ones are ignored under the player marker,
 cyan is the chosen target, and the magenta arrow is the stick vector being sent.
 It only reads the screen, so it drives nothing and is safe beside a running bot.
 
+## Memory targeting
+
+Nothing to set up — it starts itself. On **End** the bot begins a background sweep
+of the game's memory, runs on minimap pixels meanwhile, and upgrades itself when the
+unit list lands (a few seconds). It then pushes the stick six ways for about two
+seconds to work out which unit is your character and how a stick push maps to world
+movement. That calibration is why no camera angle or minimap rotation has to be
+assumed — a rotated camera is measured, not guessed.
+
+The status line tells you what it is doing:
+
+| Shows | Meaning |
+|---|---|
+| `dist  12.3` | walking to a monster 12.3 world units away |
+| `far   84.0` | nothing close; walking to the nearest one anywhere |
+| `on it   1.8` | in range, standing and swinging |
+| `gave up` | this one will not die — ignored for `MEM_IGNORE_S`, moving on |
+| `no monster` | nothing real left in range |
+| `DEAD` | your character is dead. It stops rather than swinging from a corpse |
+| `no unit` / `lost` | between calibrations, or the unit was rebuilt (map change, death, relog) |
+| `memory` / `pixels` | which path is driving right now |
+
+`MEMORY_TARGETING = False` turns it off and leaves the minimap path.
+
+### When the game patches
+
+A game update moves the class offsets, and that used to end memory targeting until
+someone re-ran Il2CppDumper by hand. It now repairs itself:
+
+1. Each offset is checked against the class name it should point at, so a stale one
+   is rejected rather than trusted.
+2. If stale, the bot searches memory for the class names — those are the game's own
+   identifiers and do not move — and finds the classes again. 2-4 minutes, on the
+   background thread, while the bot keeps fighting on pixels.
+3. What it finds is cached to `il2cpp_rva.json`, so this happens once per patch and
+   not once per run.
+
+It says so in the terminal when this happens. You only need to do something if it
+reports it could not find the classes by name either — that means a patch renamed
+or restructured them, and the field offsets in `memscan.py` need a fresh dump.
+
 ## Calibration
 
 The only thing that needs tuning per machine is the minimap box:
@@ -75,9 +123,27 @@ mis-centred box biases every heading the bot takes.
 | `--probe` | Presses every X360 button in turn, named, to find a mapping. |
 | `--press` | Fires one control at a time on the Arduino, typed in by hand. |
 | `--relogin [--dry]` | Handles the login screen showing now. `--dry` looks without clicking. |
+| `python memscan.py --demo` | Memory layer self-check. No game needed. |
+| `python memscan.py --units` | What the unit sweep classifies right now: monsters, players, pets. |
 
 ## Gotchas found the hard way
 
+- **Most of the game's unit list is not there to be fought.** Pooled and despawned
+  monsters keep their last position *and have their health reset to full*, so they
+  look exactly like a healthy monster standing still. Measured on a live map: 516
+  monster entries, 468 whose position had not changed in two seconds. The bot
+  parked in a pile of them, fought each for its timeout, gave up, took the next
+  from the same pile — and walked straight back if you dragged the character away.
+  A target must be **rendered and have health left**; neither test alone is enough.
+- **Your own character is identified by how it answers the stick, not by who moved
+  furthest.** On a busy map another player simply walks faster than a 0.7s push, so
+  the bot locked onto them and then rejected every later measurement as "not us",
+  failing calibration outright with a healthy character standing right there. Your
+  travel is a linear function of the stick; a passer-by's is not, whatever their
+  speed. That is the test.
+- **A dead character looks exactly like a targeting bug.** It swings, nothing takes
+  damage, and the obvious conclusion is that melee range is wrong — which cost a
+  whole debugging session. The bot now says `DEAD` instead.
 - **The game stays in keyboard mode until it sees stick motion**, and it drops the
   first button press while swapping modes. Every button sequence is preceded by a
   stick nudge plus a settle delay (`WAKE_*` constants).
@@ -154,7 +220,9 @@ mis-centred box biases every heading the bot takes.
   aggro'd — measured, the followers were monsters at 19–31px, right on top of the
   pet's range. And distance fails because the pet wanders off to pick up items, so
   no radius covers it without blinding the bot to real monsters. This is the case
-  for reading the game's memory instead of the screen.
+  for reading the game's memory instead of the screen — and on the memory path it
+  is simply solved: a pet knows who summoned it, so it is never a target. The
+  problem remains only on the minimap fallback.
 - Red blobs under the player marker are never targeted — that is either "arrived"
   or a fixed red UI element, and treating it as a target froze the bot.
 - **Monsters are told from red mushroom terrain art by saturation, not by size.**
@@ -168,6 +236,9 @@ mis-centred box biases every heading the bot takes.
 ## Files
 
 - `minimap_bot.py` — the bot.
+- `memscan.py` — the memory layer: unit discovery, classification, class resolution.
+  Read-only; opens the game with `PROCESS_VM_READ` and never writes to it.
 - `pad_press.py` — press one control on the Leonardo, for Steam's setup wizard.
 - `minimap_navigator.py` — earlier navigation experiment.
 - `arduino_joystick_leonardo_v1.ino` — HID gamepad sketch for a Leonardo/Pro Micro.
+- `il2cpp_rva.json` — generated cache of class offsets after a patch. Safe to delete.

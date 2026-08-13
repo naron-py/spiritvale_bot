@@ -86,6 +86,79 @@ adjusting them over adding code paths.
 
 ## Hard-won constraints — do not "simplify" these away
 
+### Memory targeting
+
+- **Most of the unit list is not there to be fought.** Pooled and despawned
+  monsters keep their last position *and get their health reset to full*, so they
+  are indistinguishable from a healthy monster standing still. Measured: 516
+  monster entries, 468 whose position had not changed in 2 seconds. Without
+  `worth_fighting()` the bot parks in a pile of them, fights each for
+  `MEM_ENGAGE_MAX_S`, gives up, takes the next from the same pile — and walks
+  straight back if you drag the character away. The test is *rendered*
+  (`IsVisible`) **and** health above zero; neither alone is enough.
+- **Our own unit is identified by fit, never by who moved furthest.** On a busy
+  map another player simply out-walks a 0.7s push, so the biggest-mover rule
+  locked onto them and then threw every later leg away as "not us", failing
+  calibration outright with a healthy character standing there. `pick_me()`
+  scores each unit by how well one 2x2 basis explains all its legs: our travel is
+  a linear function of the stick, a passer-by's is not, whatever their speed.
+- **A dead character deals no damage and looks exactly like a targeting bug.**
+  It reads as "melee range must be wrong" and sent a whole session chasing a
+  `MEM_ARRIVE` change the evidence did not support. `target()` reports `DEAD`
+  instead of swinging from a corpse. `MEM_ARRIVE = 2.5` is correct — verified
+  killing at that distance on a living character.
+- **A far target keeps the engagement clock.** Clearing it each frame meant the
+  give-up timer never fired and an unreachable monster could be walked at forever.
+- **Never return a zero stick for "nothing to do".** `main()` treats a zero stick
+  as handled and does not fall through to the pixel path, so the bot stands
+  still. That is why no monster within `MEM_RANGE` walks to the nearest one
+  anywhere (`far`) rather than returning nothing.
+- **One empty position read is not a death.** Tearing down `me`, `basis` and the
+  caches on the first miss cost a whole run — the bot went silent until it was
+  restarted. `MEM_LOST_FRAMES` consecutive misses are required.
+- **Every mode assignment must be honest, including the early returns.** Leaving
+  a stale `mode` made a bot with no unit at all report `chasing` while motionless,
+  and sent the investigation to the wrong place.
+
+### Surviving a game patch
+
+- **`TYPE_RVA` is the only thing that breaks, and it breaks every patch.** Those
+  are positions inside `GameAssembly.dll`; the 2026-08-11 update moved all three.
+  The *field* offsets (position, health, visible, summoner) did not move and
+  generally do not, because they follow the class layout, not the binary.
+- **Class pointers are verified by name, never trusted.** `type_classes()` checks
+  each slot against `CLASS_NAMES`. A stale RVA points at whatever moved in, and
+  before this check that surfaced as invented units rather than as "the offsets
+  are stale" — a wrong answer instead of an error.
+- **`find_classes()` is the recovery, and it must stay streaming and off the hot
+  path.** It searches memory for the class names and takes the object pointing at
+  one; reflection data carries the same names, so instance count disambiguates
+  (683 real against 0 for the impostors). It reads ~11 GB — an earlier version
+  collected that into a list and never finished. Results are written back as
+  fresh RVAs (`il2cpp_rva.json`, gitignored), making it once per patch, and it
+  runs on the background thread while the bot works on pixels.
+
+### Per-frame cost
+
+- **`target()` runs at 20 Hz — do not read the whole unit list in it.** It was
+  16.2 ms of a 50 ms budget with a 77 ms spike. Four things keep it at 2-4 ms and
+  all of them matter: positions for monsters only (players and pets were a
+  quarter of the work for something never targeted), units beyond `NEAR_KEEP`
+  refreshed a slice per frame rather than all at once (that spike), liveness
+  checked in distance order and cached for `LIVE_TTL_S`, and the position read
+  plus its sanity check inline. Profile before changing any of it — the cost was
+  Python overhead, not syscalls, which is not what it looks like.
+
+### Rejected features — do not rebuild without new information
+
+- **The anchor/leash/patrol feature was removed as buggy.** Double-tap End set an
+  anchor, the bot stayed within a radius and walked home if it drifted out. It is
+  in git history. Note that its worst symptom — ending 98 units outside a 77-unit
+  leash — was not a leash bug at all but the calibration locking onto another
+  player, so the idea is not disproven, only the implementation.
+
+### Gamepad and vision
+
 - **The game only reads XInput, not generic HID.** The Arduino path works over
   serial and the board enumerates fine, but the game ignores it. vgamepad is the
   working path; the Arduino backend is kept as a fallback, not the default.
@@ -97,11 +170,15 @@ adjusting them over adding code paths.
   either "arrived" or a fixed red UI element. `TARGET_ARRIVE_PX` must stay above
   `CONCEAL_PX`.
 - **The player's own pet cannot be excluded from the screen, and three attempts
-  proved it.** It renders identically to a monster; "follows the character"
-  describes any aggro'd monster equally (measured: followers were monsters at
-  19–31px, the pet's own range); and a wider `CONCEAL_PX` fails because the pet
-  wanders off to loot. Do not attempt a fourth screen-based fix — the identity of
-  the dot has to come from somewhere other than the picture.
+  proved it — this is what memory targeting exists to solve, and it does.** On
+  the memory path a pet is a pet (`SUMMONING_SUMMONER` is non-null) and is never
+  a target. The constraint below still governs the pixel fallback.
+- **(pixel path) The player's own pet cannot be excluded from the screen.** It
+  renders identically to a monster; "follows the character" describes any aggro'd
+  monster equally (measured: followers were monsters at 19–31px, the pet's own
+  range); and a wider `CONCEAL_PX` fails because the pet wanders off to loot. Do
+  not attempt a fourth screen-based fix: the identity of the dot has to come from
+  somewhere other than the picture, which is exactly what memory targeting is.
 - **Do not reintroduce marker detection *for our own character*.** Finding it as
   the nearest white blob failed two ways: the marker turns blue in a party, and in
   a crowd the nearest white blob belongs to another player. The centre is simpler
@@ -152,8 +229,14 @@ ping if the banner was already missed.
 
 ## Other files
 
+`memscan.py` is the memory layer — see Architecture. Its own `--demo` is a separate
+self-check and must also stay green.
+
 `minimap_navigator.py` is an earlier, superseded navigation experiment (argparse,
 pywin32, proportional stick) kept for reference — new work goes in `minimap_bot.py`.
+
+`il2cpp_rva.json` is a generated cache of rediscovered class slots. Gitignored, and
+safe to delete — the bot searches again and rewrites it.
 
 ## Style
 
