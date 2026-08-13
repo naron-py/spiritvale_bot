@@ -798,6 +798,42 @@ class MemoryEyes:
     def available(self):
         return bool(self.classes.get("monster"))
 
+    def heal(self, mem=None):
+        """Find the classes by name after a patch moved the RVAs.
+
+        A game update moves every entry in TYPE_RVA, and that used to end
+        memory targeting for the session: the bot fell back to pixels and
+        chased pets until somebody re-ran Il2CppDumper by hand. The class
+        names do not move, so they can be searched for instead -- a few
+        minutes on the background thread, while the bot keeps working on
+        pixels. The slots it finds are written to a cache file, so the next
+        run is instant again and the scan is once per patch.
+        """
+        mem = mem or self.mem
+        print("\nmemory targeting: the class offsets are stale, which means the"
+              " game was patched.\n  Searching for the classes by name instead"
+              " (2-4 minutes, in the background).\n  The bot keeps running on"
+              " pixels until it lands.")
+        found = self.ms.find_classes(mem)
+        if not found:
+            print("memory targeting: could not find the classes by name either. "
+                  "Staying on pixels.")
+            return False
+        self.classes = found
+        rvas = {}
+        for label, ptr in found.items():
+            rva = self.ms.class_slot_rva(mem, ptr)
+            if rva:
+                rvas[label] = rva
+        if rvas:
+            self.ms.save_rva_cache(rvas)
+            print("memory targeting: recovered. New offsets, cached for next "
+                  "time -- " + ", ".join(f"{k}=0x{v:X}" for k, v in rvas.items()))
+        else:
+            print("memory targeting: recovered for this session, but the slots "
+                  "could not be cached; the next run will search again.")
+        return True
+
     def close(self):
         if self.stop is not None:
             self.stop.set()
@@ -949,7 +985,12 @@ class MemoryEyes:
         def loop():
             mem = self.ms.Mem(self.mem.pid)
             try:
+                if not self.available():
+                    self.heal(mem)
                 while not self.stop.is_set():
+                    if not self.available():
+                        self.stop.wait(MEM_REFRESH_S)
+                        continue
                     found = self.ms.world_units(mem, regions=self.hot)
                     with self.lock:
                         self.units = found

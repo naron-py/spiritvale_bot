@@ -47,6 +47,8 @@ usage:
   python memscan.py --demo       # offline self-check, no game needed
 """
 import ctypes
+import json
+import os
 import struct
 import sys
 
@@ -115,6 +117,7 @@ PAGE_READWRITE = 0x04
 PAGE_EXECUTE_READWRITE = 0x40
 PAGE_WRITECOPY = 0x08
 PAGE_GUARD = 0x100
+PAGE_NOACCESS = 0x01
 # only the low byte is the protection; the rest are modifier flags
 WRITABLE = (PAGE_READWRITE, PAGE_WRITECOPY, PAGE_EXECUTE_READWRITE,
             PAGE_EXECUTE_WRITECOPY)
@@ -218,6 +221,26 @@ class Mem:
             addr = mbi.BaseAddress + mbi.RegionSize
             if addr >= 0x7FFFFFFFFFFF:
                 break
+        return out
+
+    def readable_regions(self):
+        """Every committed readable region, images included.
+
+        Wider than regions(): class metadata and the name strings behind it are
+        read-only, so a writable-only sweep cannot see them. Only used by the
+        one-off class rediscovery, never per frame.
+        """
+        mbi = MEMORY_BASIC_INFORMATION64()
+        addr, out = 0, []
+        while self.k32.VirtualQueryEx(self.h, ctypes.c_void_p(addr),
+                                      ctypes.byref(mbi), ctypes.sizeof(mbi)):
+            if (mbi.State == MEM_COMMIT and (mbi.Protect & 0xFF) != PAGE_NOACCESS
+                    and not (mbi.Protect & PAGE_GUARD)):
+                out.append((mbi.BaseAddress, mbi.RegionSize))
+            nxt = mbi.BaseAddress + mbi.RegionSize
+            if nxt <= addr or nxt >= 0x7FFFFFFFFFFF:
+                break
+            addr = nxt
         return out
 
     def read(self, addr, size):
@@ -1147,20 +1170,177 @@ def looks_like_class(mem, ptr):
     return bool(first) and bool(mem.read(first, 8))
 
 
-def type_classes(mem):
+def class_name(mem, ptr):
+    """The name an Il2CppClass carries, or None if `ptr` is not one."""
+    if not looks_like_class(mem, ptr):
+        return None
+    name_ptr = read_ptr(mem, ptr + CLASS_NAME_OFF)
+    if not name_ptr:
+        return None
+    blob = mem.read(name_ptr, 64)
+    if not blob or b"\0" not in blob:
+        return None
+    text = blob.split(b"\0", 1)[0]
+    try:
+        return text.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+
+
+def rva_cache_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), RVA_CACHE)
+
+
+def load_rva_cache():
+    """Slots found by a previous rediscovery, or {}."""
+    try:
+        with open(rva_cache_path()) as fh:
+            got = json.load(fh)
+        return {k: int(v) for k, v in got.items() if isinstance(v, int)}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def save_rva_cache(rvas):
+    try:
+        with open(rva_cache_path(), "w") as fh:
+            json.dump(rvas, fh, indent=1)
+    except OSError:
+        pass                              # a cache that cannot be written is fine
+
+
+def find_classes(mem, wanted=None, progress=None):
+    """Locate Il2CppClass pointers by class NAME, with no dump involved.
+
+    This is the answer to a game patch. The RVAs in TYPE_RVA are positions in
+    GameAssembly.dll and every one of them moved the last time the game
+    updated; the class names did not, because they are the game's own source
+    identifiers. A class stores its name at CLASS_NAME_OFF, so the name can be
+    found in memory and then the object pointing at it is the class.
+
+    Takes 2-4 minutes over ~11 GB, so it is a fallback rather than the normal
+    path -- and its results are cached as fresh RVAs, making it once per patch.
+    """
+    wanted = wanted or CLASS_NAMES
+    chunk = 1 << 24
+
+    def chunks(regions):
+        """Stream the given regions a piece at a time.
+
+        Collecting them into a list first meant holding all 11 GB in this
+        process at once, which swapped and never finished. Streaming stays flat
+        in memory whatever the game is doing.
+        """
+        for base, size in regions:
+            off = 0
+            while off < size:
+                blob = mem.read(base + off, min(chunk, size - off))
+                if blob:
+                    yield base + off, blob
+                off += chunk
+
+    # The two passes want different memory, which is most of the speed here.
+    # Class names are metadata: mapped read-only, about 500 MB. The class
+    # objects are heap: writable, about 11 GB. Searching each pass over
+    # everything took 214 s; over the half that can hold what it is looking
+    # for, well under half that.
+    writable = mem.regions()
+    seen = set(writable)
+    read_only = [r for r in mem.readable_regions() if r not in seen]
+
+    # pass one: where each class name string sits
+    at = {}
+    needles = {label: name.encode() + bytes(1) for label, name in wanted.items()}
+    scanned = 0
+    for where in (read_only, writable):      # cheap half first
+        for base, blob in chunks(where):
+            scanned += len(blob)
+            for label, needle in needles.items():
+                start = blob.find(needle)
+                while start >= 0:
+                    at[base + start] = label
+                    start = blob.find(needle, start + 1)
+        if len(at) >= len(wanted):
+            break                            # every name found; no need to go on
+    if progress:
+        progress(f"read {scanned >> 20} MB, found {len(at)} name strings")
+    if not at:
+        return {}
+
+    # pass two: objects whose name field points at one of those strings
+    targets = np.array(sorted(at), dtype=np.uint64)
+    found = {}
+    for base, blob in chunks(writable):
+        n = len(blob) // 8
+        if not n:
+            continue
+        words = np.frombuffer(blob[:n * 8], dtype=np.uint64)
+        for i in np.nonzero(np.isin(words, targets))[0]:
+            off = int(i) * 8
+            if off < CLASS_NAME_OFF:
+                continue
+            cand = base + off - CLASS_NAME_OFF
+            label = at.get(int(words[i]))
+            if label and class_name(mem, cand) == wanted[label]:
+                found.setdefault(label, []).append(cand)
+
+    # The name also appears in reflection data, which looks close enough to a
+    # class to pass. The real one is the one objects are actually built from, so
+    # let instance count decide: measured 683 against 0 for the impostors.
+    out = {}
+    for label, cands in found.items():
+        if len(cands) == 1:
+            out[label] = cands[0]
+            continue
+        best, most = None, 0
+        for ptr in cands:
+            n = len(list(instances_of(mem, ptr, limit=200)))
+            if n > most:
+                best, most = ptr, n
+        if best:
+            out[label] = best
+    return out
+
+
+def class_slot_rva(mem, ptr, module="GameAssembly.dll", span=0x8000000):
+    """The offset into `module` of a slot holding `ptr`, or None.
+
+    Turns a rediscovered class back into the cheap lookup the bot normally
+    uses, so the minute-long scan happens once per patch instead of per run.
+    """
+    base = module_base(mem.pid, module)
+    if base is None:
+        return None
+    needle = struct.pack("<Q", ptr)
+    off = 0
+    while off < span:
+        blob = mem.read(base + off, min(1 << 24, span - off))
+        if blob:
+            hit = blob.find(needle)
+            while hit >= 0:
+                if (base + off + hit) % 8 == 0:
+                    return off + hit
+                hit = blob.find(needle, hit + 1)
+        off += 1 << 24
+    return None
+
+
+def type_classes(mem, rvas=None):
     """{'monster': class_ptr, ...} resolved through GameAssembly.dll at runtime.
 
-    The RVAs come from the dump; ASLR moves the module, so each is read from
-    wherever it actually landed. Entries that have not been initialised yet are
-    dropped rather than returned as nonsense.
+    The RVAs are positions in the module; ASLR moves the module, so each is read
+    from wherever it landed. Every slot is checked against the name the class
+    should have -- a patch moves these and the old address then points at
+    something else entirely, which used to surface as invented units rather than
+    as "the offsets are stale".
     """
     base = module_base(mem.pid, "GameAssembly.dll")
     if base is None:
         return {}
     out = {}
-    for name, rva in TYPE_RVA.items():
+    for name, rva in dict(TYPE_RVA, **(rvas or load_rva_cache())).items():
         ptr = read_ptr(mem, base + rva)
-        if looks_like_class(mem, ptr):
+        if class_name(mem, ptr) == CLASS_NAMES.get(name):
             out[name] = ptr
     return out
 
