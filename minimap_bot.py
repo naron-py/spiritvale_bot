@@ -857,12 +857,17 @@ class MemoryEyes:
         return out
 
     def _fightable(self, unit, now=None):
-        """Cached worth_fighting. Short TTL: it must still notice a death."""
+        """Is this monster worth walking to? Cached, short TTL to notice deaths.
+
+        real_monster() rather than worth_fighting(): the latter is about being
+        rendered and alive, which a MonsterController with no identity also
+        manages, and those cannot be damaged.
+        """
         now = time.time() if now is None else now
         hit = self.fight_ok.get(unit)
         if hit and hit[0] > now:
             return hit[1]
-        ok = self.ms.worth_fighting(self.mem, unit)
+        ok = self.ms.real_monster(self.mem, unit)
         self.fight_ok[unit] = (now + LIVE_TTL_S, ok)
         return ok
 
@@ -1583,6 +1588,9 @@ def demo():
                 return self.standing
             return unit in self.real
 
+        def real_monster(self, mem, unit):
+            return self.worth_fighting(mem, unit)
+
     class _Far(MemoryEyes):
         def __init__(self, at, extra=(), real=(0x2000,)):
             self.me, self.basis = 0x1000, [[1.0, 0.0], [0.0, 1.0]]
@@ -1606,6 +1614,24 @@ def demo():
     assert far_off.mode == "far", far_off.mode
     assert fsx is not None and (fsx or fsy), "must walk to it, not stand still"
     assert abs(fd - MEM_RANGE * 3) < 1.0, fd
+    # An identity-less MonsterController sitting in melee range must not be a
+    # target. It is rendered and has health, so it passes every liveness test,
+    # but it takes no damage -- and being inside MEM_ARRIVE it pins the bot to
+    # "on it" with a zero stick, which is a bot that never moves and walks back
+    # when you drag it away. Only a spawned monster carries a MonsterId.
+    class _Nameless(_Fights):
+        def real_monster(self, mem, unit):
+            return self.worth_fighting(mem, unit) and unit != 0x4000
+
+    nameless = _Far(MEM_RANGE * 3, extra=[("monster", 0x4000, 0.5, 0.0, 0.0)],
+                    real=(0x2000, 0x4000))
+    nameless.ms = _Nameless({0x2000, 0x4000})
+    nameless.spots = {0x4000: 0.5}
+    _, _, nd = nameless.target(1.0)
+    assert nameless.chasing == 0x2000, "must ignore the one with no identity"
+    assert nd > MEM_RANGE, nd
+    assert nameless.mode == "far", nameless.mode
+
     # A pooled or dead monster sitting on top of us must not be a target, or
     # the bot parks in the pile and swings at it -- the exact symptom that had
     # it standing still and walking back when dragged away.

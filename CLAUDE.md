@@ -88,6 +88,15 @@ adjusting them over adding code paths.
 
 ### Memory targeting
 
+- **A monster with no `MonsterId` cannot be damaged.** It is a real
+  `MonsterController`, rendered, with a full health bar -- it passes every
+  liveness test there is. Measured: 232 rendered-and-alive monster objects near
+  the character, only 32 carrying an id, against 26 red dots on the minimap.
+  Because they sit inside `MEM_ARRIVE` the bot pinned to `on it` with a zero
+  stick, swung for `MEM_ENGAGE_MAX_S`, gave up, and started on the next one --
+  which from outside is a bot that will not move and walks back when you drag
+  it away. `real_monster()` requires the id; `worth_fighting()` is the weaker
+  test and is what our *own* unit is checked with, since a player has no id.
 - **Most of the unit list is not there to be fought.** Pooled and despawned
   monsters keep their last position *and get their health reset to full*, so they
   are indistinguishable from a healthy monster standing still. Measured: 516

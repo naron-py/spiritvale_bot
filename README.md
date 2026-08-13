@@ -128,6 +128,13 @@ mis-centred box biases every heading the bot takes.
 
 ## Gotchas found the hard way
 
+- **Some monsters cannot be hurt at all, and look completely normal.** They are
+  rendered, have a full health bar, and sit right next to you — but they carry no
+  monster id and take no damage. Measured: 232 live-looking monster objects near
+  the character, only 32 of them real, against 26 dots on the minimap. Since they
+  were within melee range the bot stood on one swinging, timed out, moved to the
+  next one, and never went anywhere. That is the "it stops moving and walks back
+  to the same spot" symptom.
 - **Most of the game's unit list is not there to be fought.** Pooled and despawned
   monsters keep their last position *and have their health reset to full*, so they
   look exactly like a healthy monster standing still. Measured on a live map: 516

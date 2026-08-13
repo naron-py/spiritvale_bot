@@ -1114,6 +1114,20 @@ def worth_fighting(mem, unit):
     return bool(blob) and struct.unpack("<i", blob)[0] > 0
 
 
+def real_monster(mem, unit):
+    """Is this a spawned monster that can actually be fought?
+
+    worth_fighting() is not enough on its own. Measured on a live map: 232
+    monster objects were rendered and had health, but only 32 carried a
+    MonsterId -- against 26 red dots on the minimap. The other 200 are
+    MonsterController objects with no identity yet; they take no damage, and
+    because they sit within melee range the bot stood on one swinging until the
+    give-up timer fired, then started on the next of them. From the outside that
+    is a bot that will not move and walks back if you drag it away.
+    """
+    return worth_fighting(mem, unit) and bool(read_ptr(mem, unit + MONSTER_ID))
+
+
 def unit_at(mem, obj):
     """True if `obj` really is a BaseUnitController.
 
