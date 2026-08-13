@@ -42,6 +42,7 @@ usage:
   python memscan.py --findpos    # older one-shot scan, kept for reference
   python memscan.py --check 1A2B3C4 ...   # judge addresses found in Cheat Engine
   python memscan.py --units [addr]        # monsters vs pets vs you
+  python memscan.py --ids                 # MonsterId counts; summons are singletons
   python memscan.py --entities [addr]     # older, superseded by --units
   python memscan.py --pos        # live position, once POSITION_CHAIN is set
   python memscan.py --demo       # offline self-check, no game needed
@@ -75,7 +76,18 @@ UNIT_SUMMONING = 0x148       # BaseUnitController.Summoning -> SummoningComponen
 SUMMONING_SUMMONER = 0x140   # SummoningComponent._Summoner -> BaseUnitController
 SUMMONING_ACTIVE = 0x118     # SummoningComponent.ActiveSummons -> List<Monster>
 MONSTER_ID = 0x218           # MonsterController.MonsterId, string
-MONSTER_SPAWNER = 0x288      # MonsterController.Spawner, null on a summon
+MONSTER_SPAWNER = 0x288      # MonsterController.Spawner
+# Summoned units are MonsterControllers with a MonsterId like any other, and
+# nothing structural separates them: measured on a live map, all 38 targetable
+# monsters had a null Spawner *and* a null summoner, so neither field can be the
+# test. What does separate them is the id itself -- real spawns come in numbers
+# (32 Zombie Goblin Soldier, 18 Zombie Goblin Minion, 17 Monster Bat) and a
+# summon is a singleton. Deny by name; add to the set when one turns up.
+MONSTER_DENY = {"skeleton mage", "seraphim arbiter", "skeleton", "abomination", "wraith king"}
+# Pets carry the game's own naming, e.g. 'Pet_Earth', and they reach the target
+# list for the same reason: their summoner field reads null, so the pet test
+# built on it never fires for them.
+MONSTER_DENY_PREFIX = ("pet_",)
 # The unit list holds every monster the client knows about, and most of them are
 # not there to be fought: pooled or despawned objects keep their last position
 # and get their health reset to full, so they look exactly like a healthy
@@ -1096,6 +1108,25 @@ def read_ptr(mem, addr):
     return p if 0x10000 < p < 0x7FFFFFFFFFFF else 0
 
 
+def cs_string(mem, ptr, cap=128):
+    """IL2CPP System.String: length at +0x10, UTF-16 chars right after it."""
+    if not ptr:
+        return None
+    blob = mem.read(ptr + 0x10, 4)
+    if not blob:
+        return None
+    n = struct.unpack("<i", blob)[0]
+    if not 0 < n < cap:
+        return None
+    chars = mem.read(ptr + 0x14, n * 2)
+    return chars.decode("utf-16-le", "replace") if chars else None
+
+
+def monster_id(mem, unit):
+    """MonsterController.MonsterId, e.g. 'Zombie Goblin Soldier', or None."""
+    return cs_string(mem, read_ptr(mem, unit + MONSTER_ID))
+
+
 def unit_health(mem, unit):
     """Current health, or None. Damage landing is the only proof of a hit."""
     health = read_ptr(mem, unit + UNIT_HEALTH)
@@ -1133,8 +1164,17 @@ def real_monster(mem, unit):
     because they sit within melee range the bot stood on one swinging until the
     give-up timer fired, then started on the next of them. From the outside that
     is a bot that will not move and walks back if you drag it away.
+
+    The id is also the only thing that separates another player's summon from a
+    spawned monster -- see MONSTER_DENY.
     """
-    return worth_fighting(mem, unit) and bool(read_ptr(mem, unit + MONSTER_ID))
+    if not worth_fighting(mem, unit):
+        return False
+    name = monster_id(mem, unit)
+    if not name:
+        return False
+    name = name.strip().lower()
+    return name not in MONSTER_DENY and not name.startswith(MONSTER_DENY_PREFIX)
 
 
 def unit_at(mem, obj):
@@ -1443,6 +1483,32 @@ def classify(mem, player_pos_addr):
         if p:
             out.append((kind, u, p[0], p[1], p[2]))
     return me, out
+
+
+def show_ids():
+    """Count the MonsterIds on the map, so a summon can be told from a spawn.
+
+    A spawned monster comes in numbers and somebody's summon is a singleton;
+    reading the ids is how MONSTER_DENY gets filled in, rather than by guessing
+    which of the units on the screen is a pet.
+    """
+    with Mem() as mem:
+        names = {}
+        for kind, u, *_ in world_units(mem):
+            if kind != "monster" or not worth_fighting(mem, u):
+                continue
+            name = monster_id(mem, u)
+            if name:
+                names[name] = names.get(name, 0) + 1
+        if not names:
+            print("no identified monsters -- see --units")
+            return
+        print(f"{sum(names.values())} monsters, {len(names)} distinct ids")
+        for name, n in sorted(names.items(), key=lambda kv: -kv[1]):
+            low = name.strip().lower()
+            deny = "" if (low not in MONSTER_DENY
+                          and not low.startswith(MONSTER_DENY_PREFIX)) else "  DENIED"
+            print(f"  {n:4d}  {name!r}{deny}")
 
 
 def show_units(pos_addr=None):
@@ -1763,6 +1829,39 @@ def demo():
             return []
 
     um = UnitMem()
+    # Another player's summon is a MonsterController with an ordinary MonsterId
+    # and no summoner, so only the name tells it from a spawn. Chasing one means
+    # following its owner around the map instead of farming.
+    class NameMem:
+        pid = 0
+        HEALTH, TEXT = 0x200000, 0x300000
+
+        def __init__(self, name):
+            self.name = name
+
+        def read(self, addr, size):
+            if addr == 0x10000 + UNIT_VISIBLE:
+                return b"\x01"
+            if addr == 0x10000 + UNIT_HEALTH:
+                return struct.pack("<Q", self.HEALTH)
+            if addr == self.HEALTH + HEALTH_CURRENT:
+                return struct.pack("<i", 1000)
+            if addr == 0x10000 + MONSTER_ID:
+                return struct.pack("<Q", self.TEXT if self.name else 0)
+            if addr == self.TEXT + 0x10:
+                return struct.pack("<i", len(self.name))
+            if addr == self.TEXT + 0x14:
+                return self.name.encode("utf-16-le")
+            return bytes(size)
+
+    spawned = NameMem("Zombie Goblin Soldier")
+    assert monster_id(spawned, 0x10000) == "Zombie Goblin Soldier"
+    assert real_monster(spawned, 0x10000)
+    for denied in ("Skeleton Mage", "skeleton mage", " Skeleton Mage "):
+        assert not real_monster(NameMem(denied), 0x10000), denied
+    assert not real_monster(NameMem(""), 0x10000), "no id, cannot be damaged"
+    assert not real_monster(NameMem("Pet_Earth"), 0x10000), "a pet is not a target"
+
     assert unit_at(um, ME) and unit_at(um, MON)
     assert not unit_at(um, 0x999000)                # no round trip, not a unit
     assert list_items(um, 0x150000) == [PET]
@@ -1822,6 +1921,8 @@ if __name__ == "__main__":
         rest = [a for a in sys.argv[sys.argv.index("--units") + 1:]
                 if not a.startswith("--")]
         show_units(int(rest[0], 16) if rest else None)
+    elif "--ids" in sys.argv:
+        show_ids()
     elif "--check" in sys.argv:
         given = [int(a, 16) for a in sys.argv[sys.argv.index("--check") + 1:]
                  if not a.startswith("--")]
