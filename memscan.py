@@ -113,6 +113,15 @@ LOOT_GO = 0x110              # LootDrop.gameObject -> UnityEngine.GameObject
 LOOT_SPRITE = 0x118          # LootDrop.Sprite -> LootSprite
 GO_NATIVE = 0x10             # UnityEngine.Object.m_CachedPtr
 LOOT_POS_CHAIN = (0x20, 0x28, 0x60)   # native GameObject -> ... -> Vector3
+# What the item IS. Not on the drop and not in its InventoryItemData -- both
+# read empty -- but in the synced payload: LootDrop.<sync> then the display name
+# the tooltip shows and the internal key behind it ('Flax'/'flax',
+# 'Axe'/'T_Axe_Axe'). Measured against a live field: 27 drops named Flax with
+# Flax lying on the ground, and 157 of 192 slots with no name at all -- which is
+# the pool. That absence is the liveness test: a pooled slot has no item.
+LOOT_SYNC = 0x108            # LootDrop -> SyncVar holding the drop payload
+LOOT_NAME = 0x108            # payload: display name, as the tooltip shows it
+LOOT_KEY = 0x110             # payload: internal id, e.g. 'flax'
 
 # Where each class's Il2CppClass pointer is kept, as an offset into
 # GameAssembly.dll. From Il2CppDumper's script.json, the *_TypeInfo entries.
@@ -1472,17 +1481,30 @@ def loot_pos(mem, drop):
     return t if t and looks_like_place(t) else None
 
 
+def loot_name(mem, drop):
+    """('Flax', 'flax') for a drop -- display name and internal key -- or None.
+
+    None means the slot is pooled: the game keeps a fixed set of LootDrop
+    objects and recycles them, and an unused one carries no item. Measured on a
+    live field, 157 of 192 slots were nameless while the 35 with names matched
+    what was lying on the ground.
+    """
+    sync = read_ptr(mem, drop + LOOT_SYNC)
+    if not sync:
+        return None
+    name = cs_string(mem, read_ptr(mem, sync + LOOT_NAME) or 0)
+    if not name or not name.isprintable() or not 1 < len(name) < 48:
+        return None
+    return name, cs_string(mem, read_ptr(mem, sync + LOOT_KEY) or 0) or ""
+
+
 def world_loot(mem, cls=None, regions=None):
-    """[(drop, x, y, z)] for every item lying on the ground the client knows of.
+    """[(drop, x, y, z, name)] for every item lying on the ground.
 
     instances_of() also returns slots in IL2CPP's own class table, which have no
-    GameObject; that is what the class check throws out.
-
-    Note what this does NOT tell you: whether the drop is still there. The game
-    pools LootDrops -- measured at a fixed 148 objects, recycled -- so picking an
-    item up neither frees its object nor clears its position, exactly like the
-    pooled monsters. A drop is real when its slot has been *rewritten*, which
-    only a caller watching over time can see; see LootWatch in minimap_bot.py.
+    GameObject; that is what the class check throws out. Nameless slots are
+    dropped too -- see loot_name(): they are the pool, not loot, and they keep a
+    stale position exactly the way pooled monsters do.
     """
     cls = cls or type_classes(mem).get("loot")
     if not cls:
@@ -1492,9 +1514,10 @@ def world_loot(mem, cls=None, regions=None):
         go = read_ptr(mem, a + LOOT_GO)
         if not go or class_name(mem, read_ptr(mem, go) or 0) != "GameObject":
             continue
-        t = loot_pos(mem, a)
+        named = loot_name(mem, a)
+        t = loot_pos(mem, a) if named else None
         if t:
-            out.append((a, t[0], t[1], t[2]))
+            out.append((a, t[0], t[1], t[2], named[0]))
     return out
 
 
@@ -1564,10 +1587,10 @@ def show_ids():
 
 
 def show_loot(seconds=0.0):
-    """List ground loot. With a duration, watch which slots get rewritten.
+    """List ground loot by name. With a duration, watch it appear and go.
 
-    The watch is the useful mode: a pooled slot never changes, so what moves
-    over a few seconds is what actually dropped while you were looking.
+    What this answers is "what can the bot see lying there", which is the list
+    LOOT_NAMES is written against.
     """
     import time
     with Mem() as mem:
@@ -1576,20 +1599,27 @@ def show_loot(seconds=0.0):
             print("no LootDrop class -- run the bot once so it rediscovers the "
                   "slots by name, or delete " + RVA_CACHE)
             return
-        drops = {a: (x, y, z) for a, x, y, z in world_loot(mem, cls)}
-        print(f"{len(drops)} drops")
-        for a, (x, y, z) in list(drops.items())[:20]:
-            print(f"  0x{a:012X}  ({x:8.1f},{y:6.1f},{z:8.1f})")
+        drops = {a: (x, y, z, n) for a, x, y, z, n in world_loot(mem, cls)}
+        counts = {}
+        for *_, n in drops.values():
+            counts[n] = counts.get(n, 0) + 1
+        print(f"{len(drops)} drops on the ground")
+        for n, c in sorted(counts.items(), key=lambda kv: -kv[1]):
+            print(f"  {c:4d}  {n}")
         if seconds <= 0:
             return
-        print(f"\nwatching {seconds:g}s for slots that get rewritten:")
+        print(f"\nwatching {seconds:g}s:")
         end = time.time() + seconds
         while time.time() < end:
             time.sleep(1.0)
-            for a, x, y, z in world_loot(mem, cls):
-                if a in drops and drops[a] != (x, y, z):
-                    print(f"  fresh 0x{a:012X}  ({x:8.1f},{y:6.1f},{z:8.1f})")
-                drops[a] = (x, y, z)
+            now = {a: (x, y, z, n) for a, x, y, z, n in world_loot(mem, cls)}
+            for a, (x, y, z, n) in now.items():
+                if a not in drops:
+                    print(f"  + {n:24} ({x:8.1f},{z:8.1f})")
+            for a, (x, y, z, n) in drops.items():
+                if a not in now:
+                    print(f"  - {n:24} ({x:8.1f},{z:8.1f})")
+            drops = now
 
 
 def show_units(pos_addr=None):
@@ -1960,11 +1990,29 @@ def demo():
         """One drop, walked GameObject -> native -> component -> transform."""
         DROP, GO, NATIVE, COMP, XFORM = (0x600000, 0x610000, 0x620000,
                                          0x630000, 0x640000)
+        SYNC, NAME, KEY = 0x650000, 0x660000, 0x670000
 
-        def __init__(self, pos=(12.5, 1.0, -8.25), go=True):
-            self.pos, self.go = pos, go
+        def __init__(self, pos=(12.5, 1.0, -8.25), go=True, name="Flax"):
+            self.pos, self.go, self.name = pos, go, name
+
+        def _text(self, s):
+            return struct.pack("<i", len(s)) + s.encode("utf-16-le")
 
         def read(self, addr, size):
+            if addr == self.DROP + LOOT_SYNC:
+                return struct.pack("<Q", self.SYNC)
+            if addr == self.SYNC + LOOT_NAME:
+                return struct.pack("<Q", self.NAME if self.name else 0)
+            if addr == self.SYNC + LOOT_KEY:
+                return struct.pack("<Q", self.KEY)
+            if addr == self.NAME + 0x10:
+                return self._text(self.name)[:4]
+            if addr == self.NAME + 0x14:
+                return self.name.encode("utf-16-le")
+            if addr == self.KEY + 0x10:
+                return struct.pack("<i", len(self.name))
+            if addr == self.KEY + 0x14:
+                return self.name.lower().encode("utf-16-le")
             if addr == self.DROP + LOOT_GO:
                 return struct.pack("<Q", self.GO if self.go else 0)
             if addr == self.GO + GO_NATIVE:
@@ -1979,6 +2027,10 @@ def demo():
 
     lm = LootMem()
     assert loot_pos(lm, LootMem.DROP) == (12.5, 1.0, -8.25), loot_pos(lm, LootMem.DROP)
+    # The name is what separates a real drop from a recycled slot, so a slot
+    # with no synced payload must read as None rather than as an unnamed item.
+    assert loot_name(lm, LootMem.DROP) == ("Flax", "flax"), loot_name(lm, LootMem.DROP)
+    assert loot_name(LootMem(name=""), LootMem.DROP) is None, "pooled slot"
     assert loot_pos(LootMem(go=False), LootMem.DROP) is None, "no GameObject"
     # Recycled memory reads as a place-shaped triple that is nowhere near a map.
     assert loot_pos(LootMem(pos=(1e9, 0.0, 0.0)), LootMem.DROP) is None

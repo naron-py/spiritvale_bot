@@ -162,15 +162,12 @@ LOOT_TAP_GAP_S = 0.5     # between presses while standing on a drop
 # gone -- otherwise holds the bot on the spot pressing a trigger forever.
 LOOT_MAX_S = 6.0
 LOOT_IGNORE_S = 30.0
-# The game pools LootDrop objects: measured a fixed 148 of them, recycled, and
-# picking an item up neither frees the object nor clears its position. So a
-# stale slot is indistinguishable from a drop lying there -- the same trap the
-# pooled monsters set. What does separate them is that a real drop *rewrites*
-# its slot: over 60 seconds of play 26 of the 148 changed position and the other
-# 122 were byte-identical. So the bot only chases slots it has watched change,
-# which means loot that fell before the bot started is ignored. That is the
-# right trade for a combat bot: it loots its own kills.
-LOOT_FRESH_S = 120.0     # how long a rewritten slot stays worth walking to
+# Which items to walk to, by the name the tooltip shows. Empty means every item
+# the bot can see. Matching ignores case and surrounding space; nothing else,
+# because a substring rule would make "Axe" collect a "Battle Axe" too.
+# `python memscan.py --loot` prints the names lying around you, which is the
+# list to write this from.
+LOOT_NAMES = ("Flax")          # e.g. ("Flax", "Slingshot", "Pioneer Relic")
 # The anchor/leash/patrol feature was cut as buggy: End is a plain toggle again
 # and the bot roams wherever the kills lead. It is in git history if the idea is
 # revisited -- the minimap scale tracking went with it, since sizing the leash
@@ -800,6 +797,20 @@ def stick_vector(dx, dy):
     return float(np.clip(dx * scale, -1, 1)), float(np.clip(-dy * scale, -1, 1))
 
 
+def wanted_item(name):
+    """Is this item one we walk to? Empty LOOT_NAMES means all of them.
+
+    Exact match on the tooltip name, case and padding aside. Deliberately not a
+    substring test: "Axe" would then also collect every "Battle Axe" on the map.
+    """
+    if not LOOT_NAMES:
+        return True
+    # ("Flax") is a string, not a tuple -- the missing comma is easy to write
+    # and silently matched nothing, because the set became {'F','l','a','x'}.
+    want = (LOOT_NAMES,) if isinstance(LOOT_NAMES, str) else LOOT_NAMES
+    return name.strip().lower() in {w.strip().lower() for w in want}
+
+
 class MemoryEyes:
     """Targets read from the game's unit list instead of inferred from pixels.
 
@@ -827,8 +838,8 @@ class MemoryEyes:
         self.sweep_at = 0         # cursor into the far units, a slice per frame
         self.fight_ok = {}        # unit -> (expiry, is it worth fighting)
         self.hot = None           # regions worth sweeping
-        self.loot = {}            # drop -> (x, y, z), last seen
-        self.loot_fresh = {}      # drop -> when its slot was last rewritten
+        self.loot = {}            # drop -> (x, y, z, name)
+        self.loot_name = ""       # what we are walking to, for the status line
         self.loot_target = None   # drop held between frames
         self.loot_since = None    # when we started walking to it
         self.loot_ignored = {}    # drop -> time it becomes fair game again
@@ -1041,37 +1052,57 @@ class MemoryEyes:
         return True
 
     def _sweep_loot(self, mem):
-        """Refresh ground loot, remembering which slots were rewritten.
+        """Refresh ground loot. world_loot() has already dropped the pool.
 
-        The rewrite is the whole point. LootDrop objects are pooled -- a fixed
-        set, recycled -- so a slot holding a position proves nothing; picking an
-        item up leaves both the object and its last position in place. A slot
-        whose position *changes* is an item that just dropped. Measured over 60
-        seconds of play: 26 of 148 slots changed, 122 were byte-identical.
+        LootDrop objects are pooled -- a fixed set, recycled, and picking an
+        item up frees neither the object nor its position, the same trap the
+        pooled monsters set. What separates a real drop is that it carries an
+        item at all: measured on a live field, 157 of 192 slots had no name and
+        the 35 that did matched what was lying there.
         """
         found = self.ms.world_loot(mem, self.classes.get("loot"),
                                    regions=self.hot_loot)
-        now = time.time()
         with self.lock:
-            for drop, x, y, z in found:
-                was = self.loot.get(drop)
-                if was is not None and was != (x, y, z):
-                    self.loot_fresh[drop] = now
-                self.loot[drop] = (x, y, z)
+            self.loot = {d: (x, y, z, n) for d, x, y, z, n in found}
         if self.hot_loot is None and found:
             spans = mem.regions()
-            live = {d for d, *_ in found}
+            live = {d for d, *_rest in found}
             self.hot_loot = [(b, s) for b, s in spans
                              if any(b <= d < b + s for d in live)]
+
+    def loot_here(self):
+        """Is a wanted item lying under us right now? Sets loot_name if so.
+
+        Separate from pick_loot() because it has to work *during* a fight: the
+        kill that drops the item leaves it at our feet, and waiting for the
+        monster path to go quiet before pressing the trigger means walking off
+        the drop first. Pressing costs nothing when there is nothing there, but
+        an item at our feet is the common case, so it is worth the check.
+        """
+        if not (LOOT_PICKUP and self.me):
+            return False
+        here = self._positions([self.me]).get(self.me)
+        if not here:
+            return False
+        px, _, pz = here
+        with self.lock:
+            drops = list(self.loot.values())
+        for x, _, z, name in drops:
+            if not wanted_item(name):
+                continue
+            if (x - px) ** 2 + (z - pz) ** 2 <= LOOT_ARRIVE ** 2:
+                self.loot_name = name
+                return True
+        return False
 
     def pick_loot(self, now):
         """(sx, sy, distance) toward a dropped item, or (None, None, None).
 
-        Only fresh drops (see _sweep_loot) and only within LOOT_RANGE. The held
-        target survives between frames so the bot does not swap items every time
-        two are the same distance away, and it is given up on and ignored after
-        LOOT_MAX_S -- an item that cannot be collected would otherwise hold the
-        bot on the spot pressing the trigger forever.
+        Only items in LOOT_NAMES, if that is set, and only within LOOT_RANGE.
+        The held target survives between frames so the bot does not swap items
+        every time two are the same distance away, and it is given up on and
+        ignored after LOOT_MAX_S -- an item that cannot be collected would
+        otherwise hold the bot on the spot pressing the trigger forever.
         """
         if not (LOOT_PICKUP and self.me and self.basis):
             self.loot_mode = "no loot"
@@ -1082,11 +1113,10 @@ class MemoryEyes:
             return None, None, None
         px, _, pz = here
         with self.lock:
-            drops = [(d, self.loot[d]) for d, t in self.loot_fresh.items()
-                     if now - t < LOOT_FRESH_S and d in self.loot]
-        ranked = sorted((((x - px) ** 2 + (z - pz) ** 2) ** 0.5, d, x, z)
-                        for d, (x, _, z) in drops
-                        if self.loot_ignored.get(d, 0) < now)
+            drops = list(self.loot.items())
+        ranked = sorted((((x - px) ** 2 + (z - pz) ** 2) ** 0.5, d, x, z, n)
+                        for d, (x, _, z, n) in drops
+                        if self.loot_ignored.get(d, 0) < now and wanted_item(n))
         ranked = [r for r in ranked if r[0] <= LOOT_RANGE]
         if not ranked:
             self.loot_target = self.loot_since = None
@@ -1105,7 +1135,8 @@ class MemoryEyes:
             self.loot_mode = "loot skip"
             return None, None, None
 
-        dist, drop, x, z = pick
+        dist, drop, x, z, name = pick
+        self.loot_name = name
         if dist <= LOOT_ARRIVE:
             self.loot_mode = "loot get"
             return 0.0, 0.0, dist
@@ -1572,9 +1603,18 @@ def main(port=None):
                     # away is worth more than a walk across the map, and the
                     # monster is still there afterwards. Never mid-fight.
                     on_loot = False
-                    if LOOT_PICKUP and (msx is None or eyes.mode == "far"):
+                    if LOOT_PICKUP and eyes.mode != "on it":
+                        # Gating this on "no monster or a far one" meant loot
+                        # was never picked up at all on a busy map: there is
+                        # always another monster, so the bot fought past a pile
+                        # of items forever. An item nearer than the monster is
+                        # two steps and a trigger press, and the monster is
+                        # still there afterwards -- so nearest wins. Only a
+                        # fight already in melee ("on it") is left alone.
                         lsx, lsy, ldist = eyes.pick_loot(now)
-                        if lsx is not None:
+                        if lsx is not None and (msx is None
+                                                or eyes.mode == "far"
+                                                or ldist < mdist):
                             msx, msy, mdist = lsx, lsy, ldist
                             on_loot = True
                     if eyes.me is None:
@@ -1600,8 +1640,8 @@ def main(port=None):
                     else:
                         sx, sy = msx, msy
                         if on_loot:
-                            state = ("loot!  " if eyes.loot_mode == "loot get"
-                                     else "loot   ") + f"{mdist:6.1f}"
+                            got = "get" if eyes.loot_mode == "loot get" else ""
+                            state = f"{eyes.loot_name[:9]:9}{got:3}{mdist:5.1f}"
                         else:
                             state = {"on it": "on it  ",
                                      "far": "far    "}.get(eyes.mode,
@@ -1662,11 +1702,15 @@ def main(port=None):
                     key = buff_queue.pop(0)
                     pad.tap_dpad(key, BUFF_HOLD_S)
                     next_press = now + BUFF_GAP_S
-                elif (eyes is not None and eyes.loot_mode == "loot get"
-                        and now >= next_loot):
-                    # Standing on the item: LOOT_BUTTON collects it. Same rule
-                    # as the buff and the spam button -- one press per pass, or
-                    # the game drops one inside the other's animation.
+                elif (eyes is not None and now >= next_loot
+                        and (eyes.loot_mode == "loot get"
+                             or eyes.loot_here())):
+                    # Something is under us: LOOT_BUTTON collects it. Checked
+                    # even mid-fight, because the kill drops the item at our
+                    # feet and the monster path would otherwise walk off it
+                    # first. Same rule as the buff and the spam button -- one
+                    # press per pass, or the game drops one inside the other's
+                    # animation.
                     pad.tap_trigger(LOOT_BUTTON, LOOT_HOLD_S)
                     key = LOOT_BUTTON
                     next_loot = now + LOOT_TAP_GAP_S
@@ -1858,73 +1902,66 @@ def demo():
     # Loot. The rule under test is the one the pooling forces: a slot holding a
     # position is not a drop, a slot that has been seen to *change* is.
     class _Loot(MemoryEyes):
-        def __init__(self, drops=(), fresh=()):
+        def __init__(self, drops=()):
             self.me, self.basis = 0x1000, [[1.0, 0.0], [0.0, 1.0]]
-            self.loot = {d: (x, 0.0, z) for d, x, z in drops}
-            self.loot_fresh = {d: 1.0 for d in fresh}
+            self.loot = {d: (x, 0.0, z, n) for d, x, z, n in drops}
             self.loot_target = self.loot_since = None
-            self.loot_ignored, self.loot_mode = {}, "no loot"
+            self.loot_ignored, self.loot_mode, self.loot_name = {}, "no loot", ""
             self.hot_loot, self.mem, self.ms = None, None, None
             self.lock = threading.Lock()
 
         def _positions(self, addrs):
             return {a: (0.0, 0.0, 0.0) for a in addrs}   # we stand at origin
 
-    # A drop nobody has watched change is a pooled leftover, not loot.
-    stale = _Loot(drops=[(0xA000, 5.0, 0.0)])
-    assert stale.pick_loot(2.0) == (None, None, None)
-    assert stale.loot_mode == "no loot", stale.loot_mode
-
-    near_loot = _Loot(drops=[(0xA000, 5.0, 0.0)], fresh=[0xA000])
+    near_loot = _Loot(drops=[(0xA000, 5.0, 0.0, "Flax")])
     lsx, lsy, ld = near_loot.pick_loot(2.0)
     assert lsx is not None and abs(ld - 5.0) < 1e-6, (lsx, ld)
     assert near_loot.loot_mode == "loot", near_loot.loot_mode
+    assert near_loot.loot_name == "Flax", near_loot.loot_name
 
     # Standing on it: stick goes still and the trigger press is what acts.
-    on_it = _Loot(drops=[(0xA000, LOOT_ARRIVE / 2, 0.0)], fresh=[0xA000])
+    on_it = _Loot(drops=[(0xA000, LOOT_ARRIVE / 2, 0.0, "Flax")])
     assert on_it.pick_loot(2.0)[:2] == (0.0, 0.0)
     assert on_it.loot_mode == "loot get", on_it.loot_mode
 
+    # An item at our feet is collected without the loot path being involved at
+    # all -- that is the kill-drops-at-your-feet case, mid-fight.
+    underfoot = _Loot(drops=[(0xA000, LOOT_ARRIVE / 2, 0.0, "Flax")])
+    assert underfoot.loot_here() and underfoot.loot_name == "Flax"
+    assert not _Loot(drops=[(0xA000, LOOT_ARRIVE * 3, 0.0, "Flax")]).loot_here()
+
     # Out of range is left alone: crossing the map for an item is not looting.
-    away = _Loot(drops=[(0xA000, LOOT_RANGE * 2, 0.0)], fresh=[0xA000])
+    away = _Loot(drops=[(0xA000, LOOT_RANGE * 2, 0.0, "Flax")])
     assert away.pick_loot(2.0) == (None, None, None)
 
     # An item that cannot be collected must be given up on, or it owns the bot.
-    stuck_loot = _Loot(drops=[(0xA000, 5.0, 0.0)], fresh=[0xA000])
+    stuck_loot = _Loot(drops=[(0xA000, 5.0, 0.0, "Flax")])
     stuck_loot.pick_loot(2.0)
     assert stuck_loot.pick_loot(2.0 + LOOT_MAX_S + 1) == (None, None, None)
     assert stuck_loot.loot_mode == "loot skip", stuck_loot.loot_mode
     assert 0xA000 in stuck_loot.loot_ignored
 
-    # Freshness itself: only a slot whose position changed counts.
-    class _Sweep(_Loot):
-        def __init__(self, seen):
-            _Loot.__init__(self)
-            self.seen, self.classes = seen, {"loot": 0x1}
-
-            class _MS:
-                @staticmethod
-                def world_loot(mem, cls, regions=None):
-                    return self.seen.pop(0)
-            self.ms = _MS()
-
-        def _regions(self):
-            return []
-
-    sweep = _Sweep([[(0xA000, 1.0, 0.0, 0.0), (0xB000, 2.0, 0.0, 0.0)],
-                    [(0xA000, 1.0, 0.0, 0.0), (0xB000, 9.0, 0.0, 0.0)]])
-
-    class _NoRegions:
-        pid = 0
-
-        @staticmethod
-        def regions():
-            return []
-
-    sweep._sweep_loot(_NoRegions())
-    assert not sweep.loot_fresh, "first sweep is a baseline, nothing is fresh"
-    sweep._sweep_loot(_NoRegions())
-    assert set(sweep.loot_fresh) == {0xB000}, sweep.loot_fresh
+    # The allowlist. Exact names only: "Axe" must not collect a "Battle Axe",
+    # which a substring test would do and which is the whole reason for a list.
+    global LOOT_NAMES
+    LOOT_NAMES = ("Flax", " slingshot ")
+    try:
+        assert wanted_item("Flax") and wanted_item("flax")
+        assert wanted_item("Slingshot"), "matching ignores case and padding"
+        assert not wanted_item("Battle Axe") and not wanted_item("Axe")
+        picky = _Loot(drops=[(0xA000, 1.0, 0.0, "Axe"),
+                             (0xB000, 9.0, 0.0, "Flax")])
+        _, _, pd = picky.pick_loot(2.0)
+        assert picky.loot_name == "Flax" and abs(pd - 9.0) < 1e-6, picky.loot_name
+        only_junk = _Loot(drops=[(0xA000, 1.0, 0.0, "Battle Axe")])
+        assert only_junk.pick_loot(2.0) == (None, None, None)
+        # One name without the trailing comma is a string, and read as a list
+        # of letters it matched nothing at all -- silently collecting nothing.
+        LOOT_NAMES = ("Flax")
+        assert wanted_item("Flax") and not wanted_item("Axe")
+    finally:
+        LOOT_NAMES = ()
+    assert wanted_item("anything at all"), "an empty list means take everything"
 
     only_pooled = _Far(MEM_RANGE * 3, real=())     # nothing real at all
     assert only_pooled.target(1.0) == (None, None, None)
