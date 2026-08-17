@@ -167,7 +167,7 @@ LOOT_IGNORE_S = 30.0
 # because a substring rule would make "Axe" collect a "Battle Axe" too.
 # `python memscan.py --loot` prints the names lying around you, which is the
 # list to write this from.
-LOOT_NAMES = ("Flax")          # e.g. ("Flax", "Slingshot", "Pioneer Relic")
+LOOT_NAMES = ("Rooster Card", "Bee Card", "Sprount Card")          # e.g. ("Flax", "Slingshot", "Pioneer Relic")
 # The anchor/leash/patrol feature was cut as buggy: End is a plain toggle again
 # and the bot roams wherever the kills lead. It is in git history if the idea is
 # revisited -- the minimap scale tracking went with it, since sizing the leash
