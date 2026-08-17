@@ -150,6 +150,27 @@ SWEEP_FRAMES = 20
 # pooled ones never do. Re-asking every frame walked hundreds of dead entries
 # looking for the first live one; a short cache makes that a handful of reads.
 LIVE_TTL_S = 0.4
+# Picking loot up. Only worth doing between kills, so it runs when the monster
+# path has nothing: walking off to an item mid-fight is how a bot dies.
+LOOT_PICKUP = True
+LOOT_RANGE = 40.0        # world units; do not cross the map for a drop
+LOOT_ARRIVE = 2.0        # world units; where LOOT_BUTTON is pressed
+LOOT_BUTTON = "lt"       # left trigger picks the item up
+LOOT_HOLD_S = 0.12
+LOOT_TAP_GAP_S = 0.5     # between presses while standing on a drop
+# A drop we cannot actually collect -- out of reach, someone else's, already
+# gone -- otherwise holds the bot on the spot pressing a trigger forever.
+LOOT_MAX_S = 6.0
+LOOT_IGNORE_S = 30.0
+# The game pools LootDrop objects: measured a fixed 148 of them, recycled, and
+# picking an item up neither frees the object nor clears its position. So a
+# stale slot is indistinguishable from a drop lying there -- the same trap the
+# pooled monsters set. What does separate them is that a real drop *rewrites*
+# its slot: over 60 seconds of play 26 of the 148 changed position and the other
+# 122 were byte-identical. So the bot only chases slots it has watched change,
+# which means loot that fell before the bot started is ignored. That is the
+# right trade for a combat bot: it loots its own kills.
+LOOT_FRESH_S = 120.0     # how long a rewritten slot stays worth walking to
 # The anchor/leash/patrol feature was cut as buggy: End is a plain toggle again
 # and the bot roams wherever the kills lead. It is in git history if the idea is
 # revisited -- the minimap scale tracking went with it, since sizing the leash
@@ -806,6 +827,13 @@ class MemoryEyes:
         self.sweep_at = 0         # cursor into the far units, a slice per frame
         self.fight_ok = {}        # unit -> (expiry, is it worth fighting)
         self.hot = None           # regions worth sweeping
+        self.loot = {}            # drop -> (x, y, z), last seen
+        self.loot_fresh = {}      # drop -> when its slot was last rewritten
+        self.loot_target = None   # drop held between frames
+        self.loot_since = None    # when we started walking to it
+        self.loot_ignored = {}    # drop -> time it becomes fair game again
+        self.loot_mode = "no loot"
+        self.hot_loot = None      # regions worth sweeping for loot
         self.scanner = None
         self.stop = None
         self.lock = threading.Lock()
@@ -990,6 +1018,104 @@ class MemoryEyes:
                 return True
         return False
 
+    def _ensure_loot(self, mem):
+        """Find the LootDrop class once, by name, and cache the slot.
+
+        Separate from heal() on purpose: the units can be perfectly healthy
+        while loot has never been looked up, since only a rediscovery ever
+        writes its RVA. Searching for the one name we are missing costs a
+        fraction of a full heal, and it happens once per patch.
+        """
+        found = self.ms.find_classes(mem, {"loot": self.ms.CLASS_NAMES["loot"]})
+        if not found.get("loot"):
+            print("\nloot pickup: no LootDrop class found; pickup is off this "
+                  "session")
+            return False
+        self.classes = dict(self.classes, **found)
+        rva = self.ms.class_slot_rva(mem, found["loot"])
+        if rva:
+            cached = dict(self.ms.load_rva_cache(), loot=rva)
+            self.ms.save_rva_cache(cached)
+        print(f"\nloot pickup: LootDrop found at 0x{found['loot']:X}"
+              + (f", slot cached (0x{rva:X})" if rva else ""))
+        return True
+
+    def _sweep_loot(self, mem):
+        """Refresh ground loot, remembering which slots were rewritten.
+
+        The rewrite is the whole point. LootDrop objects are pooled -- a fixed
+        set, recycled -- so a slot holding a position proves nothing; picking an
+        item up leaves both the object and its last position in place. A slot
+        whose position *changes* is an item that just dropped. Measured over 60
+        seconds of play: 26 of 148 slots changed, 122 were byte-identical.
+        """
+        found = self.ms.world_loot(mem, self.classes.get("loot"),
+                                   regions=self.hot_loot)
+        now = time.time()
+        with self.lock:
+            for drop, x, y, z in found:
+                was = self.loot.get(drop)
+                if was is not None and was != (x, y, z):
+                    self.loot_fresh[drop] = now
+                self.loot[drop] = (x, y, z)
+        if self.hot_loot is None and found:
+            spans = mem.regions()
+            live = {d for d, *_ in found}
+            self.hot_loot = [(b, s) for b, s in spans
+                             if any(b <= d < b + s for d in live)]
+
+    def pick_loot(self, now):
+        """(sx, sy, distance) toward a dropped item, or (None, None, None).
+
+        Only fresh drops (see _sweep_loot) and only within LOOT_RANGE. The held
+        target survives between frames so the bot does not swap items every time
+        two are the same distance away, and it is given up on and ignored after
+        LOOT_MAX_S -- an item that cannot be collected would otherwise hold the
+        bot on the spot pressing the trigger forever.
+        """
+        if not (LOOT_PICKUP and self.me and self.basis):
+            self.loot_mode = "no loot"
+            return None, None, None
+        here = self._positions([self.me]).get(self.me)
+        if not here:
+            self.loot_mode = "no loot"
+            return None, None, None
+        px, _, pz = here
+        with self.lock:
+            drops = [(d, self.loot[d]) for d, t in self.loot_fresh.items()
+                     if now - t < LOOT_FRESH_S and d in self.loot]
+        ranked = sorted((((x - px) ** 2 + (z - pz) ** 2) ** 0.5, d, x, z)
+                        for d, (x, _, z) in drops
+                        if self.loot_ignored.get(d, 0) < now)
+        ranked = [r for r in ranked if r[0] <= LOOT_RANGE]
+        if not ranked:
+            self.loot_target = self.loot_since = None
+            self.loot_mode = "no loot"
+            return None, None, None
+
+        held = next((r for r in ranked if r[1] == self.loot_target), None)
+        pick = held or ranked[0]
+        if pick[1] != self.loot_target:
+            self.loot_target, self.loot_since = pick[1], now
+        elif self.loot_since and now - self.loot_since > LOOT_MAX_S:
+            # Same rule the monster path needs: something we cannot collect has
+            # to be dropped, or it owns the bot.
+            self.loot_ignored[pick[1]] = now + LOOT_IGNORE_S
+            self.loot_target = self.loot_since = None
+            self.loot_mode = "loot skip"
+            return None, None, None
+
+        dist, drop, x, z = pick
+        if dist <= LOOT_ARRIVE:
+            self.loot_mode = "loot get"
+            return 0.0, 0.0, dist
+        s = stick_for(self.basis, x - px, z - pz)
+        if not s:
+            self.loot_mode = "no loot"
+            return None, None, None
+        self.loot_mode = "loot"
+        return s[0], s[1], dist
+
     def start_scanning(self):
         """Rediscover units in the background, forever. Never blocks the bot.
 
@@ -1004,6 +1130,7 @@ class MemoryEyes:
 
         def loop():
             mem = self.ms.Mem(self.mem.pid)
+            looked = True         # loot class not looked up yet; once only
             try:
                 if not self.available():
                     self.heal(mem)
@@ -1014,6 +1141,10 @@ class MemoryEyes:
                     found = self.ms.world_units(mem, regions=self.hot)
                     with self.lock:
                         self.units = found
+                    if LOOT_PICKUP and not self.classes.get("loot") and looked:
+                        looked = self._ensure_loot(mem)
+                    if LOOT_PICKUP and self.classes.get("loot"):
+                        self._sweep_loot(mem)
                     if self.hot is None and found:
                         # Narrow the next sweep to where the units turned out to
                         # be, rather than paying for the whole heap every time.
@@ -1184,6 +1315,17 @@ class VirtualPad:
     def tap_button(self, name, hold=SPAM_HOLD_S):
         self._tap(self.face[name], hold)
 
+    def tap_trigger(self, name, hold):
+        # A trigger is an axis, not a button, so it cannot go through _tap. The
+        # stick keeps its value across this the same way.
+        press = (self.pad.left_trigger if name == "lt"
+                 else self.pad.right_trigger)
+        press(value=255)
+        self.pad.update()
+        time.sleep(hold)
+        press(value=0)
+        self.pad.update()
+
     def stick(self, sx, sy, attack=False):
         self.pad.left_joystick_float(sx, sy)
         if attack:
@@ -1251,6 +1393,14 @@ class ArduinoPad:
         # hold is ignored: the sketch's own B command is press, 50ms, release.
         self._cmd(f"B{self.FACE.get(n, n)}")
 
+    def tap_trigger(self, name, hold):
+        # 'T<left>,<right>', the sketch's trigger axes. ponytail: untested on
+        # the board -- the game only reads XInput, so vgamepad is the live path.
+        lo, hi = (255, 0) if name == "lt" else (0, 255)
+        self._cmd(f"T{lo},{hi}")
+        time.sleep(hold)
+        self._cmd("T0,0")
+
     def _cmd(self, line):
         self.ser.write(f"{line}\n".encode())
         reply = self.ser.readline().strip()
@@ -1312,6 +1462,7 @@ def main(port=None):
     buff_queue = []   # d-pad presses left in the current cast
     next_press = 0.0  # earliest time for the next one
     next_spam = 0.0   # SPAM_BUTTON goes out on its own timer
+    next_loot = 0.0   # LOOT_BUTTON while standing on a drop
     next_login_check = 0.0  # a whole-window grab, so kept to RECONNECT_POLL_S
 
     pad.stick(0.0, 0.0, False)
@@ -1327,7 +1478,12 @@ def main(port=None):
                     stuck_watchdog.reset()
                     last = None
                     buff_queue = []
-                    next_buff = next_press = next_spam = 0.0
+                    next_buff = next_press = next_spam = next_loot = 0.0
+                    if eyes is not None:
+                        # Same reason the pixel helpers reset here: a drop held
+                        # from before the pause is stale by the time we resume.
+                        eyes.loot_target = eyes.loot_since = None
+                        eyes.loot_mode = "no loot"
                     print(f"\n{'STOPPED' if paused else 'STARTED'} (End)")
                     if not paused and eyes is not None and eyes.scanner is None:
                         # Returns at once. The first sweep is slow, so the bot
@@ -1374,7 +1530,7 @@ def main(port=None):
                         pet_filter.reset()
                         last = None
                         buff_queue = []
-                        next_buff = next_press = next_spam = 0.0
+                        next_buff = next_press = next_spam = next_loot = 0.0
                         continue
 
                 if not buff_queue and time.time() >= next_buff:
@@ -1411,6 +1567,16 @@ def main(port=None):
                     # pixel machinery is needed here: no pet filter, no
                     # saturation threshold for mushrooms, no minimap rotation.
                     msx, msy, mdist = eyes.target(now)
+                    # Loot gets its turn when there is no monster to fight, and
+                    # also when the only monster is "far": an item two steps
+                    # away is worth more than a walk across the map, and the
+                    # monster is still there afterwards. Never mid-fight.
+                    on_loot = False
+                    if LOOT_PICKUP and (msx is None or eyes.mode == "far"):
+                        lsx, lsy, ldist = eyes.pick_loot(now)
+                        if lsx is not None:
+                            msx, msy, mdist = lsx, lsy, ldist
+                            on_loot = True
                     if eyes.me is None:
                         # Do not shut memory targeting down for this: it comes
                         # back on its own once the sweep finds the new unit, and
@@ -1433,9 +1599,13 @@ def main(port=None):
                                                              "no monster")
                     else:
                         sx, sy = msx, msy
-                        state = {"on it": "on it  ",
-                                 "far": "far    "}.get(eyes.mode,
-                                                       "dist  ") + f"{mdist:6.1f}"
+                        if on_loot:
+                            state = ("loot!  " if eyes.loot_mode == "loot get"
+                                     else "loot   ") + f"{mdist:6.1f}"
+                        else:
+                            state = {"on it": "on it  ",
+                                     "far": "far    "}.get(eyes.mode,
+                                                           "dist  ") + f"{mdist:6.1f}"
 
                 # Everything below is the pixel path, used when memory targeting
                 # is off or has gone stale. It is left exactly as it was.
@@ -1492,6 +1662,14 @@ def main(port=None):
                     key = buff_queue.pop(0)
                     pad.tap_dpad(key, BUFF_HOLD_S)
                     next_press = now + BUFF_GAP_S
+                elif (eyes is not None and eyes.loot_mode == "loot get"
+                        and now >= next_loot):
+                    # Standing on the item: LOOT_BUTTON collects it. Same rule
+                    # as the buff and the spam button -- one press per pass, or
+                    # the game drops one inside the other's animation.
+                    pad.tap_trigger(LOOT_BUTTON, LOOT_HOLD_S)
+                    key = LOOT_BUTTON
+                    next_loot = now + LOOT_TAP_GAP_S
                 elif SPAM_BUTTON and now >= next_spam:
                     # Never in the same pass as a buff press: two taps back to back
                     # land inside one another's animation and the game drops one.
@@ -1677,6 +1855,77 @@ def demo():
     _, _, pd = pooled.target(1.0)
     assert pooled.chasing == 0x2000, "must skip the pooled one right beside us"
     assert pd > MEM_RANGE, pd
+    # Loot. The rule under test is the one the pooling forces: a slot holding a
+    # position is not a drop, a slot that has been seen to *change* is.
+    class _Loot(MemoryEyes):
+        def __init__(self, drops=(), fresh=()):
+            self.me, self.basis = 0x1000, [[1.0, 0.0], [0.0, 1.0]]
+            self.loot = {d: (x, 0.0, z) for d, x, z in drops}
+            self.loot_fresh = {d: 1.0 for d in fresh}
+            self.loot_target = self.loot_since = None
+            self.loot_ignored, self.loot_mode = {}, "no loot"
+            self.hot_loot, self.mem, self.ms = None, None, None
+            self.lock = threading.Lock()
+
+        def _positions(self, addrs):
+            return {a: (0.0, 0.0, 0.0) for a in addrs}   # we stand at origin
+
+    # A drop nobody has watched change is a pooled leftover, not loot.
+    stale = _Loot(drops=[(0xA000, 5.0, 0.0)])
+    assert stale.pick_loot(2.0) == (None, None, None)
+    assert stale.loot_mode == "no loot", stale.loot_mode
+
+    near_loot = _Loot(drops=[(0xA000, 5.0, 0.0)], fresh=[0xA000])
+    lsx, lsy, ld = near_loot.pick_loot(2.0)
+    assert lsx is not None and abs(ld - 5.0) < 1e-6, (lsx, ld)
+    assert near_loot.loot_mode == "loot", near_loot.loot_mode
+
+    # Standing on it: stick goes still and the trigger press is what acts.
+    on_it = _Loot(drops=[(0xA000, LOOT_ARRIVE / 2, 0.0)], fresh=[0xA000])
+    assert on_it.pick_loot(2.0)[:2] == (0.0, 0.0)
+    assert on_it.loot_mode == "loot get", on_it.loot_mode
+
+    # Out of range is left alone: crossing the map for an item is not looting.
+    away = _Loot(drops=[(0xA000, LOOT_RANGE * 2, 0.0)], fresh=[0xA000])
+    assert away.pick_loot(2.0) == (None, None, None)
+
+    # An item that cannot be collected must be given up on, or it owns the bot.
+    stuck_loot = _Loot(drops=[(0xA000, 5.0, 0.0)], fresh=[0xA000])
+    stuck_loot.pick_loot(2.0)
+    assert stuck_loot.pick_loot(2.0 + LOOT_MAX_S + 1) == (None, None, None)
+    assert stuck_loot.loot_mode == "loot skip", stuck_loot.loot_mode
+    assert 0xA000 in stuck_loot.loot_ignored
+
+    # Freshness itself: only a slot whose position changed counts.
+    class _Sweep(_Loot):
+        def __init__(self, seen):
+            _Loot.__init__(self)
+            self.seen, self.classes = seen, {"loot": 0x1}
+
+            class _MS:
+                @staticmethod
+                def world_loot(mem, cls, regions=None):
+                    return self.seen.pop(0)
+            self.ms = _MS()
+
+        def _regions(self):
+            return []
+
+    sweep = _Sweep([[(0xA000, 1.0, 0.0, 0.0), (0xB000, 2.0, 0.0, 0.0)],
+                    [(0xA000, 1.0, 0.0, 0.0), (0xB000, 9.0, 0.0, 0.0)]])
+
+    class _NoRegions:
+        pid = 0
+
+        @staticmethod
+        def regions():
+            return []
+
+    sweep._sweep_loot(_NoRegions())
+    assert not sweep.loot_fresh, "first sweep is a baseline, nothing is fresh"
+    sweep._sweep_loot(_NoRegions())
+    assert set(sweep.loot_fresh) == {0xB000}, sweep.loot_fresh
+
     only_pooled = _Far(MEM_RANGE * 3, real=())     # nothing real at all
     assert only_pooled.target(1.0) == (None, None, None)
     assert only_pooled.mode == "no monster", only_pooled.mode

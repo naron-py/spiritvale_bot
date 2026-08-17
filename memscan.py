@@ -43,6 +43,7 @@ usage:
   python memscan.py --check 1A2B3C4 ...   # judge addresses found in Cheat Engine
   python memscan.py --units [addr]        # monsters vs pets vs you
   python memscan.py --ids                 # MonsterId counts; summons are singletons
+  python memscan.py --loot [seconds]      # ground loot; with seconds, what is fresh
   python memscan.py --entities [addr]     # older, superseded by --units
   python memscan.py --pos        # live position, once POSITION_CHAIN is set
   python memscan.py --demo       # offline self-check, no game needed
@@ -100,6 +101,19 @@ UNIT_VISIBLE = 0x18D         # BaseUnitController.IsVisible, bool
 UNIT_HEALTH = 0x128          # BaseUnitController.Health -> HealthComponent
 HEALTH_CURRENT = 0x138       # HealthComponent._health, int
 
+# Loot on the ground. A LootDrop is a FishNet NetworkBehaviour; unlike a unit it
+# caches no position of its own, so the place has to come from Unity's own
+# transform: the managed GameObject holds a native pointer, and the position
+# sits three hops further in. Measured on a live map: 148 of 148 drops resolved,
+# every one a different value, in the same coordinate space world_units()
+# reports -- the drops sat 536 units away with the field monsters at 544, while
+# the character stood in town.
+LOOT_ITEM = 0x100            # LootDrop.Item -> InventoryItemData
+LOOT_GO = 0x110              # LootDrop.gameObject -> UnityEngine.GameObject
+LOOT_SPRITE = 0x118          # LootDrop.Sprite -> LootSprite
+GO_NATIVE = 0x10             # UnityEngine.Object.m_CachedPtr
+LOOT_POS_CHAIN = (0x20, 0x28, 0x60)   # native GameObject -> ... -> Vector3
+
 # Where each class's Il2CppClass pointer is kept, as an offset into
 # GameAssembly.dll. From Il2CppDumper's script.json, the *_TypeInfo entries.
 # These move with every patch -- re-dump and update them. Everything else in this
@@ -110,7 +124,7 @@ TYPE_RVA = dict(monster=0x5D08E50, player=0x5C60880, summoning=0x5CC1C70)
 # these names when a patch moves them, which is what makes an update survivable
 # without a re-dump. See find_classes().
 CLASS_NAMES = dict(monster="MonsterController", player="PlayerController",
-                   summoning="SummoningComponent")
+                   summoning="SummoningComponent", loot="LootDrop")
 CLASS_NAME_OFF = 0x10        # Il2CppClass.name, char*
 RVA_CACHE = "il2cpp_rva.json"  # rediscovered slots, so it is slow only once
 # Updated for the build of 2026-08-11 15:59. The previous values were
@@ -1446,6 +1460,44 @@ def world_units(mem, regions=None):
     return out
 
 
+def loot_pos(mem, drop):
+    """(x, y, z) of a dropped item, or None."""
+    p = read_ptr(mem, drop + LOOT_GO)
+    p = read_ptr(mem, p + GO_NATIVE) if p else None
+    for off in LOOT_POS_CHAIN[:-1]:
+        p = read_ptr(mem, p + off) if p else None
+    if not p:
+        return None
+    t = read_vec3(mem, p + LOOT_POS_CHAIN[-1])
+    return t if t and looks_like_place(t) else None
+
+
+def world_loot(mem, cls=None, regions=None):
+    """[(drop, x, y, z)] for every item lying on the ground the client knows of.
+
+    instances_of() also returns slots in IL2CPP's own class table, which have no
+    GameObject; that is what the class check throws out.
+
+    Note what this does NOT tell you: whether the drop is still there. The game
+    pools LootDrops -- measured at a fixed 148 objects, recycled -- so picking an
+    item up neither frees its object nor clears its position, exactly like the
+    pooled monsters. A drop is real when its slot has been *rewritten*, which
+    only a caller watching over time can see; see LootWatch in minimap_bot.py.
+    """
+    cls = cls or type_classes(mem).get("loot")
+    if not cls:
+        return []
+    out = []
+    for a in instances_of(mem, cls, limit=8000, regions=regions):
+        go = read_ptr(mem, a + LOOT_GO)
+        if not go or class_name(mem, read_ptr(mem, go) or 0) != "GameObject":
+            continue
+        t = loot_pos(mem, a)
+        if t:
+            out.append((a, t[0], t[1], t[2]))
+    return out
+
+
 def my_pets(mem, me):
     """The player's own summons, straight off their SummoningComponent."""
     comp = read_ptr(mem, me + UNIT_SUMMONING)
@@ -1509,6 +1561,35 @@ def show_ids():
             deny = "" if (low not in MONSTER_DENY
                           and not low.startswith(MONSTER_DENY_PREFIX)) else "  DENIED"
             print(f"  {n:4d}  {name!r}{deny}")
+
+
+def show_loot(seconds=0.0):
+    """List ground loot. With a duration, watch which slots get rewritten.
+
+    The watch is the useful mode: a pooled slot never changes, so what moves
+    over a few seconds is what actually dropped while you were looking.
+    """
+    import time
+    with Mem() as mem:
+        cls = type_classes(mem).get("loot")
+        if not cls:
+            print("no LootDrop class -- run the bot once so it rediscovers the "
+                  "slots by name, or delete " + RVA_CACHE)
+            return
+        drops = {a: (x, y, z) for a, x, y, z in world_loot(mem, cls)}
+        print(f"{len(drops)} drops")
+        for a, (x, y, z) in list(drops.items())[:20]:
+            print(f"  0x{a:012X}  ({x:8.1f},{y:6.1f},{z:8.1f})")
+        if seconds <= 0:
+            return
+        print(f"\nwatching {seconds:g}s for slots that get rewritten:")
+        end = time.time() + seconds
+        while time.time() < end:
+            time.sleep(1.0)
+            for a, x, y, z in world_loot(mem, cls):
+                if a in drops and drops[a] != (x, y, z):
+                    print(f"  fresh 0x{a:012X}  ({x:8.1f},{y:6.1f},{z:8.1f})")
+                drops[a] = (x, y, z)
 
 
 def show_units(pos_addr=None):
@@ -1872,6 +1953,36 @@ def demo():
     assert kinds[PET] == "your pet", kinds
     assert kinds.get(MON) in (None, "monster"), kinds
 
+    # Loot: the position is four hops from the managed object, and every hop is
+    # somewhere the chain can break -- a pooled drop with no GameObject, a
+    # destroyed native object -- so each must answer None rather than raise.
+    class LootMem:
+        """One drop, walked GameObject -> native -> component -> transform."""
+        DROP, GO, NATIVE, COMP, XFORM = (0x600000, 0x610000, 0x620000,
+                                         0x630000, 0x640000)
+
+        def __init__(self, pos=(12.5, 1.0, -8.25), go=True):
+            self.pos, self.go = pos, go
+
+        def read(self, addr, size):
+            if addr == self.DROP + LOOT_GO:
+                return struct.pack("<Q", self.GO if self.go else 0)
+            if addr == self.GO + GO_NATIVE:
+                return struct.pack("<Q", self.NATIVE)
+            if addr == self.NATIVE + LOOT_POS_CHAIN[0]:
+                return struct.pack("<Q", self.COMP)
+            if addr == self.COMP + LOOT_POS_CHAIN[1]:
+                return struct.pack("<Q", self.XFORM)
+            if addr == self.XFORM + LOOT_POS_CHAIN[2]:
+                return struct.pack("<fff", *self.pos)
+            return bytes(size)
+
+    lm = LootMem()
+    assert loot_pos(lm, LootMem.DROP) == (12.5, 1.0, -8.25), loot_pos(lm, LootMem.DROP)
+    assert loot_pos(LootMem(go=False), LootMem.DROP) is None, "no GameObject"
+    # Recycled memory reads as a place-shaped triple that is nowhere near a map.
+    assert loot_pos(LootMem(pos=(1e9, 0.0, 0.0)), LootMem.DROP) is None
+
     print("demo ok")
 
 
@@ -1923,6 +2034,10 @@ if __name__ == "__main__":
         show_units(int(rest[0], 16) if rest else None)
     elif "--ids" in sys.argv:
         show_ids()
+    elif "--loot" in sys.argv:
+        rest = [a for a in sys.argv[sys.argv.index("--loot") + 1:]
+                if not a.startswith("--")]
+        show_loot(float(rest[0]) if rest else 0.0)
     elif "--check" in sys.argv:
         given = [int(a, 16) for a in sys.argv[sys.argv.index("--check") + 1:]
                  if not a.startswith("--")]

@@ -30,6 +30,7 @@ python minimap_bot.py --probe      # press every X360 button in turn, named
 
 python memscan.py --demo           # memory layer self-check, no game needed
 python memscan.py --units          # list what the unit sweep classifies right now
+python memscan.py --loot [seconds] # ground loot; with seconds, which slots are fresh
 python memscan.py --check <addr>   # inspect one unit object
 ```
 
@@ -71,9 +72,13 @@ scanning at the bottom of the file — no argparse in `minimap_bot.py`.
    prints: `chasing`, `far`, `on it`, `gave up`, `no monster`, `lost`, `no unit`,
    `DEAD`. Everything it depends on is checked rather than trusted — see the
    constraints below.
+   Loot rides on the same layer: the background sweep also calls
+   `world_loot()`, `pick_loot(now)` returns a stick toward the nearest *fresh*
+   drop within `LOOT_RANGE`, and `LOOT_BUTTON` (left trigger) is tapped on
+   arrival. See the loot constraints below for why "fresh" is load-bearing.
 4. **Pad backends** — `VirtualPad` (vgamepad/ViGEmBus, XInput) and `ArduinoPad`
-   (serial to a Leonardo). Duck-typed, same three methods: `stick(sx, sy, attack)`,
-   `tap_dpad(name, hold)`, `close()`. Pick a backend by adding a class with those
+   (serial to a Leonardo). Duck-typed, same methods: `stick(sx, sy, attack)`,
+   `tap_dpad(name, hold)`, `tap_trigger(name, hold)`, `close()`. Pick a backend by adding a class with those
    three methods; nothing else in the file knows the difference.
 
 `memscan.py` is the memory layer: region enumeration, the heap sweep
@@ -129,8 +134,42 @@ adjusting them over adding code paths.
   a stale `mode` made a bot with no unit at all report `chasing` while motionless,
   and sent the investigation to the wrong place.
 
+### Loot pickup
+
+- **`LootDrop` objects are pooled, so a position proves nothing.** Measured a
+  fixed 148 objects, recycled; picking an item up frees neither the object nor
+  its position, and no flag anywhere says "still on the ground". Ruled out by
+  measurement, not guessed: `+0x22/+0x23` flip on most drops every few seconds
+  (an animation/dirty bit), `InventoryItemData` and `LootSprite` are non-null on
+  all 148, and the native GameObject's constant bytes are constant on all 148.
+  A pickup does not change the object. What separates a real drop is that its
+  slot gets **rewritten**: over 60 seconds of play 26 of 148 changed position
+  and the other 122 were byte-identical. Hence `LOOT_FRESH_S` and
+  `_sweep_loot()` -- the bot only walks to slots it has watched change. The cost
+  is that loot already lying there when the bot starts is ignored, which is the
+  right trade: a combat bot loots its own kills.
+- **A drop has no readable name, so an item allowlist cannot be built yet.**
+  `InventoryItemData` on the client is entirely zeroed except a Type pointer;
+  there is no name or id string within three hops of a `LootDrop`, and no
+  managed `Sprite` to read an icon name off. The identity is resolved server
+  side or through a config table the client fills in later. Do not add a
+  `LOOT_NAMES` config that silently matches nothing -- either find the name
+  first, or use the game's own loot filter (`UpdateLootFilter`,
+  `CheckLootFilter` exist in the binary).
+- **Loot never interrupts a fight.** `pick_loot()` is consulted only when the
+  monster path has nothing, or when its mode is `far` -- an item two steps away
+  beats a walk across the map, and the monster is still there afterwards.
+- **Loot needs its own give-up.** Same lesson as the monsters: an item that
+  cannot be collected holds the bot on the spot pressing a trigger forever.
+  `LOOT_MAX_S` then `LOOT_IGNORE_S`.
+
 ### Surviving a game patch
 
+- **`LootDrop` has no `TYPE_RVA` entry and is not meant to have one.** It is
+  found by name on the background thread (`MemoryEyes._ensure_loot`) the first
+  time the bot runs and cached as an RVA like the rest. `heal()` only fires when
+  the *monster* class is missing, so loot needs its own one-shot lookup -- units
+  can be perfectly healthy while loot has never been looked up at all.
 - **`TYPE_RVA` is the only thing that breaks, and it breaks every patch.** Those
   are positions inside `GameAssembly.dll`; the 2026-08-11 update moved all three.
   The *field* offsets (position, health, visible, summoner) did not move and
