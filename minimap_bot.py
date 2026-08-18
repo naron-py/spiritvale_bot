@@ -168,7 +168,7 @@ LOOT_IGNORE_S = 30.0
 # name still works, and a short entry catches everything containing it.
 # `python memscan.py --loot` prints the names lying around you, which is the
 # list to write this from.
-LOOT_NAMES = ("Sunborn", "Card", "Essence", "Gem" )          # e.g. ("Flax", "Slingshot", "Pioneer Relic")
+LOOT_NAMES = ("Grape", "Card", "Essence", "Gem" )          # e.g. ("Flax", "Slingshot", "Pioneer Relic")
 # The anchor/leash/patrol feature was cut as buggy: End is a plain toggle again
 # and the bot roams wherever the kills lead. It is in git history if the idea is
 # revisited -- the minimap scale tracking went with it, since sizing the leash
