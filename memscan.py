@@ -119,6 +119,16 @@ LOOT_POS_CHAIN = (0x20, 0x28, 0x60)   # native GameObject -> ... -> Vector3
 # 'Axe'/'T_Axe_Axe'). Measured against a live field: 27 drops named Flax with
 # Flax lying on the ground, and 157 of 192 slots with no name at all -- which is
 # the pool. That absence is the liveness test: a pooled slot has no item.
+# Which unit is ours, without pushing the stick to find out. FishNet knows: the
+# ClientManager holds the local connection, the connection holds the object it
+# owns, and that object lists its components. Verified live -- the unit it names
+# tracked the character at 14.3 units/s while walking and 0.00 while standing.
+UNIT_TRANSPORT = 0x28        # NetworkBehaviour.TransportManager
+TRANSPORT_NM = 0x68          # TransportManager.NetworkManager
+NM_CLIENT = 0x38             # NetworkManager.ClientManager
+CLIENT_CONN = 0x60           # ClientManager.Connection -> NetworkConnection
+CONN_OBJECT = 0x68           # NetworkConnection's own NetworkObject
+OBJ_BEHAVIOURS = 0x60        # NetworkObject.NetworkBehaviours -> List<>
 LOOT_SYNC = 0x108            # LootDrop -> SyncVar holding the drop payload
 LOOT_NAME = 0x108            # payload: display name, as the tooltip shows it
 LOOT_KEY = 0x110             # payload: internal id, e.g. 'flax'
@@ -1469,6 +1479,37 @@ def world_units(mem, regions=None):
     return out
 
 
+def local_player(mem, seed):
+    """Our own PlayerController, walked from any unit -- or None.
+
+    The alternative is pushing the stick and seeing which of the players on the
+    map answered, which is what calibration did for this: on a busy map another
+    player out-walks a short push, so it took a least-squares fit over six legs
+    to be sure. This is a pointer walk instead. The local connection owns
+    exactly one object and that object says what it is.
+
+    `seed` is any unit at all. Every unit is a NetworkBehaviour and carries the
+    managers, so nothing here needs a class the bot has not already resolved --
+    which matters because ClientManager has no slot in the module to cache, and
+    searching for it by name would cost minutes on every run.
+    """
+    transport = read_ptr(mem, seed + UNIT_TRANSPORT)
+    nm = read_ptr(mem, transport + TRANSPORT_NM) if transport else None
+    client = read_ptr(mem, nm + NM_CLIENT) if nm else None
+    if not client or class_name(mem, read_ptr(mem, client) or 0) != "ClientManager":
+        return None
+    conn = read_ptr(mem, client + CLIENT_CONN)
+    if not conn or class_name(mem, read_ptr(mem, conn) or 0) != "NetworkConnection":
+        return None
+    obj = read_ptr(mem, conn + CONN_OBJECT)
+    if not obj or class_name(mem, read_ptr(mem, obj) or 0) != "NetworkObject":
+        return None
+    for comp in list_items(mem, read_ptr(mem, obj + OBJ_BEHAVIOURS) or 0, cap=32):
+        if class_name(mem, read_ptr(mem, comp) or 0) == "PlayerController":
+            return comp
+    return None
+
+
 def loot_pos(mem, drop):
     """(x, y, z) of a dropped item, or None."""
     p = read_ptr(mem, drop + LOOT_GO)
@@ -2024,6 +2065,69 @@ def demo():
             if addr == self.XFORM + LOOT_POS_CHAIN[2]:
                 return struct.pack("<fff", *self.pos)
             return bytes(size)
+
+    # Our own unit, walked from the local connection. Every hop is checked by
+    # class name, because a wrong turn here picks another player -- which is
+    # the exact failure the stick-push version kept hitting.
+    class FakeHeap:
+        """A sparse byte store, so reads have real sizes and real neighbours."""
+
+        def __init__(self):
+            self.by = {}
+
+        def put(self, addr, blob):
+            for i, b in enumerate(blob):
+                self.by[addr + i] = b
+            return addr
+
+        def obj(self, addr, name, fields=b""):
+            """An object at `addr` whose class carries `name`."""
+            cls, text = addr + 0x8000, addr + 0x9000
+            self.put(addr, struct.pack("<Q", cls) + fields)
+            self.put(cls, struct.pack("<Q", cls + 0x100))      # ->Il2CppImage
+            self.put(cls + 0x100, bytes(8))
+            self.put(cls + CLASS_NAME_OFF, struct.pack("<Q", text))
+            self.put(text, name.encode() + bytes(1))
+            return addr
+
+        def regions(self):
+            return [(OWNER_CM, 8)]
+
+        def read(self, addr, size):
+            out = bytes(self.by.get(addr + i, 0) for i in range(size))
+            return out
+
+    SEED, TM, NM, OWNER_CM = 0x690000, 0x6A0000, 0x6B0000, 0x700000
+    CONN, OBJ, LIST, ARR, ME, OTHER = (0x710000, 0x720000, 0x730000,
+                                       0x760000, 0x740000, 0x750000)
+
+    def owner_heap(broken=None):
+        h = FakeHeap()
+        for addr, name in ((ME, "PlayerController"), (OTHER, "MoveComponent"),
+                           (OBJ, "NetworkObject"), (CONN, "NetworkConnection"),
+                           (OWNER_CM, "ClientManager"), (NM, "NetworkManager"),
+                           (TM, "TransportManager"), (SEED, "PlayerController")):
+            h.obj(addr, name)
+        h.put(SEED + UNIT_TRANSPORT, struct.pack("<Q", TM))
+        h.put(TM + TRANSPORT_NM, struct.pack("<Q", NM))
+        h.put(NM + NM_CLIENT,
+              struct.pack("<Q", 0 if broken == "client" else OWNER_CM))
+        h.put(OWNER_CM + CLIENT_CONN,
+              struct.pack("<Q", 0 if broken == "conn" else CONN))
+        h.put(CONN + CONN_OBJECT,
+              struct.pack("<Q", 0 if broken == "obj" else OBJ))
+        h.put(OBJ + OBJ_BEHAVIOURS, struct.pack("<Q", LIST))
+        h.put(LIST + LIST_SIZE, struct.pack("<i", 2))
+        h.put(LIST + LIST_ITEMS, struct.pack("<Q", ARR))
+        # the component that is not us comes first, so order alone cannot pass
+        h.put(ARR + ARRAY_DATA,
+              struct.pack("<QQ", OTHER, 0 if broken == "me" else ME))
+        return h
+
+    assert local_player(owner_heap(), SEED) == ME
+    # Every hop is checked by name, because a wrong turn picks another player.
+    for broken in ("client", "conn", "obj", "me"):
+        assert local_player(owner_heap(broken), SEED) is None, broken
 
     lm = LootMem()
     assert loot_pos(lm, LootMem.DROP) == (12.5, 1.0, -8.25), loot_pos(lm, LootMem.DROP)

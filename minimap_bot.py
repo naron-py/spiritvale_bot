@@ -838,6 +838,7 @@ class MemoryEyes:
         self.sweep_at = 0         # cursor into the far units, a slice per frame
         self.fight_ok = {}        # unit -> (expiry, is it worth fighting)
         self.hot = None           # regions worth sweeping
+        self.owner = None         # our unit, from the local connection
         self.loot = {}            # drop -> (x, y, z, name)
         self.loot_name = ""       # what we are walking to, for the status line
         self.loot_target = None   # drop held between frames
@@ -987,18 +988,30 @@ class MemoryEyes:
             return {a: (after[a][0] - before[a][0], after[a][2] - before[a][2])
                     for a in before if a in after}
 
-        # Push every direction first, then work out which unit was answering.
-        # Picking the biggest mover in a leg does not do it: on a busy map
-        # another player out-walks us, calibration locks onto them, and every
-        # later leg is thrown away as "not us" -- the whole thing then fails
-        # with a healthy character standing right there.
+        # Two jobs here, and only one of them still needs walking. WHO we are
+        # comes from the local connection now (self.owner) -- a pointer walk,
+        # no pushing. WHAT a push does to our position cannot be read that way:
+        # it depends on the camera angle, so it has to be measured.
+        #
+        # Without the owner this falls back to the old way, which is why the
+        # six legs and pick_me() are still here: picking the biggest mover in
+        # one leg does not work, because on a busy map another player out-walks
+        # us, calibration locks onto them, and every later leg is thrown away
+        # as "not us" -- failing outright with a healthy character standing
+        # right there.
+        me = self.owner
+        pushes = ((1.0, 0.0), (0.0, 1.0)) if me else (
+            (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0),
+            (0.7, 0.7), (-0.7, 0.7))
         legs = []
-        for sx, sy in ((1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0),
-                       (0.7, 0.7), (-0.7, 0.7)):
+        for sx, sy in pushes:
             moved = push(sx, sy)
             if moved:
                 legs.append(((sx, sy), moved))
-        me = pick_me(legs)
+            if me and len(legs) >= 2:
+                break              # two non-parallel legs is a whole basis
+        if me is None:
+            me = pick_me(legs)
         if me is None:
             return False
 
@@ -1011,7 +1024,7 @@ class MemoryEyes:
             if dist < MEM_CAL_MIN:
                 continue                    # blocked that way; the wall is fine
             samples.append(((sx, sy), (dx, dz)))
-            if len(samples) >= MEM_CAL_LEGS:
+            if len(samples) >= (2 if self.owner else MEM_CAL_LEGS):
                 # Least squares over every leg that moved, not just two of them.
                 # In a fight the character gets shoved and stunned, so a single
                 # leg can be well off -- one bad push used to become the whole
@@ -1029,25 +1042,26 @@ class MemoryEyes:
                 return True
         return False
 
-    def _ensure_loot(self, mem):
-        """Find the LootDrop class once, by name, and cache the slot.
+    def _ensure_class(self, mem, label, why):
+        """Find one class by name once, and cache its slot as an RVA.
 
         Separate from heal() on purpose: the units can be perfectly healthy
-        while loot has never been looked up, since only a rediscovery ever
-        writes its RVA. Searching for the one name we are missing costs a
-        fraction of a full heal, and it happens once per patch.
+        while a class the bot never needed before has no cached slot at all,
+        and heal() only fires when the *monster* class is missing. Searching
+        for the single name we lack costs a fraction of a full heal, and it
+        happens once per patch.
         """
-        found = self.ms.find_classes(mem, {"loot": self.ms.CLASS_NAMES["loot"]})
-        if not found.get("loot"):
-            print("\nloot pickup: no LootDrop class found; pickup is off this "
-                  "session")
+        found = self.ms.find_classes(mem, {label: self.ms.CLASS_NAMES[label]})
+        if not found.get(label):
+            print(f"\n{why}: no {self.ms.CLASS_NAMES[label]} class "
+                  f"found; off this session")
             return False
         self.classes = dict(self.classes, **found)
-        rva = self.ms.class_slot_rva(mem, found["loot"])
+        rva = self.ms.class_slot_rva(mem, found[label])
         if rva:
-            cached = dict(self.ms.load_rva_cache(), loot=rva)
-            self.ms.save_rva_cache(cached)
-        print(f"\nloot pickup: LootDrop found at 0x{found['loot']:X}"
+            self.ms.save_rva_cache(dict(self.ms.load_rva_cache(), **{label: rva}))
+        print(f"\n{why}: {self.ms.CLASS_NAMES[label]} found at "
+              f"0x{found[label]:X}"
               + (f", slot cached (0x{rva:X})" if rva else ""))
         return True
 
@@ -1172,8 +1186,14 @@ class MemoryEyes:
                     found = self.ms.world_units(mem, regions=self.hot)
                     with self.lock:
                         self.units = found
+                    if self.owner is None and found:
+                        # Who we are, read instead of walked for: any unit
+                        # carries the managers, so this is a pointer walk with
+                        # nothing to search. Re-read whenever it is lost, since
+                        # a map change rebuilds the object.
+                        self.owner = self.ms.local_player(mem, found[0][1])
                     if LOOT_PICKUP and not self.classes.get("loot") and looked:
-                        looked = self._ensure_loot(mem)
+                        looked = self._ensure_class(mem, "loot", "loot pickup")
                     if LOOT_PICKUP and self.classes.get("loot"):
                         self._sweep_loot(mem)
                     if self.hot is None and found:
@@ -1913,6 +1933,55 @@ def demo():
         def _positions(self, addrs):
             return {a: (0.0, 0.0, 0.0) for a in addrs}   # we stand at origin
 
+    # The tests below own this setting: it is a user config, and a self-check
+    # that passes or fails depending on which items someone is farming today is
+    # worse than no self-check at all.
+    global LOOT_NAMES
+    kept_names, LOOT_NAMES = LOOT_NAMES, ()
+
+    # Calibration with our unit already known: it still has to measure what a
+    # push does, because that depends on the camera, but it no longer has to
+    # work out WHICH unit answered -- so two legs replace six.
+    class _Cal(MemoryEyes):
+        def __init__(self, owner):
+            self.owner, self.me, self.basis = owner, None, None
+            self.units = [("player", 0x1000, 0.0, 0.0, 0.0),
+                          ("player", 0x2000, 5.0, 0.0, 5.0)]
+            self.lock = threading.Lock()
+            self.spot = {0x1000: [0.0, 0.0], 0x2000: [5.0, 5.0]}
+            self.pushes = []
+
+        def _positions(self, addrs):
+            return {a: (self.spot[a][0], 0.0, self.spot[a][1]) for a in addrs
+                    if a in self.spot}
+
+    class _CalPad:
+        def __init__(self, eyes):
+            self.eyes = eyes
+
+        def stick(self, sx, sy, attack=False):
+            if sx or sy:
+                # our unit walks with the push; the other player wanders
+                self.eyes.spot[0x1000][0] += sx * 0.5
+                self.eyes.spot[0x1000][1] += sy * 0.5
+                self.eyes.spot[0x2000][0] += 0.9
+
+    kept_push = MEM_CAL_PUSH_S
+    globals()["MEM_CAL_PUSH_S"] = 0.01           # the clock is not under test
+    try:
+        cal = _Cal(0x1000)
+        cal.stick_log = []
+        assert cal.calibrate(_CalPad(cal)), "two legs should be a basis"
+        assert cal.me == 0x1000, cal.me
+        assert stick_for(cal.basis, 1.0, 0.0) is not None
+        # And without it, the old path still has to work -- that is the
+        # fallback whenever the walk to our unit comes back empty.
+        blind = _Cal(None)
+        assert blind.calibrate(_CalPad(blind)), "six-leg fallback"
+        assert blind.me == 0x1000, blind.me
+    finally:
+        globals()["MEM_CAL_PUSH_S"] = kept_push
+
     near_loot = _Loot(drops=[(0xA000, 5.0, 0.0, "Flax")])
     lsx, lsy, ld = near_loot.pick_loot(2.0)
     assert lsx is not None and abs(ld - 5.0) < 1e-6, (lsx, ld)
@@ -1943,7 +2012,6 @@ def demo():
 
     # The allowlist. Exact names only: "Axe" must not collect a "Battle Axe",
     # which a substring test would do and which is the whole reason for a list.
-    global LOOT_NAMES
     LOOT_NAMES = ("Flax", " slingshot ")
     try:
         assert wanted_item("Flax") and wanted_item("flax")
@@ -1962,6 +2030,7 @@ def demo():
     finally:
         LOOT_NAMES = ()
     assert wanted_item("anything at all"), "an empty list means take everything"
+    LOOT_NAMES = kept_names
 
     only_pooled = _Far(MEM_RANGE * 3, real=())     # nothing real at all
     assert only_pooled.target(1.0) == (None, None, None)

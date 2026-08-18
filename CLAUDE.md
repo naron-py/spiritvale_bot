@@ -111,6 +111,24 @@ adjusting them over adding code paths.
   `MEM_ENGAGE_MAX_S`, gives up, takes the next from the same pile — and walks
   straight back if you drag the character away. The test is *rendered*
   (`IsVisible`) **and** health above zero; neither alone is enough.
+- **Our own unit is read from the local connection, not searched for.**
+  `local_player()` walks any unit -> TransportManager -> NetworkManager ->
+  ClientManager -> the local NetworkConnection -> the one NetworkObject it owns
+  -> its PlayerController. Verified live: the unit it names tracked the
+  character at 14.3 units/s while walking and 0.00 while standing still. It
+  starts from a unit on purpose -- every unit is a NetworkBehaviour and carries
+  the managers, so no extra class has to be resolved. That matters because
+  `ClientManager` has **no slot in GameAssembly.dll to cache** (checked to a
+  0x20000000 span), so looking it up by name would cost minutes on every run
+  rather than once per patch.
+- **Calibration still has to walk, but only for the basis.** Knowing which unit
+  is ours removes half its job; what a stick push does to our position depends
+  on the camera angle and cannot be read from the unit list. With the owner
+  known it takes two legs instead of six (`pushes` in `calibrate()`), and
+  `stick_for()` normalizes, so only the rotation matters, never the scale.
+- **The six-leg fit is still the fallback, and must stay.** If the walk to our
+  unit comes back empty, `pick_me()` runs exactly as before. What follows is
+  why it works that way:
 - **Our own unit is identified by fit, never by who moved furthest.** On a busy
   map another player simply out-walks a 0.7s push, so the biggest-mover rule
   locked onto them and then threw every later leg away as "not us", failing
