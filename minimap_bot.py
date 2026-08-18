@@ -162,12 +162,13 @@ LOOT_TAP_GAP_S = 0.5     # between presses while standing on a drop
 # gone -- otherwise holds the bot on the spot pressing a trigger forever.
 LOOT_MAX_S = 6.0
 LOOT_IGNORE_S = 30.0
-# Which items to walk to, by the name the tooltip shows. Empty means every item
-# the bot can see. Matching ignores case and surrounding space; nothing else,
-# because a substring rule would make "Axe" collect a "Battle Axe" too.
+# Which items to walk to, matched against the name the tooltip shows. Empty
+# means every item the bot can see. Each entry is a case-insensitive substring,
+# so ("Card",) takes Bee Card, Rooster Card and any card added later; a full
+# name still works, and a short entry catches everything containing it.
 # `python memscan.py --loot` prints the names lying around you, which is the
 # list to write this from.
-LOOT_NAMES = ("Rooster Card", "Bee Card", "Sprount Card")          # e.g. ("Flax", "Slingshot", "Pioneer Relic")
+LOOT_NAMES = ("Sunborn", "Card", "Essence", "Gem" )          # e.g. ("Flax", "Slingshot", "Pioneer Relic")
 # The anchor/leash/patrol feature was cut as buggy: End is a plain toggle again
 # and the bot roams wherever the kills lead. It is in git history if the idea is
 # revisited -- the minimap scale tracking went with it, since sizing the leash
@@ -800,15 +801,19 @@ def stick_vector(dx, dy):
 def wanted_item(name):
     """Is this item one we walk to? Empty LOOT_NAMES means all of them.
 
-    Exact match on the tooltip name, case and padding aside. Deliberately not a
-    substring test: "Axe" would then also collect every "Battle Axe" on the map.
+    Substring, case-insensitive: "Card" collects "Bee Card", "Rooster Card" and
+    every other card, which is the point -- a whole family of items is usually
+    what you want and listing them one by one goes stale as the game adds more.
+    The cost is that a short entry catches more than it looks like it will
+    ("axe" also takes "Battle Axe"), so keep entries specific enough to mean it.
     """
     if not LOOT_NAMES:
         return True
-    # ("Flax") is a string, not a tuple -- the missing comma is easy to write
-    # and silently matched nothing, because the set became {'F','l','a','x'}.
+    # ("Card") is a string, not a tuple -- the missing comma is easy to write,
+    # and iterating it would test the letters 'C', 'a', 'r', 'd' one at a time.
     want = (LOOT_NAMES,) if isinstance(LOOT_NAMES, str) else LOOT_NAMES
-    return name.strip().lower() in {w.strip().lower() for w in want}
+    got = name.strip().lower()
+    return any(w.strip().lower() in got for w in want if w.strip())
 
 
 class MemoryEyes:
@@ -1000,6 +1005,8 @@ class MemoryEyes:
         # as "not us" -- failing outright with a healthy character standing
         # right there.
         me = self.owner
+        if me is not None and not any(u == me for _, u, *_ in self.units):
+            me = self.owner = None       # from before a relog; look again
         pushes = ((1.0, 0.0), (0.0, 1.0)) if me else (
             (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0),
             (0.7, 0.7), (-0.7, 0.7))
@@ -1245,6 +1252,17 @@ class MemoryEyes:
             # the whole heap, because the new objects need not be where the old
             # ones were.
             self.me = self.basis = self.hot = self.approach = None
+            # The owner is a pointer to the object that was just rebuilt, so it
+            # is as dead as the rest. It is also what the scanner checks before
+            # looking us up again, so leaving it set meant we never recovered.
+            self.owner = None
+            # Same reason as `hot`: the drops that survive a relog need not be
+            # in the regions the old ones were, and a narrowed sweep that finds
+            # nothing keeps finding nothing.
+            self.hot_loot = None
+            with self.lock:
+                self.loot = {}
+            self.loot_target = self.loot_since = None
             self.chasing = self.engaged_since = None
             self.ignored = {}
             self.seen_at, self.fight_ok = {}, {}
@@ -1974,6 +1992,12 @@ def demo():
         assert cal.calibrate(_CalPad(cal)), "two legs should be a basis"
         assert cal.me == 0x1000, cal.me
         assert stick_for(cal.basis, 1.0, 0.0) is not None
+        # An owner that is no longer in the unit list is a leftover from
+        # before a relog, and trusting it means every leg is thrown away.
+        stale = _Cal(0xDEAD)
+        assert stale.calibrate(_CalPad(stale)), "stale owner must not stick"
+        assert stale.me == 0x1000, stale.me
+
         # And without it, the old path still has to work -- that is the
         # fallback whenever the walk to our unit comes back empty.
         blind = _Cal(None)
@@ -2010,23 +2034,26 @@ def demo():
     assert stuck_loot.loot_mode == "loot skip", stuck_loot.loot_mode
     assert 0xA000 in stuck_loot.loot_ignored
 
-    # The allowlist. Exact names only: "Axe" must not collect a "Battle Axe",
-    # which a substring test would do and which is the whole reason for a list.
-    LOOT_NAMES = ("Flax", " slingshot ")
+    # The allowlist: case-insensitive substrings, so one entry covers a family.
+    LOOT_NAMES = ("card", " Flax ")
     try:
-        assert wanted_item("Flax") and wanted_item("flax")
-        assert wanted_item("Slingshot"), "matching ignores case and padding"
-        assert not wanted_item("Battle Axe") and not wanted_item("Axe")
-        picky = _Loot(drops=[(0xA000, 1.0, 0.0, "Axe"),
-                             (0xB000, 9.0, 0.0, "Flax")])
+        assert wanted_item("Bee Card") and wanted_item("Rooster Card")
+        assert wanted_item("flax"), "matching ignores case and padding"
+        assert not wanted_item("Slingshot")
+        picky = _Loot(drops=[(0xA000, 1.0, 0.0, "Slingshot"),
+                             (0xB000, 9.0, 0.0, "Sprount Card")])
         _, _, pd = picky.pick_loot(2.0)
-        assert picky.loot_name == "Flax" and abs(pd - 9.0) < 1e-6, picky.loot_name
-        only_junk = _Loot(drops=[(0xA000, 1.0, 0.0, "Battle Axe")])
+        assert picky.loot_name == "Sprount Card", picky.loot_name
+        assert abs(pd - 9.0) < 1e-6, pd
+        only_junk = _Loot(drops=[(0xA000, 1.0, 0.0, "Broad Sword")])
         assert only_junk.pick_loot(2.0) == (None, None, None)
-        # One name without the trailing comma is a string, and read as a list
-        # of letters it matched nothing at all -- silently collecting nothing.
-        LOOT_NAMES = ("Flax")
-        assert wanted_item("Flax") and not wanted_item("Axe")
+        # One name without the trailing comma is a string; iterating it would
+        # test single letters, and 'C' alone would match half the map.
+        LOOT_NAMES = ("Card")
+        assert wanted_item("Bee Card") and not wanted_item("Potions")
+        # An empty entry must not turn into "everything contains ''".
+        LOOT_NAMES = ("", "Card")
+        assert wanted_item("Bee Card") and not wanted_item("Potions")
     finally:
         LOOT_NAMES = ()
     assert wanted_item("anything at all"), "an empty list means take everything"
@@ -2088,6 +2115,13 @@ def demo():
         assert blind.me and blind.mode == "lost", (i, blind.mode)
     blind.target(99.0)                         # one miss too many: unit is gone
     assert blind.me is None and blind.mode == "no unit", blind.mode
+    # A relog rebuilds our unit, so the pointer read from the connection is as
+    # dead as the rest. Leaving it set meant the scanner never looked it up
+    # again (it only reads when owner is None) and calibration kept pushing on
+    # behalf of an object that no longer existed -- "no unit moved when pushed"
+    # every 15s, forever, with a healthy character standing there.
+    assert blind.owner is None, "the stale owner must go with the unit"
+
 
     # Giving up on a target that will not die. Without this the bot parks on the
     # spot swinging forever, which is indistinguishable from a hung bot.
