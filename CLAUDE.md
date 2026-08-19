@@ -27,6 +27,7 @@ python minimap_bot.py --snap       # dump minimap_snap.png with detections drawn
 python minimap_bot.py --test       # walk a blind circle: isolates pad vs vision
 python minimap_bot.py --buff [hold] [gap]   # fire buff sequence once
 python minimap_bot.py --probe      # press every X360 button in turn, named
+python minimap_bot.py --walklog    # what the wall sensor sees, every frame
 
 python memscan.py --demo           # memory layer self-check, no game needed
 python memscan.py --units          # list what the unit sweep classifies right now
@@ -77,7 +78,18 @@ scanning at the bottom of the file — no argparse in `minimap_bot.py`.
    within `LOOT_RANGE` whose name passes `wanted_item()` (`LOOT_NAMES`), and
    `LOOT_BUTTON` (left trigger) is tapped on arrival. Loot is only consulted
    when the monster path has nothing or is `far` -- never mid-fight.
-4. **Pad backends** — `VirtualPad` (vgamepad/ViGEmBus, XInput) and `ArduinoPad`
+4. **Walk map** — `WalkMap` is a coarse grid over world (x, z) recording where the
+   character can and cannot go. Walls come from our own movement: the cell ahead
+   is blocked when travel *projected onto the commanded direction* stays under
+   `WALK_BLOCK_PROGRESS` for `WALK_BLOCK_FRAMES` (`observe()`, fed the actually
+   issued stick by `observe_move()`). Floor comes from the background sweep —
+   `paint()` takes every unit that moved since the last one, since they walk the
+   same navmesh we do. `MemoryEyes.route_to()` keeps the straight line unless it
+   crosses a known wall, then runs a weighted search that prefers floor and
+   steers at a waypoint; a goal with no route at all is blacklisted (`walled`).
+   Both channels persist to `walkmap.json` (gitignored) from the background
+   thread. `PATHFIND = False` turns all of it off; `--walklog` shows the sensor.
+5. **Pad backends** — `VirtualPad` (vgamepad/ViGEmBus, XInput) and `ArduinoPad`
    (serial to a Leonardo). Duck-typed, same methods: `stick(sx, sy, attack)`,
    `tap_dpad(name, hold)`, `tap_trigger(name, hold)`, `close()`. Pick a backend by adding a class with those
    three methods; nothing else in the file knows the difference.
@@ -164,6 +176,75 @@ adjusting them over adding code paths.
 - **Every mode assignment must be honest, including the early returns.** Leaving
   a stale `mode` made a bot with no unit at all report `chasing` while motionless,
   and sent the investigation to the wrong place.
+
+### Walking round walls
+
+- **There is no grid in this game, and the question is settled — do not reopen
+  it without new information.** Checked against the shipped
+  `SpiritVale_Data\il2cpp_data\Metadata\global-metadata.dat`, which carries
+  every IL2CPP class and field name as plain ASCII. A* Pathfinding Project is
+  absent outright (no `AstarPath`, `GridGraph`, `GridNode`, `RecastGraph`,
+  `GraphNode`), as are `Pathfinder`, `MapGrid`, `GridManager`, `CollisionMap`,
+  `ObstacleMap`, `WalkableArea`. Every `Grid`/`Tile` name that *is* there
+  belongs to something else: FishNet's `HashGrid` observer spatial hashing,
+  MongoDB `GridFS*`, Unity UI `GridLayoutGroup`, Unity 2D `ITilemap`.
+  Walkability is a **Unity NavMesh** — the game's own `_App` helper calls
+  `SnapToNavMesh`, `TryGetNavMeshPosition`, `GetNavMeshManager`, and
+  `com.unity.ai.navigation` ships with it. Two ways to use that were rejected:
+  the polygons are native Detour structures inside `UnityPlayer.dll`
+  (undocumented, moves with the Unity version, days of work), and querying it
+  properly means calling `CalculatePathInternal` in-process, which needs
+  `VM_WRITE` and injected code and would end this bot's read-only guarantee.
+- **So the walkable area is learned, from two readings that cost nothing.** Our
+  own position against the stick we sent says where a wall is; every *other*
+  unit's position says where floor is, because monsters and players walk the
+  same navmesh and the sweep already carries hundreds of them.
+- **Progress, not speed, is what a wall takes away.** The first version marked a
+  wall when per-frame travel fell under a floor — and learned almost nothing,
+  because Unity slides a character along the collider it is pushed into, so
+  travel stays near full pace while no ground is gained. The honest test is the
+  projection of actual travel onto the direction we asked for
+  (`WALK_BLOCK_PROGRESS`): head-on gives ~0, a 45° slide gives ~0.5 and is real
+  headway that must not be marked. `--walklog` prints that number every frame
+  and is how the constant is set.
+- **Floor from other units is evidence, not proof, and must never clear a
+  wall.** A cell is 1.5 units wide and a monster on the far side of a thin wall
+  shares its edge; letting that erase a wall we measured gives a
+  mark-clear-mark ping-pong. Only our own feet (`free()`) clear a blocked cell.
+  For the same reason only units that **moved** since the last sweep count — a
+  pooled monster keeps its last position and full health, and one parked inside
+  scenery would paint floor that is not there.
+- **A cell never visited must route as passable.** Treating unknown as solid
+  means a fresh map can only ever walk inside the room it started in, which is
+  worse than no pathfinding. Only cells proven blocked are impassable, and only
+  those are saved.
+- **Walls are only learned while walking somewhere** (`chasing`, `far`, `loot`).
+  Standing still is *correct* in every other mode — the orbit holds position on
+  purpose, a dead or lost unit sends no stick — and marking from those states
+  fills the map with fiction centred wherever the bot happened to stop.
+- **One sighting is not a wall.** Another player or a monster in a doorway reads
+  exactly like stone. `WALK_BLOCK_HITS`, `WALK_DECAY_S`, and clearing any cell
+  the character later stands in are what stop bodies from sealing the map. A
+  wrong mark that nothing corrects is worse than no map at all.
+- **Route failure returns the target, never a zero stick.** `main()` reads a
+  zero stick as handled and never falls through, so an unreachable goal must
+  degrade to a straight walk. The one exception is a goal proven *walled off*:
+  `route()` sets `capped` to say whether it ran out of budget or of map, and
+  only a genuine dead end (`eyes.sealed`) blacklists the monster and reports
+  `walled`. Running out of corridor must never do that — the wall may simply be
+  longer than the search.
+- **The search is bounded to a corridor round the straight line** (`WALK_PAD`).
+  Unbounded it spreads through unknown space in every direction: measured at
+  9.7 ms against a 50 ms frame, ~3 ms bounded. It replans at most every
+  `WALK_REPLAN_S`, and `crossed()` — the per-frame question — is 1 µs.
+- **Steps are weighted (Dijkstra), not free (BFS).** Floor costs
+  `WALK_FLOOR_COST`, unknown `WALK_UNKNOWN_COST` — preferred, not forbidden, or
+  the bot could never explore. Distance has to stay in the cost: an earlier
+  0-1 BFS made proven floor free, every route through it cost the same, and a
+  12-unit trip came back as a 170-point snake instead of 14.
+- **Routing does not get its own `mode`.** It sets `eyes.routing` and prints a
+  `~` instead. `mode` is read by the loot arbitration (`far` gives loot its
+  turn) and by the wall learner, and a fifth value silently changed both.
 
 ### Loot pickup
 
@@ -351,6 +432,9 @@ pywin32, proportional stick) kept for reference — new work goes in `minimap_bo
 
 `il2cpp_rva.json` is a generated cache of rediscovered class slots. Gitignored, and
 safe to delete — the bot searches again and rewrites it.
+
+`walkmap.json` is the learned wall map. Gitignored, and safe to delete — the bot
+relearns it, worse for a while. Delete it after a map change that moves geometry.
 
 ## Style
 

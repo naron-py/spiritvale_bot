@@ -9,6 +9,8 @@ usage:
   python minimap_bot.py --port COM5   # Arduino Leonardo
   python minimap_bot.py --demo        # offline self-check
 """
+import heapq
+import json
 import math
 import os
 import struct
@@ -208,6 +210,52 @@ CAMERA_CHECK = True      # False skips the startup measurement entirely
 CAMERA_MAX_DEG = 20      # refuse to run past this; relog to reset the camera
 CAMERA_LEG_S = 0.8       # per direction, four of them
 LOOP_HZ = 20
+
+# Walking round walls. There is no grid to read: checked against the game's own
+# global-metadata.dat, which carries every class name as plain text. A* Pathfinding
+# Project is absent entirely, and every Grid/Tile name in there belongs to something
+# else -- FishNet's observer spatial hash, MongoDB GridFS, Unity UI. Walkability is
+# a Unity NavMesh (the game calls SnapToNavMesh / TryGetNavMeshPosition), whose
+# polygons are native Detour structures in UnityPlayer.dll: undocumented, moves with
+# the Unity version, and properly queryable only by calling into the process, which
+# would end this bot's read-only guarantee. So the walkable area is *learned*
+# instead, from two readings that cost nothing:
+#   - our own position against the stick we sent: no headway means a wall ahead
+#   - every other unit's position: monsters and players walk on that same navmesh,
+#     so anything that moved between sweeps has just proven its ground walkable
+# Cells nothing has ever touched still route as passable, or a fresh map could never
+# leave the spot it started on.
+PATHFIND = True
+WALK_CELL = 1.5          # world units per grid cell; under MEM_ARRIVE (2.5)
+# Walking is ~14.3 units/s measured, so ~0.7 units per frame at LOOP_HZ. Speed is
+# the wrong test: Unity slides a character along the wall it is pushed into, so
+# travel stays near full while nothing is gained. What a wall actually takes away
+# is *progress along the direction we asked for*. Head-on gives 0, a 45-degree
+# slide gives ~0.5 and is real headway, so this sits between them.
+# ponytail: a calibration knob, not a measurement -- --walklog prints the number.
+WALK_BLOCK_PROGRESS = 0.25   # world units per frame, projected onto the push
+WALK_BLOCK_FRAMES = 6    # consecutive such frames before calling it a wall
+WALK_BLOCK_AHEAD = 2.0   # world units ahead of us the wall gets marked
+# Another player or a monster standing in the way reads exactly like a wall.
+# Two sightings, a decay, and clearing any cell we later stand in are what stop
+# those from rotting into the map permanently.
+WALK_BLOCK_HITS = 2      # observations before a cell is really blocked
+WALK_DECAY_S = 300.0     # a blocked mark this old is forgotten
+WALK_REPLAN_S = 0.5      # recompute a route at most this often
+WALK_WAYPOINT = 3.0      # aim this far along the route
+# What a step costs the router. Ground something has walked on is cheaper than
+# ground nothing has, so a route prefers proven floor -- but unknown is only
+# three times the price, not forbidden, or the bot would never explore.
+WALK_FLOOR_COST = 1
+WALK_UNKNOWN_COST = 3
+WALK_MAX_CELLS = 4000    # search expansion ceiling; past it, walk straight
+WALK_PAD = 12            # cells of detour room either side of the straight line
+WALK_FILE = "walkmap.json"
+WALK_SAVE_S = 30.0       # the map is written from the scanner thread
+# ponytail: floor grows without bound over weeks of play; at the cap it simply
+# stops taking new cells. Age them out if that ever turns out to matter.
+WALK_FLOOR_MAX = 200000  # cells of proven floor kept, ~2 MB of JSON
+WALK_LOG = "--walklog" in sys.argv   # print what the wall sensor sees
 
 
 def wake_controller(pad):
@@ -652,6 +700,246 @@ class TargetLock:
         return self.current
 
 
+class WalkMap:
+    """Where the character can and cannot walk, learned while it walks.
+
+    A coarse grid over world (x, z). Three states: blocked, floor, and never
+    seen -- and never-seen routes as passable, so the bot explores instead of
+    refusing to move on a fresh map.
+
+    Floor comes from two sources with different authority. Standing somewhere
+    proves it walkable and clears anything we believed before. *Another* unit
+    standing there proves the navmesh reaches it -- monsters and players walk on
+    the same surface we do -- but a cell is 1.5 units wide and a monster on the
+    far side of a thin wall shares its edge, so their evidence never erases a
+    wall we measured. It only makes the route prefer that ground.
+    """
+
+    def __init__(self, path=WALK_FILE, cell=WALK_CELL):
+        self.path, self.cell = path, cell
+        self.hits = {}            # (cx, cz) -> [sightings, last seen]
+        self.floor = set()        # (cx, cz) something has walked in
+        self.lock = threading.Lock()
+        self.still = 0            # frames in a row we asked to move and did not
+        self.last_pos = None      # our position at the previous observation
+        self.capped = False       # the last route ran out of budget, not of map
+        self.dirty = False
+
+    # -- the grid -----------------------------------------------------------
+    def at(self, x, z):
+        return (math.floor(x / self.cell), math.floor(z / self.cell))
+
+    def centre(self, c):
+        return ((c[0] + 0.5) * self.cell, (c[1] + 0.5) * self.cell)
+
+    def free(self, x, z):
+        """We are standing here, so whatever we thought before was wrong."""
+        c = self.at(x, z)
+        with self.lock:
+            if self.hits.pop(c, None) is not None or c not in self.floor:
+                self.dirty = True
+            self.floor.add(c)
+
+    def paint(self, moved):
+        """Cells other units walked in. Evidence of floor, not proof of no wall.
+
+        Everything alive stands on the same navmesh we do, and the background
+        sweep already carries hundreds of positions -- so the walkable area
+        fills in from other people's traffic, including where the bot has never
+        been. Only units that actually moved count: a pooled monster keeps its
+        last position and full health, and one parked inside scenery would paint
+        floor that is not there.
+        """
+        with self.lock:
+            if len(self.floor) >= WALK_FLOOR_MAX:
+                return 0
+            before = len(self.floor)
+            self.floor.update(self.at(x, z) for x, z in moved)
+            grew = len(self.floor) - before
+            self.dirty = self.dirty or bool(grew)
+        return grew
+
+    def block(self, x, z, now):
+        with self.lock:
+            e = self.hits.setdefault(self.at(x, z), [0, now])
+            e[0] += 1
+            e[1] = now
+            self.dirty = True
+
+    def blocked(self, c, now):
+        e = self.hits.get(c)
+        return bool(e and e[0] >= WALK_BLOCK_HITS and now - e[1] < WALK_DECAY_S)
+
+    def crossed(self, x0, z0, x1, z1, now):
+        """Is there a known wall on the straight line to there?
+
+        This is the per-frame question, and the answer is almost always no --
+        which is what keeps the straight line as the default and the whole
+        feature inert until something has actually been learned.
+        """
+        d = math.hypot(x1 - x0, z1 - z0)
+        steps = int(d / (self.cell / 2)) + 1
+        for i in range(steps + 1):
+            t = i / steps
+            if self.blocked(self.at(x0 + (x1 - x0) * t, z0 + (z1 - z0) * t), now):
+                return True
+        return False
+
+    # -- routing ------------------------------------------------------------
+    def route(self, px, pz, tx, tz, now):
+        """World points from here to there avoiding known walls, or None.
+
+        Dijkstra on an 8-connected grid, a cell something has walked in costing
+        `WALK_FLOOR_COST` and an unknown one `WALK_UNKNOWN_COST`. Weights rather
+        than a plain BFS so the route hugs ground proven walkable; distance
+        still in the cost so it does not wander -- free floor made every route
+        of equal price and the answer came back as a 170-point snake.
+
+        None means no path. `capped` then says which kind: True if the search
+        ran out of budget or corridor, False if the goal is genuinely walled
+        off -- which is worth giving up on the monster for.
+        """
+        self.capped = False
+        start, goal = self.at(px, pz), self.at(tx, tz)
+        if start == goal:
+            return [(tx, tz)]
+        # Unbounded, the search spreads through unknown space in every
+        # direction: measured at 9.7 ms, which is a fifth of the frame budget.
+        # A detour worth taking stays near the line, so search a corridor round
+        # it. Anything needing more than that is a straight walk's problem.
+        lo = (min(start[0], goal[0]) - WALK_PAD, min(start[1], goal[1]) - WALK_PAD)
+        hi = (max(start[0], goal[0]) + WALK_PAD, max(start[1], goal[1]) + WALK_PAD)
+        cost, prev = {start: 0}, {start: None}
+        queue = [(0, start)]
+        steps, walled = 0, True
+        while queue:
+            here, c = heapq.heappop(queue)
+            if here > cost.get(c, 1 << 30):
+                continue                     # a cheaper way here was found later
+            steps += 1
+            if steps > WALK_MAX_CELLS:
+                self.capped = True
+                return None
+            if c == goal:
+                # Popped, not pushed: a cell can be reached again more cheaply,
+                # so only the pop is final.
+                path, at = [(tx, tz)], prev[c]
+                while at is not None:
+                    path.append(self.centre(at))
+                    at = prev[at]
+                path.reverse()
+                return path[1:]              # drop the cell we are standing in
+            for dx in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    n = (c[0] + dx, c[1] + dz)
+                    if not (lo[0] <= n[0] <= hi[0] and lo[1] <= n[1] <= hi[1]):
+                        walled = False       # the corridor stopped us, not a wall
+                        continue
+                    if self.blocked(n, now):
+                        continue
+                    step = here + (WALK_FLOOR_COST if n in self.floor
+                                   else WALK_UNKNOWN_COST)
+                    if step >= cost.get(n, 1 << 30):
+                        continue
+                    cost[n], prev[n] = step, c
+                    heapq.heappush(queue, (step, n))
+        # Exhausted. If the corridor never got in the way, the goal really is
+        # walled off from here and the monster is not worth walking at.
+        self.capped = not walled
+        return None
+
+    def waypoint(self, px, pz, path):
+        """The first point far enough along to steer at without wobbling."""
+        for x, z in path:
+            if math.hypot(x - px, z - pz) >= WALK_WAYPOINT:
+                return x, z
+        return path[-1]
+
+    # -- learning -----------------------------------------------------------
+    def observe(self, now, px, pz, sx, sy, basis, mode):
+        """Record floor under us, and a wall ahead when a push goes nowhere.
+
+        Only while actually walking somewhere. Standing still is *correct* in
+        every other mode -- the orbit holds position on purpose, a dead or lost
+        unit issues no stick at all -- and marking walls from those states fills
+        the map with fiction centred on wherever the bot happened to stop.
+        """
+        if mode not in ("chasing", "far", "loot"):
+            self.still, self.last_pos = 0, None
+            return None
+        self.free(px, pz)
+        was, self.last_pos = self.last_pos, (px, pz)
+        if was is None or not basis or not (sx or sy):
+            self.still = 0
+            return None
+        wx, wz = world_for(basis, sx, sy)
+        n = math.hypot(wx, wz)
+        if n < 1e-9:
+            self.still = 0
+            return None
+        ux, uz = wx / n, wz / n
+        # Speed is not the test. Pushed into a wall the game slides the
+        # character along it at nearly full pace, so travel stays high while
+        # nothing is gained -- which is why measuring speed learned almost no
+        # walls at all. What a wall takes away is progress along the direction
+        # we asked for, and a slide takes away all of it.
+        progress = (px - was[0]) * ux + (pz - was[1]) * uz
+        if progress >= WALK_BLOCK_PROGRESS:
+            self.still = 0
+        else:
+            self.still += 1
+        if WALK_LOG:
+            # speed against progress is the whole diagnosis: a slide keeps the
+            # first and loses the second, which is what a plain speed test missed.
+            print(f"\nwalklog push ({ux:5.2f},{uz:5.2f}) moved "
+                  f"({px - was[0]:5.2f},{pz - was[1]:5.2f}) speed "
+                  f"{math.hypot(px - was[0], pz - was[1]):5.2f} progress "
+                  f"{progress:5.2f} still {self.still}")
+        if not self.still:
+            return None
+        if self.still < WALK_BLOCK_FRAMES:
+            return None
+        self.still = 0
+        bx, bz = px + ux * WALK_BLOCK_AHEAD, pz + uz * WALK_BLOCK_AHEAD
+        self.block(bx, bz, now)
+        if WALK_LOG:
+            print(f"\nwalklog WALL at {self.at(bx, bz)}")
+        return self.at(bx, bz)
+
+    def forget_walk(self):
+        """Our unit changed or the bot was paused; the world did not."""
+        self.still, self.last_pos = 0, None
+
+    # -- persistence --------------------------------------------------------
+    def load(self):
+        try:
+            with open(self.path) as f:
+                blob = json.load(f)
+        except (OSError, ValueError):
+            return self
+        # A file written at another cell size cannot be rescaled honestly, and
+        # pretending otherwise puts walls where there are none.
+        if blob.get("cell") != self.cell:
+            return self
+        self.hits = {(c[0], c[1]): [c[2], c[3]] for c in blob.get("blocked", ())}
+        self.floor = {(c[0], c[1]) for c in blob.get("floor", ())}
+        return self
+
+    def save(self):
+        with self.lock:
+            if not self.dirty:
+                return False
+            rows = [[c[0], c[1], e[0], e[1]] for c, e in self.hits.items()]
+            floor = [[c[0], c[1]] for c in self.floor]
+            self.dirty = False
+        try:
+            with open(self.path, "w") as f:
+                json.dump({"cell": self.cell, "blocked": rows, "floor": floor}, f)
+        except OSError:
+            return False
+        return True
+
+
 class StuckWatchdog:
     """Report a locked target that has not become meaningfully closer in time."""
 
@@ -765,6 +1053,17 @@ def stick_for(basis, dx, dz):
     return sx / n * SPEED, sy / n * SPEED
 
 
+def world_for(basis, sx, sy):
+    """World travel a stick push produces -- `basis` used forwards.
+
+    stick_for() inverts it to answer "which way do I push"; this asks the other
+    question, "where was I trying to go", which is what names the cell a wall
+    sits in when a push goes nowhere.
+    """
+    (a, b), (c, d) = basis
+    return a * sx + b * sy, c * sx + d * sy
+
+
 def stale_target(now, engaged_since, limit=MEM_ENGAGE_MAX_S):
     """True once we have been on one target longer than it should take to die.
 
@@ -858,6 +1157,13 @@ class MemoryEyes:
     already found. Spawns show up a refresh late, which at this range is nothing.
     """
 
+    # Class-level so a half-built instance -- demo()'s stubs assemble their own
+    # state -- routes straight instead of raising. No map means no detour.
+    walk = None
+    path = path_to = last_pos = None
+    path_at = 0.0
+    routing = sealed = False
+
     def __init__(self):
         import memscan
         self.ms = memscan
@@ -886,6 +1192,13 @@ class MemoryEyes:
         self.loot_ignored = {}    # drop -> time it becomes fair game again
         self.loot_mode = "no loot"
         self.hot_loot = None      # regions worth sweeping for loot
+        self.walk = WalkMap().load()   # learned walls; the world, not our unit
+        self.path = None          # cells to the current goal, world points
+        self.path_at = 0.0        # when it was planned
+        self.path_to = None       # what it was planned toward
+        self.last_pos = None      # our (x, z) this frame, for the walk map
+        self.routing = False      # steering at a waypoint, not at the target
+        self.sealed = False       # the last goal had no route to it at all
         self.scanner = None
         self.stop = None
         self.lock = threading.Lock()
@@ -1168,6 +1481,7 @@ class MemoryEyes:
             self.loot_mode = "no loot"
             return None, None, None
         px, _, pz = here
+        self.last_pos = (px, pz)
         with self.lock:
             drops = list(self.loot.items())
         ranked = sorted((((x - px) ** 2 + (z - pz) ** 2) ** 0.5, d, x, z, n)
@@ -1196,7 +1510,8 @@ class MemoryEyes:
         if dist <= LOOT_ARRIVE:
             self.loot_mode = "loot get"
             return 0.0, 0.0, dist
-        s = stick_for(self.basis, x - px, z - pz)
+        gx, gz = self.route_to(now, px, pz, x, z)
+        s = stick_for(self.basis, gx - px, gz - pz)
         if not s:
             self.loot_mode = "no loot"
             return None, None, None
@@ -1218,6 +1533,9 @@ class MemoryEyes:
         def sweep():
             mem = self.ms.Mem(self.mem.pid)
             looked = True         # loot class not looked up yet; once only
+            saved = 0.0           # the walk map is written from here, not the
+                                  # 50 ms frame, and only when it changed
+            before = {}           # last sweep's positions, to spot who moved
             try:
                 if not self.available():
                     self.heal(mem)
@@ -1238,6 +1556,18 @@ class MemoryEyes:
                         looked = self._ensure_class(mem, "loot", "loot pickup")
                     if LOOT_PICKUP and self.classes.get("loot"):
                         self._sweep_loot(mem)
+                    if PATHFIND:
+                        # Everything alive walks the same navmesh we do, so a
+                        # unit that moved since the last sweep has just proven
+                        # its ground walkable. Free floor, hundreds of cells at
+                        # a time, in places the bot has never been.
+                        walkers = [(x, z) for _, u, x, _, z in found
+                                   if u in before and before[u] != (x, z)]
+                        before = {u: (x, z) for _, u, x, _, z in found}
+                        self.walk.paint(walkers)
+                        if time.time() - saved >= WALK_SAVE_S:
+                            self.walk.save()
+                            saved = time.time()
                     if self.hot is None and found:
                         # Narrow the next sweep to where the units turned out to
                         # be, rather than paying for the whole heap every time.
@@ -1263,6 +1593,54 @@ class MemoryEyes:
 
         self.scanner = threading.Thread(target=loop, daemon=True)
         self.scanner.start()
+
+    def route_to(self, now, px, pz, tx, tz):
+        """Where to actually steer -- the target, or a way round a known wall.
+
+        The straight line is the default and stays it: a route is only planned
+        when the line crosses something the map says is solid. A failed plan
+        returns the target too, so the worst case is exactly today's behaviour
+        and MEM_ENGAGE_MAX_S gives up as it always did. Never returns nothing:
+        main() reads a zero stick as handled and parks the bot.
+        """
+        self.routing = self.sealed = False
+        if not (PATHFIND and self.walk):
+            return tx, tz
+        if not self.walk.crossed(px, pz, tx, tz, now):
+            self.path = None
+            return tx, tz
+        fresh = (self.path and now - self.path_at < WALK_REPLAN_S
+                 and self.path_to
+                 and math.hypot(tx - self.path_to[0], tz - self.path_to[1])
+                 < WALK_WAYPOINT)
+        if not fresh:
+            self.path = self.walk.route(px, pz, tx, tz, now)
+            self.path_at, self.path_to = now, (tx, tz)
+        if not self.path:
+            # No path at all, and the search was not merely out of budget: the
+            # goal is walled off from here. Say so, so the caller can drop the
+            # monster instead of leaning on the wall for MEM_ENGAGE_MAX_S.
+            self.sealed = not self.walk.capped
+            return tx, tz
+        self.routing = True
+        return self.walk.waypoint(px, pz, self.path)
+
+    def observe_move(self, now, sx, sy):
+        """Feed the walk map the stick that actually went out this frame.
+
+        It has to be the issued one, not the one target() computed: loot can
+        win the arbitration, and a wall learned against a stick we never sent
+        would sit in the map at the wrong angle.
+        """
+        if not (PATHFIND and self.walk and self.last_pos and self.basis):
+            return None
+        px, pz = self.last_pos
+        mode = self.loot_mode if self.mode == "no monster" else self.mode
+        hit = self.walk.observe(now, px, pz, sx or 0.0, sy or 0.0,
+                                self.basis, mode)
+        if hit:
+            self.path = None            # a new wall: the old route is a lie
+        return hit
 
     def _orbit_way(self, now, px, pz):
         """Which way round the target to go. Reverses when the circle stops
@@ -1328,12 +1706,18 @@ class MemoryEyes:
             self.chasing = self.engaged_since = None
             self.ignored = {}
             self.seen_at, self.fight_ok = {}, {}
+            # The route and the travel history belong to a unit that is gone;
+            # the map itself describes the world and stays.
+            self.path = self.last_pos = None
+            if self.walk:
+                self.walk.forget_walk()
             self.mode = "no unit"
             with self.lock:
                 self.units = []
             return None, None, None
         self.misses = 0
         px, _, pz = here
+        self.last_pos = (px, pz)
         if not self.ms.worth_fighting(self.mem, self.me):
             # We are dead (or not rendered). Swinging at things from a corpse
             # looks exactly like a bot that cannot kill anything -- it cost a
@@ -1413,7 +1797,16 @@ class MemoryEyes:
             ox, oy = ox + rx * pull, oy + ry * pull
             n = math.hypot(ox, oy) or 1.0
             return ox / n * MEM_ORBIT_SPEED, oy / n * MEM_ORBIT_SPEED, dist
-        s = stick_for(self.basis, hit[1] - px, hit[3] - pz)
+        gx, gz = self.route_to(now, px, pz, hit[1], hit[3])
+        if self.sealed:
+            # Walled off with no way round: walking at it is eight seconds of
+            # pressing into stone before MEM_ENGAGE_MAX_S notices. There are
+            # other monsters.
+            self.ignored[hit[0]] = now + MEM_IGNORE_S
+            self.chasing = self.engaged_since = None
+            self.mode = "walled"
+            return None, None, None
+        s = stick_for(self.basis, gx - px, gz - pz)
         if not s:
             return None, None, None
         self.approach = s                # remembered for the back-off above
@@ -1623,6 +2016,10 @@ def main(port=None):
                         # from before the pause is stale by the time we resume.
                         eyes.loot_target = eyes.loot_since = None
                         eyes.loot_mode = "no loot"
+                        # The route is stale for the same reason; the walls it
+                        # avoided are not, so the map itself is left alone.
+                        eyes.path = eyes.last_pos = None
+                        eyes.walk.forget_walk()
                     print(f"\n{'STOPPED' if paused else 'STARTED'} (End)")
                     if (not paused and eyes is not None and
                             (eyes.scanner is None
@@ -1775,6 +2172,7 @@ def main(port=None):
                         state = {"no unit": "no unit  ",
                                  "lost": "lost     ",
                                  "dead": "DEAD     ",
+                                 "walled": "walled   ",
                                  "gave up": "gave up  "}.get(eyes.mode,
                                                              "no monster")
                     else:
@@ -1783,9 +2181,14 @@ def main(port=None):
                             got = "get" if eyes.loot_mode == "loot get" else ""
                             state = f"{eyes.loot_name[:9]:9}{got:3}{mdist:5.1f}"
                         else:
+                            # "~" says the bot is walking round a known wall
+                            # rather than at the monster, which is the only
+                            # thing routing looks like from the outside.
                             state = {"on it": "on it  ",
                                      "far": "far    "}.get(eyes.mode,
-                                                           "dist  ") + f"{mdist:6.1f}"
+                                                           "dist  ") + (
+                                f"{mdist:6.1f}" if not eyes.routing
+                                else f"{mdist:5.1f}~")
 
                 # Everything below is the pixel path, used when memory targeting
                 # is off or has gone stale. It is left exactly as it was.
@@ -1832,6 +2235,11 @@ def main(port=None):
 
                 # L1 held down continuously. Set ATTACK_MASH to mash it instead.
                 atk = (now % ATTACK_PERIOD_S) < ATTACK_HOLD_S if ATTACK_MASH else True
+                if eyes is not None:
+                    # The stick that actually goes out is the one the walk map
+                    # can learn a wall from -- loot may have won the arbitration
+                    # above, and target()'s own vector was never sent.
+                    eyes.observe_move(now, sx, sy)
                 pad.stick(sx, sy, atk)
 
                 # One d-pad press per pass, spaced by BUFF_GAP_S. The stick and L1
@@ -2501,6 +2909,146 @@ def demo():
     pad.tap_button("y")           # by name
     pad.tap_button(3)             # same button by index
     assert sent == [b"B3\n", b"B3\n"], sent
+
+    # --- the walk map ----------------------------------------------------
+    # One sighting is not a wall: another player standing in a doorway would
+    # otherwise seal it permanently.
+    wm = WalkMap(path=os.devnull)
+    wm.block(10.0, 10.0, 100.0)
+    assert not wm.blocked(wm.at(10.0, 10.0), 100.0), "one sighting is not a wall"
+    wm.block(10.0, 10.0, 100.0)
+    assert wm.blocked(wm.at(10.0, 10.0), 100.0)
+    assert not wm.blocked(wm.at(10.0, 10.0), 100.0 + WALK_DECAY_S + 1), "must decay"
+    # Standing in a cell proves it walkable, whatever we believed before.
+    wm.free(10.0, 10.0)
+    assert not wm.blocked(wm.at(10.0, 10.0), 100.0), "standing there clears it"
+
+    # A wall across x = 0, from z = -9 to z = 9, with the map open beyond it.
+    wall = WalkMap(path=os.devnull)
+    for i in range(-6, 7):
+        wall.block(0.0, i * WALK_CELL, 100.0)
+        wall.block(0.0, i * WALK_CELL, 100.0)
+    here, there = (-6.0, 0.0), (6.0, 0.0)
+    assert wall.crossed(here[0], here[1], there[0], there[1], 100.0), "wall is on the line"
+    assert not wall.crossed(-6.0, 30.0, 6.0, 30.0, 100.0), "clear line is clear"
+    path = wall.route(here[0], here[1], there[0], there[1], 100.0)
+    assert path, "a wall with open ends must be walkable round"
+    assert not any(wall.blocked(wall.at(x, z), 100.0) for x, z in path), path
+    walked = sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                 for a, b in zip([here] + path, path))
+    assert walked > math.hypot(there[0] - here[0], there[1] - here[1]), "must go round"
+    wp = wall.waypoint(here[0], here[1], path)
+    assert math.hypot(wp[0] - here[0], wp[1] - here[1]) >= WALK_WAYPOINT or wp == path[-1]
+
+    # Sealed in: no route exists, and the caller must still be handed the
+    # target rather than nothing -- main() reads a zero stick as "handled".
+    box = WalkMap(path=os.devnull)
+    for i in range(-3, 4):
+        for c in ((i, -3), (i, 3), (-3, i), (3, i)):
+            box.hits[c] = [WALK_BLOCK_HITS, 100.0]
+    assert box.route(0.0, 0.0, 40.0, 0.0, 100.0) is None, "sealed means no route"
+
+    # A wall whose ends are outside the corridor is the same answer: no route,
+    # walk straight. Searching further is what cost 9.7 ms of a 50 ms frame.
+    long_wall = WalkMap(path=os.devnull)
+    for i in range(-(WALK_PAD + 20), WALK_PAD + 21):
+        long_wall.hits[(0, i)] = [WALK_BLOCK_HITS, 100.0]
+    assert long_wall.route(-6.0, 0.0, 6.0, 0.0, 100.0) is None, "corridor is bounded"
+
+    class FakeEyes(MemoryEyes):
+        def __init__(self, wmap):
+            self.walk, self.path, self.path_at = wmap, None, 0.0
+            self.path_to, self.routing = None, False
+    eyes = FakeEyes(WalkMap(path=os.devnull))
+    assert eyes.route_to(100.0, -6.0, 0.0, 6.0, 0.0) == (6.0, 0.0), "clean map goes straight"
+    assert not eyes.routing
+    eyes.walk = wall
+    assert eyes.route_to(100.0, -6.0, 0.0, 6.0, 0.0) != (6.0, 0.0), "known wall routes"
+    assert eyes.routing
+    eyes.walk = box
+    assert eyes.route_to(100.0, 0.0, 0.0, 40.0, 0.0) == (40.0, 0.0), "no route walks straight"
+    assert not eyes.routing
+
+    # A route must be handed back for a cap or a corridor bound, and only a
+    # genuine dead end may drop the monster.
+    assert box.capped is False, "sealed in is not a budget problem"
+    assert long_wall.capped is True, "the corridor stopped that one, not a wall"
+    eyes.walk = box
+    eyes.route_to(100.0, 0.0, 0.0, 40.0, 0.0)
+    assert eyes.sealed, "a walled-off goal must be reported"
+    eyes.walk = long_wall
+    eyes.route_to(100.0, -6.0, 0.0, 6.0, 0.0)
+    assert not eyes.sealed, "running out of corridor is not proof of a wall"
+
+    # Learning a wall. The old test was travel *speed*, and it almost never
+    # fired: pushed into a wall the game slides the character along it at full
+    # pace. Progress along the push is what a wall actually takes away.
+    ident = ((1.0, 0.0), (0.0, 1.0))
+    learn = WalkMap(path=os.devnull)
+    for i in range(WALK_BLOCK_FRAMES + 1):
+        hit = learn.observe(100.0 + i * 0.05, 5.0, 5.0, 1.0, 0.0, ident, "chasing")
+    assert hit == learn.at(5.0 + WALK_BLOCK_AHEAD, 5.0), hit
+
+    # The regression: sliding sideways at full speed while pushing east. Travel
+    # is 0.7 a frame -- the speed test saw a bot walking happily -- and progress
+    # east is zero.
+    slide = WalkMap(path=os.devnull)
+    hit = None
+    for i in range(WALK_BLOCK_FRAMES + 1):
+        hit = slide.observe(100.0 + i * 0.05, 5.0, 5.0 + i * 0.7,
+                            1.0, 0.0, ident, "chasing")
+    assert hit == slide.at(5.0 + WALK_BLOCK_AHEAD, 5.0 + WALK_BLOCK_FRAMES * 0.7), hit
+
+    # Real headway is never a wall, whether straight on or at an angle.
+    for step in ((0.7, 0.0), (0.5, 0.5)):
+        run = WalkMap(path=os.devnull)
+        for i in range(WALK_BLOCK_FRAMES + 3):
+            assert run.observe(100.0 + i * 0.05, 5.0 + i * step[0],
+                               5.0 + i * step[1], 1.0, 0.0,
+                               ident, "chasing") is None, step
+        assert not run.hits, step
+
+    orbit = WalkMap(path=os.devnull)
+    for i in range(WALK_BLOCK_FRAMES + 3):
+        assert orbit.observe(100.0 + i * 0.05, 5.0, 5.0, 1.0, 0.0,
+                             ident, "on it") is None, "the orbit stands still on purpose"
+    assert not orbit.hits
+
+    # Floor painted from other units' traffic: only those that moved, and it
+    # must never erase a wall we measured ourselves.
+    traffic = WalkMap(path=os.devnull)
+    traffic.block(0.0, 0.0, 100.0)
+    traffic.block(0.0, 0.0, 100.0)
+    traffic.paint([(0.0, 0.0), (20.0, 20.0)])
+    assert traffic.blocked(traffic.at(0.0, 0.0), 100.0), "traffic must not clear a wall"
+    assert traffic.at(20.0, 20.0) in traffic.floor
+    traffic.free(0.0, 0.0)
+    assert not traffic.blocked(traffic.at(0.0, 0.0), 100.0), "our own feet do clear it"
+
+    # 0-1 BFS: with two equally short ways round, the one something has walked
+    # in wins.
+    pref = WalkMap(path=os.devnull)
+    for i in range(-6, 7):
+        pref.hits[(0, i)] = [WALK_BLOCK_HITS, 100.0]
+    # The northern way round is proven ground; the southern one is unknown.
+    pref.floor.update((x, z) for x in range(-8, 9) for z in range(1, 9))
+    picked = pref.route(-6.0, 0.0, 6.0, 0.0, 100.0)
+    assert picked, "still routable"
+    assert min(z for _, z in picked) >= 0, ("must take the floor side", picked)
+    assert max(z for _, z in picked) > 0, ("must go round, not through", picked)
+
+    # Saving keeps walls and floor; a file at another cell size cannot be
+    # rescaled honestly and is dropped rather than believed.
+    tmp = os.path.join(os.environ.get("TEMP", "."), "walkmap_demo.json")
+    wall.path = tmp
+    wall.paint([(30.0, 30.0)])
+    assert wall.save(), "a changed map must write"
+    assert not wall.save(), "an unchanged map must not"
+    back = WalkMap(path=tmp).load()
+    assert back.hits == wall.hits, (len(back.hits), len(wall.hits))
+    assert back.floor == wall.floor, (len(back.floor), len(wall.floor))
+    assert not WalkMap(path=tmp, cell=WALK_CELL * 2).load().hits, "wrong scale is dropped"
+    os.remove(tmp)
 
     print("demo ok")
 
