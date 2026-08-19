@@ -140,6 +140,18 @@ adjusting them over adding code paths.
   `MEM_ARRIVE` change the evidence did not support. `target()` reports `DEAD`
   instead of swinging from a corpse. `MEM_ARRIVE = 2.5` is correct — verified
   killing at that distance on a living character.
+- **In melee the bot circles the target; it neither stands still nor stands on
+  it.** Two separate findings force this. A stick of exactly zero drops the game
+  back to keyboard mode and the held attack silently stops landing (measured: hp
+  frozen at 37502 for dozens of frames while the bot reported `on it`). And the
+  push that replaced the zero only cancelled itself out frame to frame, so the
+  character stayed jammed against the monster -- at that range the game gives no
+  attack at all, it needs room to swing. The orbit answers both: it always moves,
+  and it holds `MEM_ORBIT_MIN`..`MEM_ORBIT_MAX` of standoff. Those two are a
+  calibration knob, not a measurement -- `--fightlog` prints distance against
+  target health every frame, and is how to set them. `_orbit_way()` reverses the
+  circle when *our own position* stops changing; the radius cannot report a wall,
+  since holding the radius constant is the whole job.
 - **A far target keeps the engagement clock.** Clearing it each frame meant the
   give-up timer never fired and an unreachable monster could be walked at forever.
 - **Never return a zero stick for "nothing to do".** `main()` treats a zero stick
@@ -175,10 +187,14 @@ adjusting them over adding code paths.
   `LOOT_SYNC` -> `LOOT_NAME` (display name, as the tooltip shows) and
   `LOOT_KEY` (internal id): 'Flax'/'flax', 'Axe'/'T_Axe_Axe'. Confirmed against
   the screen -- 27 drops named Flax with Flax on the ground.
-- **`LOOT_NAMES` matches whole names, never substrings.** "Axe" would otherwise
-  collect every "Battle Axe" on the map, which defeats the point of a list.
-  Empty means take everything. `python memscan.py --loot` prints what is lying
-  around, which is the list to write it from.
+- **`LOOT_NAMES` entries are case-insensitive substrings.** `("Card",)` takes
+  Bee Card, Rooster Card and any card added later; a full name still works.
+  Requested deliberately over whole-name matching -- the item lists are families
+  with a shared word, and writing every member out is what the list is meant to
+  save. The cost is real: a short entry catches everything containing it, so
+  "Axe" takes every Battle Axe too. Empty means take everything.
+  `python memscan.py --loot` prints what is lying around, which is the list to
+  write it from.
 - **Loot never interrupts a fight.** `pick_loot()` is consulted only when the
   monster path has nothing, or when its mode is `far` -- an item two steps away
   beats a walk across the map, and the monster is still there afterwards.
@@ -284,6 +300,33 @@ adjusting them over adding code paths.
   the Ok button goes and blue skill icons where Play Character goes, so a lone
   colour probe fires mid-fight — and the consequence is a mouse click during
   combat. Keep both halves of every test. `RECONNECT = False` disables all of it.
+- **Backdrop probes must sit at the edges, never where the character stands.**
+  The character screen was never detected at all: `CHAR_BG` probed (0.30, 0.50),
+  which is the middle of the screen, and a Weaver holding a lit cyan axe read
+  255 there. Measured live -- `find_blue_button(PLAY_BTN)` returned the button at
+  its nominal spot the whole time, so this looked like a missed click and was
+  not one: no click was ever sent. The model, its pet and its weapon own the
+  middle; probe (0.03, 0.50) and the other three edges instead.
+- **Both halves still are not enough, and the reconnect flow must be able to give
+  up.** Measured on a live session: `login_screen()` returned `"disconnected"`
+  during ordinary play for the rest of the run. Nothing was on screen, and the
+  status line read `memory` throughout, which only prints while our own unit is
+  alive -- the client was never disconnected. The bot clicked `OK_BTN`
+  (0.500, 0.144) into the world every `RECONNECT_POLL_S`, dropped the stick and
+  `continue`d, so it stood still for hours and looked like a frozen End key.
+  `RECONNECT_MAX_REPEAT` identical screens now turns reconnect off for the run,
+  and the first `RECONNECT_DUMP_MAX` triggering frames are written to
+  `reconnect_<screen>_<n>.png` -- which blob matched is the one thing the log
+  cannot say, and without it the test can only be tightened by guesswork.
+- **"No monster" is the unit list speaking, not the screen, so it must not zero
+  the stick.** `main()` treats a zero stick as handled and never falls through to
+  pixels; `hold_still()` holds that distinction and is asserted in `demo()`. Death
+  and a rebuilt unit do stop the bot; an empty unit list hands over to the dots.
+- **A dead scanner thread is invisible.** One raised read inside the sweep used to
+  end the thread for good: the unit list froze, every frame reported `no monster`,
+  and the End toggle would not restart it, because the guard tested
+  `scanner is None` and a dead `Thread` is not None. The sweep now retries from
+  the top, and the toggle checks `is_alive()`.
 - **`START_PAUSED` must stay true.** Launching the script has to be safe; the bot
   waits for `End` (`TOGGLE_VK`) before it touches the stick.
 - `ArduinoPad.stick` deduplicates against `self.last` because the sketch is

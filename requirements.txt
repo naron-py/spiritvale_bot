@@ -4,3 +4,4 @@ numpy
 pygetwindow
 vgamepad
 pyserial
+AL8J4GAMXA

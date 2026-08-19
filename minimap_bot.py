@@ -79,6 +79,14 @@ PET_FORGET_FRAMES = 40   # remember a vanished confirmed pet for about two secon
 RECONNECT = True          # False disables the whole thing, clicks included
 RECONNECT_POLL_S = 2.0    # how often to look for a login screen while running
 RECONNECT_SETTLE_S = 1.5  # wait after each click; these screens animate
+# A screen that will not advance is either stuck or was never there. Measured
+# from a live freeze: login_screen() read "disconnected" during ordinary play and
+# the bot clicked (0.500, 0.144) into the world every poll for the rest of the
+# session, dropping the stick each time -- a bot that stands still forever. A
+# real flow walks disconnected -> server -> character within a poll or two, so
+# repeating the same screen this many times means stop clicking, not click again.
+RECONNECT_MAX_REPEAT = 5
+RECONNECT_DUMP_MAX = 5    # frames written when it fires; the only evidence there is
 UI_BLUE = ((95, 90, 150), (112, 255, 255))    # the game's button blue, in HSV
 # (x, y, width) fractions. Width matters: Connect and Play sit only 0.033 apart
 # vertically, close enough that either matches the other on position alone -- the
@@ -99,7 +107,13 @@ SEA_MATCH_MIN = 0.70
 # margin, which is no margin at all.
 MODAL_DARK = ((0.44, 0.093), (0.55, 0.093))
 PANEL_WHITE = (0.42, 0.60)    # white body of the server table
-CHAR_BG = ((0.30, 0.50), (0.50, 0.06), (0.70, 0.85), (0.06, 0.60))  # dark backdrop
+# Dark backdrop of the character screen. Every probe must sit clear of the
+# character itself: (0.30, 0.50) was over the model, and a Weaver holding a lit
+# cyan axe read 255 there, so the screen never matched and the bot sat on it
+# without ever pressing Play -- measured live, the button was found at exactly
+# its nominal spot the whole time. Edges only: the model, its pet and its
+# weapon all live in the middle.
+CHAR_BG = ((0.03, 0.50), (0.50, 0.06), (0.70, 0.85), (0.06, 0.60))
 # Targeting from the game's own unit list rather than from red pixels. It knows
 # what a thing IS -- monster, pet, player -- so the pet, other players' pets,
 # mushroom terrain art and the minimap's rotation all stop mattering at once.
@@ -119,11 +133,21 @@ MEM_ARRIVE = 2.5         # world units
 # of seconds later with the target still standing: measured 46474 -> 37502 and
 # then frozen for dozens of frames at an unchanging 2.02 units, attack still
 # held. The game sits in keyboard mode until it sees stick motion, and with a
-# dead stick it goes back there, so the held attack stops landing. Distance was
-# never the problem -- damage landed fine at 0.30. Keep the stick alive instead:
-# alternate a push either side of the approach heading, which nets out to
-# standing still. ponytail: calibration knob, raise if the damage still stalls.
-MEM_HOLD_WIGGLE = 0.5    # stick magnitude while holding on a target
+# dead stick it goes back there, so the held attack stops landing. So the stick
+# has to keep moving on a target -- but the push that replaced the zero only
+# cancelled itself out frame to frame, which left the character pressed against
+# the monster, and that close the game gives no attack at all: it needs room to
+# swing. Circle the target instead. One motion pays for both lessons.
+# ponytail: MIN/MAX are the calibration knob -- the range the game actually
+# swings at is unmeasured, and --fightlog is what measures it.
+MEM_ORBIT_MIN = 1.8       # closer than this, push away from the target
+MEM_ORBIT_MAX = 2.5       # further than this, push back in
+MEM_ORBIT_SPEED = 0.7     # stick magnitude while circling
+# A wall or a corner stops the circle dead, and the radius cannot say so -- the
+# radius is the thing the orbit holds constant. Our own position not changing
+# is the honest test: when it does not, go round the other way.
+MEM_ORBIT_FLIP_S = 1.5
+MEM_ORBIT_MIN_MOVE = 0.6  # world units of our own travel that counts as progress
 # --fightlog: print distance against the target's health every frame we are on
 # one. Which distances actually take health off is the only way to set the two
 # constants above, and guessing them is what this exists to stop.
@@ -207,6 +231,16 @@ def toggle_key_hit(get_state=None):
         import ctypes
         get_state = ctypes.windll.user32.GetAsyncKeyState
     return bool(get_state(TOGGLE_VK) & 1)
+
+
+def hold_still(mode):
+    """True when memory targeting means "stop", not merely "nothing here".
+
+    main() reads a zero stick as handled and never falls through to the pixel
+    path, so this is the difference between a bot that waits out a death and a
+    bot that stands in a field forever because the unit list came back empty.
+    """
+    return mode != "no monster"
 
 
 def toggle_running(paused, pad, pet_filter, wake=wake_controller):
@@ -834,7 +868,8 @@ class MemoryEyes:
         self.units = []           # cached (kind, addr, x, y, z)
         self.chasing = None       # unit held between frames, so it does not flap
         self.approach = None      # last heading that closed on a target
-        self.wiggle = 1           # which side the holding push goes, flips
+        self.orbit_dir = 1        # which way round a target we circle
+        self.orbit_mark = None    # (time, x, z) the orbit last made progress at
         self.engaged_since = None # when we started on the current target
         self.ignored = {}         # unit -> time it becomes fair game again
         self.mode = "no unit"
@@ -1180,7 +1215,7 @@ class MemoryEyes:
         import threading
         self.stop = threading.Event()
 
-        def loop():
+        def sweep():
             mem = self.ms.Mem(self.mem.pid)
             looked = True         # loot class not looked up yet; once only
             try:
@@ -1214,8 +1249,34 @@ class MemoryEyes:
             finally:
                 mem.close()
 
+        def loop():
+            # One failed read used to end the thread, silently and forever:
+            # the unit list froze, the bot reported "no monster" from then on,
+            # and the End toggle would not restart it (a dead Thread is not
+            # None). Take the sweep from the top instead.
+            while not self.stop.is_set():
+                try:
+                    sweep()
+                except Exception as e:
+                    print(f"\nunit sweep failed ({e}); retrying")
+                    self.stop.wait(MEM_REFRESH_S)
+
         self.scanner = threading.Thread(target=loop, daemon=True)
         self.scanner.start()
+
+    def _orbit_way(self, now, px, pz):
+        """Which way round the target to go. Reverses when the circle stops
+        getting anywhere -- a wall, a corner, another body in the way."""
+        if self.orbit_mark is None:
+            self.orbit_mark = (now, px, pz)
+            return self.orbit_dir
+        since, mx, mz = self.orbit_mark
+        if math.hypot(px - mx, pz - mz) >= MEM_ORBIT_MIN_MOVE:
+            self.orbit_mark = (now, px, pz)   # moving; keep going this way
+        elif now - since >= MEM_ORBIT_FLIP_S:
+            self.orbit_dir = -self.orbit_dir
+            self.orbit_mark = (now, px, pz)
+        return self.orbit_dir
 
     def known_players(self):
         with self.lock:
@@ -1252,6 +1313,7 @@ class MemoryEyes:
             # the whole heap, because the new objects need not be where the old
             # ones were.
             self.me = self.basis = self.hot = self.approach = None
+            self.orbit_mark = None
             # The owner is a pointer to the object that was just rebuilt, so it
             # is as dead as the rest. It is also what the scanner checks before
             # looking us up again, so leaving it set meant we never recovered.
@@ -1334,18 +1396,23 @@ class MemoryEyes:
             hp = self.ms.unit_health(self.mem, hit[0])
             print(f"\nfightlog {hit[0]:012X} dist {dist:5.2f} hp {hp}")
         if dist <= MEM_ARRIVE:
-            # Arrived: stay put but never go still, or the game drops back to
-            # keyboard mode and the held attack stops landing. Sideways to the
-            # approach heading and alternating, so the two frames cancel and the
-            # character holds its ground. Not towards the target: at this range
-            # its direction flips every frame, measured at 0.4 units.
+            # Arrived: circle it rather than stand on it. Standing on the
+            # monster is no attack, and a dead stick is no attack either.
             self.mode = "on it"
-            if not self.approach:
+            radial = (stick_for(self.basis, hit[1] - px, hit[3] - pz)
+                      if dist >= MEM_ORBIT_MIN else self.approach)
+            # Point blank the direction to the target flips every frame,
+            # measured at 0.4 units, so the last good heading stands in.
+            if not radial:
                 return 0.0, 0.0, dist
-            self.wiggle = -self.wiggle
-            ax, ay = self.approach
-            return (-ay * MEM_HOLD_WIGGLE * self.wiggle,
-                    ax * MEM_HOLD_WIGGLE * self.wiggle, dist)
+            rx, ry = radial
+            way = self._orbit_way(now, px, pz)
+            ox, oy = -ry * way, rx * way
+            pull = (-1.0 if dist < MEM_ORBIT_MIN else
+                    1.0 if dist > MEM_ORBIT_MAX else 0.0)
+            ox, oy = ox + rx * pull, oy + ry * pull
+            n = math.hypot(ox, oy) or 1.0
+            return ox / n * MEM_ORBIT_SPEED, oy / n * MEM_ORBIT_SPEED, dist
         s = stick_for(self.basis, hit[1] - px, hit[3] - pz)
         if not s:
             return None, None, None
@@ -1533,6 +1600,9 @@ def main(port=None):
     next_spam = 0.0   # SPAM_BUTTON goes out on its own timer
     next_loot = 0.0   # LOOT_BUTTON while standing on a drop
     next_login_check = 0.0  # a whole-window grab, so kept to RECONNECT_POLL_S
+    reconnecting = RECONNECT   # switched off if a screen refuses to advance
+    same_screen = (None, 0)    # what reconnect_step did last, and how many in a row
+    dumps = 0                  # frames written, capped by RECONNECT_DUMP_MAX
 
     pad.stick(0.0, 0.0, False)
     print("STOPPED -- press End to start")
@@ -1554,7 +1624,9 @@ def main(port=None):
                         eyes.loot_target = eyes.loot_since = None
                         eyes.loot_mode = "no loot"
                     print(f"\n{'STOPPED' if paused else 'STARTED'} (End)")
-                    if not paused and eyes is not None and eyes.scanner is None:
+                    if (not paused and eyes is not None and
+                            (eyes.scanner is None
+                             or not eyes.scanner.is_alive())):
                         # Returns at once. The first sweep is slow, so the bot
                         # runs on pixels meanwhile and upgrades itself when the
                         # unit list arrives -- nothing waits on it.
@@ -1583,16 +1655,38 @@ def main(port=None):
                     time.sleep(0.05)
                     continue
 
-                if RECONNECT and time.time() >= next_login_check:
+                if reconnecting and time.time() >= next_login_check:
                     next_login_check = time.time() + RECONNECT_POLL_S
                     full = np.array(sct.grab(window_region(win)))[:, :, :3]
-                    if login_screen(full):
+                    if not login_screen(full):
+                        same_screen = (None, 0)
+                    else:
                         # Drop the stick and attack before touching the mouse: the
                         # character is gone, and a held button carries into the
                         # next session.
                         pad.stick(0.0, 0.0, False)
                         did = reconnect_step(full, win)
                         print(f"\nreconnect: handled the {did} screen")
+                        if dumps < RECONNECT_DUMP_MAX:
+                            # Which blue blob matched is the one thing the log
+                            # cannot say, and a false positive can only be
+                            # guessed at without it. Capped, so a real
+                            # reconnect does not paper the folder.
+                            cv2.imwrite(f"reconnect_{did}_{dumps}.png", full)
+                            dumps += 1
+                        seen, n = same_screen
+                        same_screen = (did, n + 1 if did == seen else 1)
+                        if same_screen[1] >= RECONNECT_MAX_REPEAT:
+                            # Either the click misses or the screen was never
+                            # there. Both end the same way -- pinned in this
+                            # branch, clicking into the game every poll with
+                            # the stick dropped, which is worse than no
+                            # reconnect at all.
+                            reconnecting = False
+                            print(f"\nreconnect: the {did} screen did not "
+                                  f"advance in {RECONNECT_MAX_REPEAT} tries -- "
+                                  f"reconnect OFF for this run; see "
+                                  f"reconnect_*.png. Restart to re-arm.")
                         target_lock.reset()
                         target_blacklist.reset()
                         stuck_watchdog.reset()
@@ -1666,7 +1760,15 @@ def main(port=None):
                                   "until then")
                             had_unit = False
                     elif msx is None:
-                        sx = sy = 0.0
+                        # A zero stick reads as "handled" below, so the pixel
+                        # path never runs. Right for the modes that mean stop
+                        # (a corpse swings at nothing, a rebuilt unit has no
+                        # basis) -- wrong for "no monster", which is the unit
+                        # list saying it has nothing, not the screen. Leaving
+                        # sx None there is what walks the bot to a red dot
+                        # instead of standing still until it is restarted.
+                        if hold_still(eyes.mode):
+                            sx = sy = 0.0
                         # Name which kind of nothing this is: "no monster" was
                         # printed for a lost unit too, hiding a dead bot behind
                         # a message that reads like a quiet patch of map.
@@ -1893,7 +1995,7 @@ def demo():
             self.chasing = self.engaged_since = self.approach = None
             self.ignored = {}
             self.mode, self.misses, self.hot = "chasing", 0, None
-            self.wiggle = 1
+            self.orbit_dir, self.orbit_mark = 1, None
             self.at, self.mem = at, None
             self.seen_at, self.sweep_at, self.fight_ok = {}, 0, {}
             self.ms = _Fights(real)
@@ -1937,6 +2039,47 @@ def demo():
     _, _, pd = pooled.target(1.0)
     assert pooled.chasing == 0x2000, "must skip the pooled one right beside us"
     assert pd > MEM_RANGE, pd
+
+    # In melee the bot circles the target instead of standing on it: standing
+    # on a monster is a character with no room to swing, and the game gives no
+    # attack for it. The stick must also never go still (see MEM_ORBIT_MIN).
+    band = (MEM_ORBIT_MIN + MEM_ORBIT_MAX) / 2
+    ring = _Far(band)
+    rsx, rsy, rd = ring.target(1.0)
+    assert ring.mode == "on it", ring.mode
+    assert abs(rd - band) < 1e-6, rd
+    assert abs(math.hypot(rsx, rsy) - MEM_ORBIT_SPEED) < 1e-6, (rsx, rsy)
+    # Target sits on +x from us, so in the band the push is pure tangent.
+    assert abs(rsx) < 1e-6 and abs(rsy) > 0, (rsx, rsy)
+
+    # Too close: the push has to carry us away from it, or we stay jammed in.
+    close = _Far(MEM_ORBIT_MIN / 2)
+    close.approach = (1.0, 0.0)          # last heading that closed on it
+    csx, _, _ = close.target(1.0)
+    assert csx < 0, f"must back off when inside MEM_ORBIT_MIN, got {csx}"
+
+    # Drifted out but still in melee: pull back in rather than let it slide.
+    # Defaults put MEM_ORBIT_MAX at MEM_ARRIVE, leaving no room to drift, so
+    # this narrows the band the way tuning it down would.
+    kept_max = MEM_ORBIT_MAX
+    try:
+        globals()["MEM_ORBIT_MAX"] = MEM_ARRIVE / 2
+        wide = _Far(MEM_ARRIVE * 0.75)
+        wsx, _, _ = wide.target(1.0)
+        assert wsx > 0, f"must close back to the band, got {wsx}"
+    finally:
+        globals()["MEM_ORBIT_MAX"] = kept_max
+
+    # Blocked: our own position is what says the circle is getting nowhere --
+    # the radius cannot, it is the thing being held constant. _Far parks us at
+    # the origin, which is exactly a bot pressed against a wall.
+    stuck = _Far(band)
+    stuck.target(1.0)
+    assert stuck.orbit_dir == 1, stuck.orbit_dir
+    stuck.target(1.0 + MEM_ORBIT_FLIP_S / 2)
+    assert stuck.orbit_dir == 1, "must not reverse before MEM_ORBIT_FLIP_S"
+    stuck.target(1.0 + MEM_ORBIT_FLIP_S + 0.1)
+    assert stuck.orbit_dir == -1, "blocked circle must turn round"
     # Loot. The rule under test is the one the pooling forces: a slot holding a
     # position is not a drop, a slot that has been seen to *change* is.
     class _Loot(MemoryEyes):
@@ -2062,6 +2205,11 @@ def demo():
     only_pooled = _Far(MEM_RANGE * 3, real=())     # nothing real at all
     assert only_pooled.target(1.0) == (None, None, None)
     assert only_pooled.mode == "no monster", only_pooled.mode
+    # ...and an empty unit list must not park the bot. A zero stick counts as
+    # handled in main(), so "no monster" has to reach the pixel path instead:
+    # this is the branch that stood still for a whole session once.
+    assert not hold_still("no monster")
+    assert hold_still("dead") and hold_still("lost") and hold_still("no unit")
 
     # A dead character must be reported as such, not left swinging: a corpse
     # that keeps attacking reads as "melee range is wrong" and sends the next
@@ -2080,19 +2228,21 @@ def demo():
     assert near.mode == "chasing", near.mode
     assert near.approach, "the chase heading is what the back-off reverses"
 
-    # Holding on a target must never send an exactly zero stick: the game falls
-    # back to keyboard mode and the held attack quietly stops landing, measured
-    # as a target frozen at 37502 hp for dozens of frames while the bot reported
-    # "on it". The two frames must cancel, or the bot walks off the monster.
+    # On a target the stick must never be exactly zero: the game falls back to
+    # keyboard mode and the held attack quietly stops landing, measured as a
+    # target frozen at 37502 hp for dozens of frames while the bot reported
+    # "on it". The orbit is what keeps it alive, so it must not cancel itself
+    # out either -- that was the old holding push, and it is how the character
+    # ended up jammed against the monster with no room to swing.
     onto = _Far(MEM_ARRIVE / 2)
     onto.approach = (0.6, -0.8)
     one = onto.target(1.0)
     two = onto.target(1.0)
     assert onto.mode == "on it", onto.mode
     assert one[0] or one[1], "a dead stick loses the attack"
-    assert abs(one[0] + two[0]) < 1e-9 and abs(one[1] + two[1]) < 1e-9, (one, two)
-    # Sideways, so holding does not close or open the distance.
-    assert abs(one[0] * 0.6 + one[1] * -0.8) < 1e-9, one
+    assert abs(one[0] + two[0]) > 1e-9 or abs(one[1] + two[1]) > 1e-9, (one, two)
+    # Inside MEM_ORBIT_MIN it has to open the distance, not hold it.
+    assert one[0] * 0.6 + one[1] * -0.8 < 0, one
 
     # A blank position read must not throw the calibration away: the bot goes
     # silent until someone notices and restarts it. Coast, then give up.
@@ -2285,6 +2435,11 @@ def demo():
     chars = np.zeros((432, 768, 3), np.uint8)
     chars[:] = (53, 36, 28)                        # the dark character backdrop
     cv2.circle(chars, (int(768 * 0.42), int(432 * 0.60)), 40, (250, 250, 250), -1)
+    # The character stands in the middle of this screen holding whatever it
+    # holds. A probe there is not a backdrop probe -- this is the frame that
+    # kept the bot parked on the character screen.
+    cv2.rectangle(chars, (int(768 * 0.20), int(432 * 0.25)),
+                  (int(768 * 0.62), int(432 * 0.80)), (255, 255, 167), -1)
     blue(chars, PLAY_BTN)
     # Regression, found the hard way on a live disconnect: Connect and Play sit
     # 0.033 apart vertically, and the character's own bright armour can sit under
