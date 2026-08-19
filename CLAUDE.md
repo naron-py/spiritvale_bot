@@ -82,7 +82,9 @@ scanning at the bottom of the file — no argparse in `minimap_bot.py`.
    character can and cannot go. Walls come from our own movement: the cell ahead
    is blocked when travel *projected onto the commanded direction* stays under
    `WALK_BLOCK_PROGRESS` for `WALK_BLOCK_FRAMES` (`observe()`, fed the actually
-   issued stick by `observe_move()`). Floor comes from the background sweep —
+   issued stick by `observe_move()`), or when a `WALK_STUCK_S` window brings us
+   less than `WALK_STUCK_MIN` closer to the goal (`_creeping()`, the only sensor
+   that catches a shallow slide). Floor comes from the background sweep —
    `paint()` takes every unit that moved since the last one, since they walk the
    same navmesh we do. `MemoryEyes.route_to()` keeps the straight line unless it
    crosses a known wall, then runs a weighted search that prefers floor and
@@ -204,9 +206,28 @@ adjusting them over adding code paths.
   because Unity slides a character along the collider it is pushed into, so
   travel stays near full pace while no ground is gained. The honest test is the
   projection of actual travel onto the direction we asked for
-  (`WALK_BLOCK_PROGRESS`): head-on gives ~0, a 45° slide gives ~0.5 and is real
-  headway that must not be marked. `--walklog` prints that number every frame
-  and is how the constant is set.
+  (`WALK_BLOCK_PROGRESS`). Measured live: `0.00` stuck against `0.81` walking
+  free. `--walklog` prints that number every frame and is how it is set.
+- **That fast test only catches a steep hit, and raising its limit was
+  rejected.** Against 0.81 free walking a slide reads `0.81·cos²θ` for θ into
+  the wall: 0.00 head-on and 0.20 at 60° (both caught), but 0.41 at 45° and 0.61
+  at 30°, which look exactly like ordinary walking. Raising the limit to 0.45 to
+  catch them would also fire on slow ground, on a monster body-blocking us, and
+  through every corner — writing walls onto open ground. A shallow slide is also
+  often *right*: it is how a character rounds a corner.
+- **So the second sensor asks "am I getting closer", not "am I sliding".**
+  `_creeping()` judges a `WALK_STUCK_S` window: less than `WALK_STUCK_MIN` of net
+  approach means a wall, marked toward the goal. Free walking covers ~14 units in
+  that window against a bar of 1.5, so it fires only when genuinely trapped. Two
+  things it must keep doing: measure **both** distances against the goal's
+  position *now* (or a fleeing monster reads as a wall), and restart the window
+  rather than judge when the goal jumps more than `WALK_GOAL_JUMP` (or the
+  monster we just turned toward gets a wall drawn in front of it).
+- **On a route, the slow sensor's goal is the waypoint, not the monster.** A
+  detour round a big wall closes no distance on the monster for seconds at a
+  time, and judging against it there writes a false wall across the way round
+  that is working. `pick_loot()` also runs when it *loses* the arbitration, so
+  `observe_move()` is told which goal actually got the stick (`on_loot`).
 - **Floor from other units is evidence, not proof, and must never clear a
   wall.** A cell is 1.5 units wide and a monster on the far side of a thin wall
   shares its edge; letting that erase a wall we measured gives a

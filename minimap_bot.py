@@ -234,7 +234,20 @@ WALK_CELL = 1.5          # world units per grid cell; under MEM_ARRIVE (2.5)
 # slide gives ~0.5 and is real headway, so this sits between them.
 # ponytail: a calibration knob, not a measurement -- --walklog prints the number.
 WALK_BLOCK_PROGRESS = 0.25   # world units per frame, projected onto the push
-WALK_BLOCK_FRAMES = 6    # consecutive such frames before calling it a wall
+WALK_BLOCK_FRAMES = 3    # consecutive such frames before calling it a wall
+# The push test only catches a steep hit. Measured against 0.81 free walking, a
+# slide sees 0.81*cos(angle into the wall)^2: 0.00 head on, 0.20 at 60 degrees --
+# both caught -- but 0.41 at 45 and 0.61 at 30, which read as ordinary walking.
+# Raising the limit to catch those was rejected: real walking dips that low on
+# slow ground, against a monster body, and through every corner, and each would
+# write a wall onto open ground. A shallow slide is also often *right* -- it is
+# how a character rounds a corner. So the second test is not "am I sliding" but
+# "am I getting closer", judged slowly. Free walking covers ~14 units in the
+# window, so this bar is deliberately near the floor: it fires only when the bot
+# is genuinely trapped, never merely slow.
+WALK_STUCK_S = 1.2       # window the slow sensor judges over
+WALK_STUCK_MIN = 1.5     # world units of net approach that counts as arriving
+WALK_GOAL_JUMP = 5.0     # goal moved this far: restart the window, judge nothing
 WALK_BLOCK_AHEAD = 2.0   # world units ahead of us the wall gets marked
 # Another player or a monster standing in the way reads exactly like a wall.
 # Two sightings, a decay, and clearing any cell we later stand in are what stop
@@ -722,6 +735,7 @@ class WalkMap:
         self.lock = threading.Lock()
         self.still = 0            # frames in a row we asked to move and did not
         self.last_pos = None      # our position at the previous observation
+        self.mark = None          # (time, x, z, goal) the slow sensor judges from
         self.capped = False       # the last route ran out of budget, not of map
         self.dirty = False
 
@@ -856,8 +870,14 @@ class WalkMap:
         return path[-1]
 
     # -- learning -----------------------------------------------------------
-    def observe(self, now, px, pz, sx, sy, basis, mode):
-        """Record floor under us, and a wall ahead when a push goes nowhere.
+    def observe(self, now, px, pz, sx, sy, basis, mode, goal=None):
+        """Record floor under us, and a wall ahead when we are not getting there.
+
+        Two sensors. The fast one asks whether this frame's travel went the way
+        we pushed, and catches a steep hit in 0.3s. The slow one asks whether
+        the last `WALK_STUCK_S` actually brought us closer to `goal`, and is the
+        only thing that catches a shallow slide -- which keeps full speed and a
+        healthy-looking push projection while running along the wall.
 
         Only while actually walking somewhere. Standing still is *correct* in
         every other mode -- the orbit holds position on purpose, a dead or lost
@@ -865,17 +885,19 @@ class WalkMap:
         the map with fiction centred on wherever the bot happened to stop.
         """
         if mode not in ("chasing", "far", "loot"):
-            self.still, self.last_pos = 0, None
+            self.still, self.last_pos, self.mark = 0, None, None
             return None
         self.free(px, pz)
         was, self.last_pos = self.last_pos, (px, pz)
+        # No stick out means we are not trying to get anywhere, so neither
+        # sensor may judge: the window has to start again when we do.
         if was is None or not basis or not (sx or sy):
-            self.still = 0
+            self.still, self.mark = 0, None
             return None
         wx, wz = world_for(basis, sx, sy)
         n = math.hypot(wx, wz)
         if n < 1e-9:
-            self.still = 0
+            self.still, self.mark = 0, None
             return None
         ux, uz = wx / n, wz / n
         # Speed is not the test. Pushed into a wall the game slides the
@@ -895,20 +917,60 @@ class WalkMap:
                   f"({px - was[0]:5.2f},{pz - was[1]:5.2f}) speed "
                   f"{math.hypot(px - was[0], pz - was[1]):5.2f} progress "
                   f"{progress:5.2f} still {self.still}")
-        if not self.still:
+        if self.still >= WALK_BLOCK_FRAMES:
+            self.still = 0
+            return self._wall(now, px, pz, ux, uz, "push")
+        return self._creeping(now, px, pz, goal)
+
+    def _creeping(self, now, px, pz, goal):
+        """Wall from the slow sensor: a window that brought us no closer.
+
+        A shallow slide keeps full speed and a healthy push projection while
+        running along the wall, so only distance to the goal can say it is not
+        working. Both distances are measured against the goal's position *now*,
+        which is what makes a fleeing monster harmless: if it ran and we chased,
+        we still closed on where it now is.
+        """
+        if goal is None:
+            self.mark = None
             return None
-        if self.still < WALK_BLOCK_FRAMES:
+        if self.mark is None:
+            self.mark = (now, px, pz, goal)
             return None
-        self.still = 0
+        since, mx, mz, was_goal = self.mark
+        if math.hypot(goal[0] - was_goal[0], goal[1] - was_goal[1]) > WALK_GOAL_JUMP:
+            # The target changed. Judging across that writes a wall between us
+            # and a monster we have only just turned towards.
+            self.mark = (now, px, pz, goal)
+            return None
+        if now - since < WALK_STUCK_S:
+            return None
+        approach = (math.hypot(goal[0] - mx, goal[1] - mz)
+                    - math.hypot(goal[0] - px, goal[1] - pz))
+        self.mark = (now, px, pz, goal)
+        if WALK_LOG:
+            print(f"\nwalklog window {now - since:4.1f}s approach {approach:6.2f}"
+                  f" (need {WALK_STUCK_MIN})")
+        if approach >= WALK_STUCK_MIN:
+            return None
+        gx, gz = goal[0] - px, goal[1] - pz
+        n = math.hypot(gx, gz)
+        if n < 1e-9:
+            return None
+        return self._wall(now, px, pz, gx / n, gz / n, "creep")
+
+    def _wall(self, now, px, pz, ux, uz, why):
+        """Block the cell WALK_BLOCK_AHEAD along (ux, uz), which is a unit vector."""
         bx, bz = px + ux * WALK_BLOCK_AHEAD, pz + uz * WALK_BLOCK_AHEAD
         self.block(bx, bz, now)
+        self.mark = None            # that window is spent whichever sensor fired
         if WALK_LOG:
-            print(f"\nwalklog WALL at {self.at(bx, bz)}")
+            print(f"\nwalklog WALL at {self.at(bx, bz)} ({why})")
         return self.at(bx, bz)
 
     def forget_walk(self):
         """Our unit changed or the bot was paused; the world did not."""
-        self.still, self.last_pos = 0, None
+        self.still, self.last_pos, self.mark = 0, None, None
 
     # -- persistence --------------------------------------------------------
     def load(self):
@@ -1160,7 +1222,7 @@ class MemoryEyes:
     # Class-level so a half-built instance -- demo()'s stubs assemble their own
     # state -- routes straight instead of raising. No map means no detour.
     walk = None
-    path = path_to = last_pos = None
+    path = path_to = last_pos = goal = loot_goal = None
     path_at = 0.0
     routing = sealed = False
 
@@ -1199,6 +1261,8 @@ class MemoryEyes:
         self.last_pos = None      # our (x, z) this frame, for the walk map
         self.routing = False      # steering at a waypoint, not at the target
         self.sealed = False       # the last goal had no route to it at all
+        self.goal = None          # (x, z) we are walking at, for the slow sensor
+        self.loot_goal = None     # the same, for the loot path
         self.scanner = None
         self.stop = None
         self.lock = threading.Lock()
@@ -1473,6 +1537,7 @@ class MemoryEyes:
         ignored after LOOT_MAX_S -- an item that cannot be collected would
         otherwise hold the bot on the spot pressing the trigger forever.
         """
+        self.loot_goal = None            # same rule as target()'s goal
         if not (LOOT_PICKUP and self.me and self.basis):
             self.loot_mode = "no loot"
             return None, None, None
@@ -1515,6 +1580,7 @@ class MemoryEyes:
         if not s:
             self.loot_mode = "no loot"
             return None, None, None
+        self.loot_goal = (gx, gz)
         self.loot_mode = "loot"
         return s[0], s[1], dist
 
@@ -1625,19 +1691,21 @@ class MemoryEyes:
         self.routing = True
         return self.walk.waypoint(px, pz, self.path)
 
-    def observe_move(self, now, sx, sy):
+    def observe_move(self, now, sx, sy, on_loot=False):
         """Feed the walk map the stick that actually went out this frame.
 
         It has to be the issued one, not the one target() computed: loot can
         win the arbitration, and a wall learned against a stick we never sent
-        would sit in the map at the wrong angle.
+        would sit in the map at the wrong angle. `on_loot` is that arbitration's
+        answer, and picks which goal the slow sensor is judging progress toward
+        -- pick_loot() runs even when it loses, so its goal cannot be assumed.
         """
         if not (PATHFIND and self.walk and self.last_pos and self.basis):
             return None
         px, pz = self.last_pos
-        mode = self.loot_mode if self.mode == "no monster" else self.mode
-        hit = self.walk.observe(now, px, pz, sx or 0.0, sy or 0.0,
-                                self.basis, mode)
+        mode = self.loot_mode if on_loot else self.mode
+        hit = self.walk.observe(now, px, pz, sx or 0.0, sy or 0.0, self.basis,
+                                mode, self.loot_goal if on_loot else self.goal)
         if hit:
             self.path = None            # a new wall: the old route is a lie
         return hit
@@ -1666,6 +1734,9 @@ class MemoryEyes:
         Positions come fresh every call; only the membership list is cached, so a
         monster that walks is chased where it is now, not where it was.
         """
+        # Cleared here and set again only if a stick comes out of this call, so
+        # the slow sensor is never judging progress toward a goal we gave up on.
+        self.goal = None
         if not (self.me and self.basis):
             # Say so. Leaving the old mode standing made a bot with no unit at
             # all report whatever it was doing when it still had one, which read
@@ -1809,6 +1880,11 @@ class MemoryEyes:
         s = stick_for(self.basis, gx - px, gz - pz)
         if not s:
             return None, None, None
+        # What the slow sensor judges progress toward. On a route that is the
+        # waypoint, not the monster: a detour round a big wall closes no
+        # distance on the monster for seconds, and judging against it there
+        # would write a false wall across the way round that is working.
+        self.goal = (gx, gz)
         self.approach = s                # remembered for the back-off above
         return s[0], s[1], dist
 
@@ -2239,7 +2315,7 @@ def main(port=None):
                     # The stick that actually goes out is the one the walk map
                     # can learn a wall from -- loot may have won the arbitration
                     # above, and target()'s own vector was never sent.
-                    eyes.observe_move(now, sx, sy)
+                    eyes.observe_move(now, sx, sy, on_loot)
                 pad.stick(sx, sy, atk)
 
                 # One d-pad press per pass, spaced by BUFF_GAP_S. The stick and L1
@@ -3013,6 +3089,69 @@ def demo():
         assert orbit.observe(100.0 + i * 0.05, 5.0, 5.0, 1.0, 0.0,
                              ident, "on it") is None, "the orbit stands still on purpose"
     assert not orbit.hits
+
+    # The slow sensor. A shallow slide keeps full speed and a healthy push
+    # projection -- measured 0.41 at 45 degrees against a limit of 0.25 -- so
+    # only distance to the goal can say it is not working. `creep` walks a
+    # window's worth of frames and returns the last thing observe() said.
+    def creep(wm, steps, at, goal, push=(1.0, 0.0), seconds=WALK_STUCK_S + 0.2):
+        """Walk a window's worth of frames; give back every cell marked."""
+        out = []
+        for i in range(steps + 1):
+            got = wm.observe(100.0 + i * (seconds / steps), *at(i),
+                             push[0], push[1], ident, "chasing", goal(i))
+            if got:
+                out.append(got)
+        return out
+
+    # Sliding north along a wall while the goal sits due east: full speed, no
+    # approach at all. This is the case a 45-degree push produces and the fast
+    # sensor cannot see.
+    slid = WalkMap(path=os.devnull)
+    marked = creep(slid, 30, lambda i: (5.0, 5.0 + i * 0.4),
+                   lambda i: (40.0, 5.0), push=(0.7, 0.7))
+    assert marked, "a slide that never arrives must be marked"
+    # Marked toward the goal, which is east of the track we slid along.
+    assert all(c[0] > slid.at(5.0, 0.0)[0] for c in marked), marked
+
+    # A slide that *is* rounding the obstacle closes on the goal, and must
+    # never be marked however long it runs.
+    ok = WalkMap(path=os.devnull)
+    assert not creep(ok, 30, lambda i: (5.0 + i * 0.4, 5.0),
+                     lambda i: (40.0, 5.0))
+    assert not ok.hits, ok.hits
+
+    # A monster running away while we chase it at full speed: both distances
+    # are measured against where it is now, so we are still closing on it.
+    flee = WalkMap(path=os.devnull)
+    assert not creep(flee, 30, lambda i: (5.0 + i * 0.4, 5.0),
+                     lambda i: (40.0 + i * 0.2, 5.0))
+    assert not flee.hits, flee.hits
+
+    # Switching target restarts the window rather than judging across it --
+    # otherwise the monster we have just turned towards gets a wall in front.
+    # (walking at full speed throughout, or the fast sensor would fire first
+    # and the slow one would never be reached)
+    swap = WalkMap(path=os.devnull)
+    assert not creep(swap, 30, lambda i: (5.0 + i * 0.4, 5.0),
+                     lambda i: (40.0, 5.0) if i < 15 else (-40.0, 5.0))
+    assert not swap.hits, swap.hits
+
+    # Nothing may be marked before the window is up, and a mode that is not
+    # walking, or a frame with no stick, throws the window away.
+    early = WalkMap(path=os.devnull)
+    assert not creep(early, 8, lambda i: (5.0, 5.0 + i * 0.4),
+                     lambda i: (40.0, 5.0), push=(0.7, 0.7),
+                     seconds=WALK_STUCK_S * 0.5)
+    assert not early.hits, "the window was not up yet"
+    early.observe(200.0, 5.0, 5.0, 0.0, 0.0, ident, "chasing", (40.0, 5.0))
+    assert early.mark is None, "no stick means no window"
+    early.mark = (0.0, 0.0, 0.0, (1.0, 1.0))
+    early.observe(200.0, 5.0, 5.0, 1.0, 0.0, ident, "on it", (40.0, 5.0))
+    assert early.mark is None, "not walking means no window"
+    early.mark = (0.0, 0.0, 0.0, (1.0, 1.0))
+    early.forget_walk()
+    assert early.mark is None, "a rebuilt unit throws the window away"
 
     # Floor painted from other units' traffic: only those that moved, and it
     # must never erase a wall we measured ourselves.
