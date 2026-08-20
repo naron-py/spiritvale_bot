@@ -193,7 +193,12 @@ LOOT_HOLD_S = 0.12
 LOOT_TAP_GAP_S = 0.5     # between presses while standing on a drop
 # A drop we cannot actually collect -- out of reach, someone else's, already
 # gone -- otherwise holds the bot on the spot pressing a trigger forever.
-LOOT_MAX_S = 6.0
+# A drop at the edge of LOOT_RANGE is ~2.8s of walking at 14.3 units/s, but a
+# wall detour, a monster in the way or a wedge escape all spend the clock too,
+# and 6.0 gave up on items the bot was still walking toward. This counts only
+# time actually spent going for it -- main() restarts it on any frame the item
+# loses the arbitration -- so it is a real walking budget, not a wall clock.
+LOOT_MAX_S = 15.0
 LOOT_IGNORE_S = 30.0
 # Which items to walk to, matched against the name the tooltip shows. Empty
 # means every item the bot can see. Each entry is a case-insensitive substring,
