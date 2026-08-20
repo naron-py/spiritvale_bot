@@ -249,6 +249,15 @@ WALK_STUCK_S = 1.2       # window the slow sensor judges over
 WALK_STUCK_MIN = 1.5     # world units of net approach that counts as arriving
 WALK_GOAL_JUMP = 5.0     # goal moved this far: restart the window, judge nothing
 WALK_BLOCK_AHEAD = 2.0   # world units ahead of us the wall gets marked
+WALK_BLOCK_ARC = 0.6     # radians either side of it also marked, two deep
+# A router cannot free a character the physics has jammed. Wedged into a rock
+# the bot pushed the same heading for minutes: it never moved, so it could only
+# ever mark one cell, the route came back unchanged, and it pushed again. Back
+# off sideways for a moment instead -- that is a physical answer to a physical
+# problem, and the map plus the router take it from there.
+WALK_ESCAPE_S = 0.6      # how long the sidestep runs
+WALK_ESCAPE_TURN = 2.4   # radians off the blocked heading (~135 degrees, back)
+WALK_ESCAPE_GIVEUP = 3   # escapes on one target before it is not worth chasing
 # Another player or a monster standing in the way reads exactly like a wall.
 # Two sightings, a decay, and clearing any cell we later stand in are what stop
 # those from rotting into the map permanently.
@@ -736,6 +745,7 @@ class WalkMap:
         self.still = 0            # frames in a row we asked to move and did not
         self.last_pos = None      # our position at the previous observation
         self.mark = None          # (time, x, z, goal) the slow sensor judges from
+        self.wedged = False       # the last wall came from being unable to move
         self.capped = False       # the last route ran out of budget, not of map
         self.dirty = False
 
@@ -960,13 +970,30 @@ class WalkMap:
         return self._wall(now, px, pz, gx / n, gz / n, "creep")
 
     def _wall(self, now, px, pz, ux, uz, why):
-        """Block the cell WALK_BLOCK_AHEAD along (ux, uz), which is a unit vector."""
-        bx, bz = px + ux * WALK_BLOCK_AHEAD, pz + uz * WALK_BLOCK_AHEAD
-        self.block(bx, bz, now)
+        """Block an arc ahead along (ux, uz), which is a unit vector.
+
+        One cell is too thin to describe what we are actually pressed against.
+        Measured live, wedged: the bot marked the same single cell forever,
+        because dodging 1.5 units at 2 units' range bends the heading by 25
+        degrees, the route came back effectively unchanged, and the character
+        pushed the same rock again -- and having never moved, it could only ever
+        mark that one cell. So block a fan: two ranges deep, three ways wide.
+        """
+        hit, mine = None, self.at(px, pz)
+        for reach in (WALK_BLOCK_AHEAD * 0.6, WALK_BLOCK_AHEAD):
+            for turn in (-WALK_BLOCK_ARC, 0.0, WALK_BLOCK_ARC):
+                c, s = math.cos(turn), math.sin(turn)
+                bx = px + (ux * c - uz * s) * reach
+                bz = pz + (ux * s + uz * c) * reach
+                if self.at(bx, bz) == mine:
+                    continue         # we are standing in it; free() clears it anyway
+                self.block(bx, bz, now)
+                hit = hit or self.at(bx, bz)
         self.mark = None            # that window is spent whichever sensor fired
+        self.wedged = why == "push"  # only the fast sensor means we cannot move
         if WALK_LOG:
-            print(f"\nwalklog WALL at {self.at(bx, bz)} ({why})")
-        return self.at(bx, bz)
+            print(f"\nwalklog WALL at {hit} ({why})")
+        return hit
 
     def forget_walk(self):
         """Our unit changed or the bot was paused; the world did not."""
@@ -1222,8 +1249,9 @@ class MemoryEyes:
     # Class-level so a half-built instance -- demo()'s stubs assemble their own
     # state -- routes straight instead of raising. No map means no detour.
     walk = None
-    path = path_to = last_pos = goal = loot_goal = None
-    path_at = 0.0
+    path = path_to = last_pos = goal = loot_goal = escape = None
+    path_at = escape_until = 0.0
+    escape_side, escapes = 1, 0
     routing = sealed = False
 
     def __init__(self):
@@ -1263,6 +1291,10 @@ class MemoryEyes:
         self.sealed = False       # the last goal had no route to it at all
         self.goal = None          # (x, z) we are walking at, for the slow sensor
         self.loot_goal = None     # the same, for the loot path
+        self.escape = None        # stick that backs us out of a wedge
+        self.escape_until = 0.0
+        self.escape_side = 1      # alternated, so a corner is tried both ways
+        self.escapes = 0          # on the current target
         self.scanner = None
         self.stop = None
         self.lock = threading.Lock()
@@ -1708,7 +1740,25 @@ class MemoryEyes:
                                 mode, self.loot_goal if on_loot else self.goal)
         if hit:
             self.path = None            # a new wall: the old route is a lie
+            if self.walk.wedged:
+                self.wedge_off(now, sx or 0.0, sy or 0.0)
         return hit
+
+    def wedge_off(self, now, sx, sy):
+        """Back out sideways from whatever we are jammed against.
+
+        Only the fast sensor sets this off, and it means the character did not
+        move at all -- which no amount of routing can fix, since a bot that
+        cannot move cannot learn a second cell to route around. Turn the stick
+        well off the blocked heading for a moment, alternating sides so a
+        corner that defeats one way out is escaped the other.
+        """
+        turn = WALK_ESCAPE_TURN * self.escape_side
+        c, s = math.cos(turn), math.sin(turn)
+        self.escape = (sx * c - sy * s, sx * s + sy * c)
+        self.escape_until = now + WALK_ESCAPE_S
+        self.escape_side = -self.escape_side
+        self.escapes += 1
 
     def _orbit_way(self, now, px, pz):
         """Which way round the target to go. Reverses when the circle stops
@@ -1796,6 +1846,12 @@ class MemoryEyes:
             # range was wrong when the character was simply lying down.
             self.mode = "dead"
             return None, None, None
+        if self.escape and now < self.escape_until:
+            # Backing out of a wedge. This overrides the target entirely: while
+            # the character cannot move, nothing else it decides matters.
+            self.mode = "unwedge"
+            return self.escape[0], self.escape[1], 0.0
+        self.escape = None
         self.mode = "chasing"
         fresh = [(k, u, *live[u]) for k, u, *_ in cached if u in live]
         # Most of the list is pooled or dead objects that keep their position
@@ -1836,7 +1892,14 @@ class MemoryEyes:
             # engagement clock as a near one, or an unreachable monster across
             # a wall is walked at forever.
         if hit[0] != self.chasing:
-            self.chasing, self.engaged_since = hit[0], now
+            self.chasing, self.engaged_since, self.escapes = hit[0], now, 0
+        elif self.escapes >= WALK_ESCAPE_GIVEUP:
+            # Backed out of the same approach this many times and still here.
+            # Whatever is in the way, this monster is not the one to fight.
+            self.ignored[hit[0]] = now + MEM_IGNORE_S
+            self.chasing = self.engaged_since = None
+            self.escapes, self.mode = 0, "walled"
+            return None, None, None
         elif stale_target(now, self.engaged_since):
             # Long enough on one target that it is not going to die: already
             # dead and still listed, unreachable, or not attackable. Parking on
@@ -2261,6 +2324,7 @@ def main(port=None):
                             # rather than at the monster, which is the only
                             # thing routing looks like from the outside.
                             state = {"on it": "on it  ",
+                                     "unwedge": "unwedge",
                                      "far": "far    "}.get(eyes.mode,
                                                            "dist  ") + (
                                 f"{mdist:6.1f}" if not eyes.routing
@@ -3063,7 +3127,8 @@ def demo():
     learn = WalkMap(path=os.devnull)
     for i in range(WALK_BLOCK_FRAMES + 1):
         hit = learn.observe(100.0 + i * 0.05, 5.0, 5.0, 1.0, 0.0, ident, "chasing")
-    assert hit == learn.at(5.0 + WALK_BLOCK_AHEAD, 5.0), hit
+    assert hit, "a push that goes nowhere must mark"
+    assert learn.at(5.0 + WALK_BLOCK_AHEAD, 5.0) in learn.hits, learn.hits
 
     # The regression: sliding sideways at full speed while pushing east. Travel
     # is 0.7 a frame -- the speed test saw a bot walking happily -- and progress
@@ -3073,7 +3138,9 @@ def demo():
     for i in range(WALK_BLOCK_FRAMES + 1):
         hit = slide.observe(100.0 + i * 0.05, 5.0, 5.0 + i * 0.7,
                             1.0, 0.0, ident, "chasing")
-    assert hit == slide.at(5.0 + WALK_BLOCK_AHEAD, 5.0 + WALK_BLOCK_FRAMES * 0.7), hit
+    assert hit, "a sideways slide must mark"
+    assert slide.at(5.0 + WALK_BLOCK_AHEAD,
+                    5.0 + WALK_BLOCK_FRAMES * 0.7) in slide.hits, slide.hits
 
     # Real headway is never a wall, whether straight on or at an angle.
     for step in ((0.7, 0.0), (0.5, 0.5)):
@@ -3112,7 +3179,7 @@ def demo():
                    lambda i: (40.0, 5.0), push=(0.7, 0.7))
     assert marked, "a slide that never arrives must be marked"
     # Marked toward the goal, which is east of the track we slid along.
-    assert all(c[0] > slid.at(5.0, 0.0)[0] for c in marked), marked
+    assert max(c[0] for c in slid.hits) > slid.at(5.0, 0.0)[0], slid.hits
 
     # A slide that *is* rounding the obstacle closes on the goal, and must
     # never be marked however long it runs.
@@ -3152,6 +3219,40 @@ def demo():
     early.mark = (0.0, 0.0, 0.0, (1.0, 1.0))
     early.forget_walk()
     assert early.mark is None, "a rebuilt unit throws the window away"
+
+    # Wedged. Measured live: pushing a rock the character never moved, so only
+    # one cell could ever be learned, the route came back unchanged and the bot
+    # pushed the same heading for minutes. Two answers, both needed. A fan of
+    # cells, so the route cannot sidestep the obstacle by one cell...
+    fan = WalkMap(path=os.devnull)
+    for i in range(WALK_BLOCK_FRAMES + 1):
+        fan.observe(100.0 + i * 0.05, 5.0, 5.0, 1.0, 0.0, ident, "chasing")
+    assert len(fan.hits) >= 4, fan.hits
+    assert fan.wedged, "a push that moved us nowhere is a wedge"
+    assert all(c != fan.at(5.0, 5.0) for c in fan.hits), "never block our own cell"
+    # ...and a sideways shove, because no route can free a jammed character.
+    crept = WalkMap(path=os.devnull)
+    creep(crept, 30, lambda i: (5.0, 5.0 + i * 0.4),
+          lambda i: (40.0, 5.0), push=(0.7, 0.7))
+    assert not crept.wedged, "creeping is not a wedge -- we were moving"
+
+    class Wedge(MemoryEyes):
+        def __init__(self):
+            self.walk, self.basis = WalkMap(path=os.devnull), ident
+            self.last_pos, self.goal = (5.0, 5.0), (40.0, 5.0)
+            self.mode, self.loot_mode = "chasing", "no loot"
+            self.escape_side, self.escapes, self.escape_until = 1, 0, 0.0
+            self.escape, self.path = None, None
+    stuck = Wedge()
+    for i in range(WALK_BLOCK_FRAMES + 1):
+        stuck.observe_move(100.0 + i * 0.05, 1.0, 0.0)
+    assert stuck.escape, "a wedge must produce a way out"
+    assert stuck.escape[0] < 0, ("the way out is backwards", stuck.escape)
+    assert stuck.escape_until > 100.0 and stuck.escapes == 1
+    # Alternating sides, so a corner that beats one way out is tried the other.
+    first = stuck.escape
+    stuck.wedge_off(200.0, 1.0, 0.0)
+    assert (first[1] > 0) != (stuck.escape[1] > 0), (first, stuck.escape)
 
     # Floor painted from other units' traffic: only those that moved, and it
     # must never erase a wall we measured ourselves.

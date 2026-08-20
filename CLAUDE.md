@@ -223,6 +223,19 @@ adjusting them over adding code paths.
   position *now* (or a fleeing monster reads as a wall), and restart the window
   rather than judge when the goal jumps more than `WALK_GOAL_JUMP` (or the
   monster we just turned toward gets a wall drawn in front of it).
+- **A router cannot free a character the physics has jammed, and one cell is not
+  a wall.** Measured live, wedged against a rock: the bot marked the *same*
+  single cell for minutes. It never moved, so it could never learn a second one;
+  dodging 1.5 units at 2 units' range bends the heading by 25°, so the route came
+  back effectively unchanged and it pushed the same rock again — stick identical
+  frame after frame. Two answers, both required. `_wall()` blocks a **fan**
+  (`WALK_BLOCK_ARC`, two ranges deep, three ways wide) so a route cannot sidestep
+  an obstacle by one cell, skipping the cell we occupy since `free()` clears it
+  anyway. And a wedge — which only the fast sensor can mean, since it says we did
+  not move at all — fires `wedge_off()`: a fixed sideways-and-back push
+  (`WALK_ESCAPE_TURN`) for `WALK_ESCAPE_S`, **alternating sides**, so a corner
+  that defeats one way out is escaped the other. `WALK_ESCAPE_GIVEUP` escapes on
+  one monster and it is blacklisted as `walled`.
 - **On a route, the slow sensor's goal is the waypoint, not the monster.** A
   detour round a big wall closes no distance on the monster for seconds at a
   time, and judging against it there writes a false wall across the way round
