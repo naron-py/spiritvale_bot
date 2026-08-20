@@ -202,6 +202,11 @@ LOOT_IGNORE_S = 30.0
 # `python memscan.py --loot` prints the names lying around you, which is the
 # list to write this from.
 LOOT_NAMES = ("Grape", "Card", "Essence", "Gem" )          # e.g. ("Flax", "Slingshot", "Pioneer Relic")
+# --lootlog: why a drop was or was not walked to, every frame. An item ignored
+# at the character's feet has three possible causes -- not in the sweep's cache
+# at all, blacklisted, or losing the arbitration -- and they look identical from
+# outside the process.
+LOOT_LOG = "--lootlog" in sys.argv
 # The anchor/leash/patrol feature was cut as buggy: End is a plain toggle again
 # and the bot roams wherever the kills lead. It is in git history if the idea is
 # revisited -- the minimap scale tracking went with it, since sizing the leash
@@ -1588,6 +1593,29 @@ class MemoryEyes:
                 return True
         return False
 
+    def loot_debug(self, now):
+        """Why the loot path offered nothing, in one line.
+
+        An item ignored at the character's feet has three causes that look
+        identical from outside: it is not in the sweep's cache at all, it is
+        blacklisted, or it is not wanted. Naming which one is the whole job.
+        """
+        here = self._positions([self.me]).get(self.me) if self.me else None
+        if not here:
+            return "no position"
+        px, _, pz = here
+        with self.lock:
+            drops = list(self.loot.items())
+        if not drops:
+            return "cache empty -- the sweep is finding no drops at all"
+        near = sorted((math.hypot(x - px, z - pz), d, n)
+                      for d, (x, _, z, n) in drops)[:3]
+        return f"{len(drops)} cached; nearest " + ", ".join(
+            f"{n[:14]}@{dist:.1f}"
+            f"{' IGNORED' if self.loot_ignored.get(d, 0) > now else ''}"
+            f"{'' if wanted_item(n) else ' unwanted'}"
+            for dist, d, n in near)
+
     def pick_loot(self, now):
         """(sx, sy, distance) toward a dropped item, or (None, None, None).
 
@@ -1624,7 +1652,12 @@ class MemoryEyes:
             self.loot_target, self.loot_since = pick[1], now
         elif self.loot_since and now - self.loot_since > LOOT_MAX_S:
             # Same rule the monster path needs: something we cannot collect has
-            # to be dropped, or it owns the bot.
+            # to be dropped, or it owns the bot. The clock counts only time
+            # spent actually walking to it -- main() restarts it on every frame
+            # the item loses the arbitration, because an item that keeps losing
+            # to a nearer monster was otherwise blacklisted for LOOT_IGNORE_S
+            # having never been approached at all, which reads from outside as
+            # the bot ignoring a drop at its feet.
             self.loot_ignored[pick[1]] = now + LOOT_IGNORE_S
             self.loot_target = self.loot_since = None
             self.loot_mode = "loot skip"
@@ -2306,6 +2339,23 @@ def main(port=None):
                                                          else None, ldist):
                             msx, msy, mdist = lsx, lsy, ldist
                             on_loot = True
+                        elif eyes.loot_since:
+                            # It lost this frame, so it is not being walked to
+                            # and LOOT_MAX_S must not run against it.
+                            eyes.loot_since = now
+                        if LOOT_LOG:
+                            if lsx is not None:
+                                print(f"\nlootlog {eyes.loot_name[:14]:14} "
+                                      f"dist {ldist:6.1f} mode "
+                                      f"{eyes.loot_mode:9} monster "
+                                      f"{eyes.mode:8} "
+                                      f"{'TAKE' if on_loot else 'lost'}")
+                            else:
+                                # Nothing was even offered. Which of the three
+                                # reasons it was is the whole question, and only
+                                # the cache can answer it.
+                                print(f"\nlootlog nothing offered ({eyes.loot_mode})"
+                                      f" -- {eyes.loot_debug(now)}")
                     if eyes.me is None:
                         # Do not shut memory targeting down for this: it comes
                         # back on its own once the sweep finds the new unit, and
@@ -2748,6 +2798,23 @@ def demo():
     # every item on the map would otherwise look nearer than the monster).
     assert not loot_wins("on it", 1.0, 1.0), "never walk out of melee"
     assert not loot_wins("unwedge", 0.0, 1.0), "never interrupt an escape"
+
+    # LOOT_MAX_S counts time spent walking to an item, not time the item spent
+    # losing to a nearer monster -- otherwise a drop at our feet is blacklisted
+    # for LOOT_IGNORE_S having never been approached, which is exactly what
+    # "the bot ignores items right next to it" looks like.
+    patient = _Loot(drops=[(0xA000, 5.0, 0.0, "Flax")])
+    patient.pick_loot(2.0)
+    for i in range(20):                     # kept losing, clock kept restarting
+        patient.pick_loot(2.0 + i)
+        patient.loot_since = 2.0 + i
+    assert patient.pick_loot(2.0 + 20) != (None, None, None), "must still be offered"
+    assert 0xA000 not in patient.loot_ignored, patient.loot_ignored
+    # And it says why when it offers nothing at all.
+    assert "cache empty" in _Loot().loot_debug(1.0)
+    shunned = _Loot(drops=[(0xA000, 1.0, 0.0, "Flax")])
+    shunned.loot_ignored[0xA000] = 99.0
+    assert "IGNORED" in shunned.loot_debug(1.0), shunned.loot_debug(1.0)
 
     # Out of range is left alone: crossing the map for an item is not looting.
     away = _Loot(drops=[(0xA000, LOOT_RANGE * 2, 0.0, "Flax")])

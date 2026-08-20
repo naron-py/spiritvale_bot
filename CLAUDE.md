@@ -28,6 +28,7 @@ python minimap_bot.py --test       # walk a blind circle: isolates pad vs vision
 python minimap_bot.py --buff [hold] [gap]   # fire buff sequence once
 python minimap_bot.py --probe      # press every X360 button in turn, named
 python minimap_bot.py --walklog    # what the wall sensor sees, every frame
+python minimap_bot.py --lootlog    # why a drop was or was not walked to
 
 python memscan.py --demo           # memory layer self-check, no game needed
 python memscan.py --units          # list what the unit sweep classifies right now
@@ -322,6 +323,17 @@ adjusting them over adding code paths.
   reports a distance of **0.0**, so without excluding it every drop on the map
   looks nearer than the monster and the escape push would be overridden by loot
   — leaving the bot jammed against the wall it was in the middle of escaping.
+- **`LOOT_MAX_S` counts time spent walking to an item, never time it spent
+  losing.** `loot_since` starts when a drop becomes the *candidate*, and the
+  candidate is recomputed every frame whether or not loot won -- so an item that
+  kept losing to a nearer monster was blacklisted for `LOOT_IGNORE_S` having
+  never been approached at all. From outside that is a bot ignoring a drop at
+  its feet, which is exactly how it was reported. `main()` restarts the clock on
+  every frame the item loses.
+- **Why a drop was skipped has three causes that look identical**: not in the
+  sweep's cache, blacklisted, or not in `LOOT_NAMES`. `loot_debug()` names which,
+  and `--lootlog` prints it. Reach for that before theorising -- the filter was
+  blamed first and the clock turned out to be the fault.
 - **Loot needs its own give-up.** Same lesson as the monsters: an item that
   cannot be collected holds the bot on the spot pressing a trigger forever.
   `LOOT_MAX_S` then `LOOT_IGNORE_S`.
