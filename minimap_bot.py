@@ -186,7 +186,7 @@ LOOT_RANGE = 40.0        # world units; do not cross the map for a drop
 # it is seconds of walking and the monster is still there afterwards. Melee is
 # still exempt: walking out of a fight already joined is how a bot dies, and a
 # drop under our feet is collected by LOOT_BUTTON regardless.
-LOOT_FIRST_RANGE = 15.0  # world units; 0 turns this off and restores nearest-wins
+LOOT_FIRST_RANGE = 40.0  # world units; 0 turns this off and restores nearest-wins
 LOOT_ARRIVE = 2.0        # world units; where LOOT_BUTTON is pressed
 LOOT_BUTTON = "lt"       # left trigger picks the item up
 LOOT_HOLD_S = 0.12
@@ -198,7 +198,7 @@ LOOT_TAP_GAP_S = 0.5     # between presses while standing on a drop
 # and 6.0 gave up on items the bot was still walking toward. This counts only
 # time actually spent going for it -- main() restarts it on any frame the item
 # loses the arbitration -- so it is a real walking budget, not a wall clock.
-LOOT_MAX_S = 15.0
+LOOT_MAX_S = 6.0
 LOOT_IGNORE_S = 30.0
 # Which items to walk to, matched against the name the tooltip shows. Empty
 # means every item the bot can see. Each entry is a case-insensitive substring,
@@ -2791,10 +2791,14 @@ def demo():
     assert not _Loot(drops=[(0xA000, LOOT_ARRIVE * 3, 0.0, "Flax")]).loot_here()
 
     # Who wins the frame. Nearest-wins alone left drops lying on a busy map,
-    # where a monster is almost always the nearer of the two.
-    assert loot_wins("chasing", 4.0, LOOT_FIRST_RANGE - 1), "close item goes first"
-    assert not loot_wins("chasing", 4.0, LOOT_FIRST_RANGE + 5), "far item waits"
-    assert loot_wins("chasing", 30.0, LOOT_FIRST_RANGE + 5), "unless it is nearer"
+    # where a monster is almost always the nearer of the two. Pinned rather than
+    # read from the constant: at LOOT_FIRST_RANGE == LOOT_RANGE every drop that
+    # can be offered is inside it, and the nearest-wins half is unreachable.
+    global LOOT_FIRST_RANGE
+    kept_first, LOOT_FIRST_RANGE = LOOT_FIRST_RANGE, 15.0
+    assert loot_wins("chasing", 4.0, 14.0), "close item goes first"
+    assert not loot_wins("chasing", 4.0, 20.0), "far item waits"
+    assert loot_wins("chasing", 30.0, 20.0), "unless it is nearer"
     assert loot_wins("far", 80.0, 39.0), "a far monster always yields"
     assert loot_wins("no monster", None, 39.0), "nothing to fight, so loot"
     assert not loot_wins("chasing", 4.0, None), "no item, no contest"
@@ -2803,6 +2807,7 @@ def demo():
     # every item on the map would otherwise look nearer than the monster).
     assert not loot_wins("on it", 1.0, 1.0), "never walk out of melee"
     assert not loot_wins("unwedge", 0.0, 1.0), "never interrupt an escape"
+    LOOT_FIRST_RANGE = kept_first
 
     # LOOT_MAX_S counts time spent walking to an item, not time the item spent
     # losing to a nearer monster -- otherwise a drop at our feet is blacklisted
