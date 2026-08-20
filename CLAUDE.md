@@ -310,9 +310,18 @@ adjusting them over adding code paths.
   "Axe" takes every Battle Axe too. Empty means take everything.
   `python memscan.py --loot` prints what is lying around, which is the list to
   write it from.
-- **Loot never interrupts a fight.** `pick_loot()` is consulted only when the
-  monster path has nothing, or when its mode is `far` -- an item two steps away
-  beats a walk across the map, and the monster is still there afterwards.
+- **Who wins the frame is `loot_wins()`, and nearest-wins was not enough.** On a
+  busy map a monster is almost always the nearer of the two, so drops a few steps
+  away lost every arbitration until they despawned. Inside `LOOT_FIRST_RANGE` the
+  item now takes precedence outright; beyond it, nearest still wins. Set
+  `LOOT_FIRST_RANGE = 0` to restore the old rule.
+- **Two modes are never interrupted, and both are load-bearing.** `on it` is a
+  fight already joined — walking out of one is how a bot dies, and an item at our
+  feet is collected by `LOOT_BUTTON` without moving anyway (`loot_here()`, checked
+  even mid-fight, because the kill drops the item where we stand). `unwedge`
+  reports a distance of **0.0**, so without excluding it every drop on the map
+  looks nearer than the monster and the escape push would be overridden by loot
+  — leaving the bot jammed against the wall it was in the middle of escaping.
 - **Loot needs its own give-up.** Same lesson as the monsters: an item that
   cannot be collected holds the bot on the spot pressing a trigger forever.
   `LOOT_MAX_S` then `LOOT_IGNORE_S`.

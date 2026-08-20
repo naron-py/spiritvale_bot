@@ -180,6 +180,13 @@ LIVE_TTL_S = 0.4
 # path has nothing: walking off to an item mid-fight is how a bot dies.
 LOOT_PICKUP = True
 LOOT_RANGE = 40.0        # world units; do not cross the map for a drop
+# Nearest-wins alone left items on the ground: on a busy map a monster is
+# almost always the nearer of the two, so a drop a few steps away lost every
+# arbitration until it despawned. Inside this radius the item wins outright --
+# it is seconds of walking and the monster is still there afterwards. Melee is
+# still exempt: walking out of a fight already joined is how a bot dies, and a
+# drop under our feet is collected by LOOT_BUTTON regardless.
+LOOT_FIRST_RANGE = 15.0  # world units; 0 turns this off and restores nearest-wins
 LOOT_ARRIVE = 2.0        # world units; where LOOT_BUTTON is pressed
 LOOT_BUTTON = "lt"       # left trigger picks the item up
 LOOT_HOLD_S = 0.12
@@ -1151,6 +1158,27 @@ def world_for(basis, sx, sy):
     """
     (a, b), (c, d) = basis
     return a * sx + b * sy, c * sx + d * sy
+
+
+def loot_wins(mode, mdist, ldist):
+    """Does the drop beat the monster this frame?
+
+    Nearest-wins alone left items lying: on a busy map the monster is almost
+    always nearer, so a drop a few steps away lost every arbitration until it
+    despawned. Inside LOOT_FIRST_RANGE the item takes precedence outright.
+
+    Two modes are never interrupted. "on it" is a fight already joined, and
+    walking out of one is how a bot dies -- an item under our feet is collected
+    by LOOT_BUTTON anyway, without moving. "unwedge" is the character backing
+    out of something it is jammed against, and it reports a distance of zero:
+    overriding that push would leave the bot stuck against the wall it is in
+    the middle of escaping.
+    """
+    if ldist is None or mode in ("on it", "unwedge"):
+        return False
+    if mdist is None or mode == "far":
+        return True
+    return ldist <= LOOT_FIRST_RANGE or ldist < mdist
 
 
 def stale_target(now, engaged_since, limit=MEM_ENGAGE_MAX_S):
@@ -2271,18 +2299,11 @@ def main(port=None):
                     # away is worth more than a walk across the map, and the
                     # monster is still there afterwards. Never mid-fight.
                     on_loot = False
-                    if LOOT_PICKUP and eyes.mode != "on it":
-                        # Gating this on "no monster or a far one" meant loot
-                        # was never picked up at all on a busy map: there is
-                        # always another monster, so the bot fought past a pile
-                        # of items forever. An item nearer than the monster is
-                        # two steps and a trigger press, and the monster is
-                        # still there afterwards -- so nearest wins. Only a
-                        # fight already in melee ("on it") is left alone.
+                    if LOOT_PICKUP and eyes.mode not in ("on it", "unwedge"):
                         lsx, lsy, ldist = eyes.pick_loot(now)
-                        if lsx is not None and (msx is None
-                                                or eyes.mode == "far"
-                                                or ldist < mdist):
+                        if lsx is not None and loot_wins(eyes.mode, mdist
+                                                         if msx is not None
+                                                         else None, ldist):
                             msx, msy, mdist = lsx, lsy, ldist
                             on_loot = True
                     if eyes.me is None:
@@ -2713,6 +2734,20 @@ def demo():
     underfoot = _Loot(drops=[(0xA000, LOOT_ARRIVE / 2, 0.0, "Flax")])
     assert underfoot.loot_here() and underfoot.loot_name == "Flax"
     assert not _Loot(drops=[(0xA000, LOOT_ARRIVE * 3, 0.0, "Flax")]).loot_here()
+
+    # Who wins the frame. Nearest-wins alone left drops lying on a busy map,
+    # where a monster is almost always the nearer of the two.
+    assert loot_wins("chasing", 4.0, LOOT_FIRST_RANGE - 1), "close item goes first"
+    assert not loot_wins("chasing", 4.0, LOOT_FIRST_RANGE + 5), "far item waits"
+    assert loot_wins("chasing", 30.0, LOOT_FIRST_RANGE + 5), "unless it is nearer"
+    assert loot_wins("far", 80.0, 39.0), "a far monster always yields"
+    assert loot_wins("no monster", None, 39.0), "nothing to fight, so loot"
+    assert not loot_wins("chasing", 4.0, None), "no item, no contest"
+    # Two pushes that must never be interrupted: a fight already joined, and a
+    # character in the middle of backing out of a wedge (which reports 0.0, so
+    # every item on the map would otherwise look nearer than the monster).
+    assert not loot_wins("on it", 1.0, 1.0), "never walk out of melee"
+    assert not loot_wins("unwedge", 0.0, 1.0), "never interrupt an escape"
 
     # Out of range is left alone: crossing the map for an item is not looting.
     away = _Loot(drops=[(0xA000, LOOT_RANGE * 2, 0.0, "Flax")])
