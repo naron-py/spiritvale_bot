@@ -20,7 +20,9 @@ is read-only (`ReadProcessMemory`); nothing is written and nothing is injected.
 python -m venv .venv && .venv\Scripts\activate
 pip install -r requirements.txt
 
-python minimap_bot.py              # run, vgamepad (virtual X360) backend
+python minimap_bot.py              # run, minimap targeting (default)
+python minimap_bot.py --memory     # run, memory targeting (unit list)
+python minimap_bot.py --minimap    # run, red dots only, never memory
 python minimap_bot.py --port auto  # run, Arduino Leonardo serial backend
 python minimap_bot.py --demo       # the test suite (see below)
 python minimap_bot.py --snap       # dump minimap_snap.png with detections drawn
@@ -28,6 +30,8 @@ python minimap_bot.py --test       # walk a blind circle: isolates pad vs vision
 python minimap_bot.py --buff [hold] [gap]   # fire buff sequence once
 python minimap_bot.py --probe      # press every X360 button in turn, named
 python minimap_bot.py --walklog    # what the wall sensor sees, every frame
+python minimap_bot.py --record <name>  # walk the area to farm; End saves it
+python minimap_bot.py --area <name>    # run confined to a recorded area
 python minimap_bot.py --lootlog    # why a drop was or was not walked to
 
 python memscan.py --demo           # memory layer self-check, no game needed
@@ -92,7 +96,12 @@ scanning at the bottom of the file — no argparse in `minimap_bot.py`.
    steers at a waypoint; a goal with no route at all is blacklisted (`walled`).
    Both channels persist to `walkmap.json` (gitignored) from the background
    thread. `PATHFIND = False` turns all of it off; `--walklog` shows the sensor.
-5. **Pad backends** — `VirtualPad` (vgamepad/ViGEmBus, XInput) and `ArduinoPad`
+5. **Farming areas** -- `Area` is a named set of cells painted by walking the
+   ground with `--record <name>`, saved to `areas.json` (gitignored). With
+   `--area <name>` the bot only targets monsters and loot inside it, walks back
+   when it ends up outside, and wanders inside it when nothing is left to kill.
+   Without `--area` the whole feature is inert and the bot roams as before.
+6. **Pad backends** — `VirtualPad` (vgamepad/ViGEmBus, XInput) and `ArduinoPad`
    (serial to a Leonardo). Duck-typed, same methods: `stick(sx, sy, attack)`,
    `tap_dpad(name, hold)`, `tap_trigger(name, hold)`, `close()`. Pick a backend by adding a class with those
    three methods; nothing else in the file knows the difference.
@@ -202,6 +211,36 @@ adjusting them over adding code paths.
   own position against the stick we sent says where a wall is; every *other*
   unit's position says where floor is, because monsters and players walk the
   same navmesh and the sweep already carries hundreds of them.
+- **A repeated position is the feed hiccuping, not a wall, and counting frames
+  can never tell them apart.** `UNIT_POSITION` is `_lastValidPosition` --
+  server-validated, not the live transform -- and it repeats for several frames
+  at a time as a matter of course. Measured at 20 Hz: walking by hand, 4% of
+  frames repeated with one run of **8**; with the bot driving, runs of 3, 4, 5,
+  6 *and* 7 inside a single 8 s window. `WALK_BLOCK_FRAMES` was 6, so that is
+  two fake walls every 8 seconds, ~15 a minute, stamped on open ground -- and
+  from outside it is a bot that walks three steps, turns away from nothing, and
+  repeats forever, which is exactly how it was reported. Raising the number
+  cannot fix it: a slow feed and a wall both read as "did not move". So
+  `observe()` lets **neither** sensor judge on a repeat -- the slow one is
+  fooled just as badly, since a stall spanning its window leaves both endpoints
+  holding the same value and a walking character reads as gaining nothing.
+  Four things were measured and ruled out first, all
+  cheaper to re-check than to re-derive: the read path is healthy (36 units
+  moved in the same 8 s), `local_player()` has the right unit (51.4 units of
+  travel while walking), holding attack does **not** root the character (0%
+  stalled held, and it is the *smoother* leg), and a zero stick does **not**
+  strand the game in keyboard mode (0-frame lead-in freeze).
+- **Being jammed cannot be timed off repeated reads either, and the threshold
+  version was tried and failed.** `WALK_STALL_S = 1.0` was set against a worst
+  measured stall of 8 frames; a loaded run then produced runs of 15, 17 and 26
+  frames (1.3 s) with the feed at 12.4 Hz, and the bot called every one of them
+  a jam -- same fake walls, new sensor, and `--walklog` filled with `stalled
+  1.0s ... jammed` while the target distance kept changing, which is proof
+  things were moving. Any such limit races a feed that slows under load. What
+  actually separates the two: a stall *ends* with the position jumping to where
+  the character walked, a jam ends where it started. So `_jammed()` measures
+  **displacement across `WALK_JAM_S`** and does not care how many samples
+  arrived.
 - **Progress, not speed, is what a wall takes away.** The first version marked a
   wall when per-frame travel fell under a floor — and learned almost nothing,
   because Unity slides a character along the collider it is pushed into, so
@@ -280,6 +319,82 @@ adjusting them over adding code paths.
 - **Routing does not get its own `mode`.** It sets `eyes.routing` and prints a
   `~` instead. `mode` is read by the loot arbitration (`far` gives loot its
   turn) and by the wall learner, and a fifth value silently changed both.
+
+### Choosing the target source
+
+- **Minimap is the default and memory is opt-in (`--memory`).** The pixel path
+  needs nothing from the game's memory, so it survives a patch and starts
+  instantly; the memory path is better when it works but costs a heap sweep at
+  startup and goes stale every patch. `targeting_mode()` holds the rule and is
+  asserted in `demo()`.
+- **`--area` implies `--memory`, and an explicit `--minimap` still wins.** A
+  recorded area is world coordinates and the screen cannot say where in the
+  world anything is, so there is nothing for the fence to test on the pixel
+  path -- `main()` says the area is being ignored rather than pretending to
+  confine the bot. Silently overriding a flag the user typed is worse than
+  refusing it.
+
+### Farming areas
+
+- **Nothing in the game says which map you are on.** Checked against both files
+  and `il2cpp_rva.json`: the memory layer resolves `MonsterController`,
+  `PlayerController`, `SummoningComponent` and `LootDrop`, and nothing else.
+  There is no scene name, zone id or map id anywhere. So an area cannot be
+  auto-selected and has to be named on the command line -- and `--area` pointed
+  at the wrong map puts "home" thousands of units away. `AREA_ABANDON` and
+  `AREA_RETURN_MAX_S` turn the fence off with a printed reason rather than let
+  the bot lean into scenery on another continent for an hour.
+- **Two thresholds, never one.** `inside()` is the boundary and `deep()` (every
+  one of the eight neighbours painted) is the line to get back over before the
+  walk-back releases. The deleted leash had a single threshold and bounced along
+  it forever against a monster standing on the line; `AREA_CELL = 3.0` is twice
+  `WALK_CELL` precisely so one cell of commit is ~4 frames of travel rather
+  than two, which is single-frame-flap territory.
+- **The walk-back is routed, never steered straight.** The leash aimed raw at
+  its anchor with `stick_for` and so leaned on rock for minutes; `_go_home()`
+  goes through `route_to()`, and sits *below* the `unwedge` override so the
+  physical escape always wins.
+- **It returns the real distance, not zero.** `loot_wins()` compares that
+  against the nearest drop, and a hard zero would make walking home unbeatable
+  by an item two steps ahead of it -- the same trap `unwedge` sets.
+- **`returning` is its own flag, not `self.mode`.** The leash derived it from
+  the mode string, which is also the status line and is overwritten by half a
+  dozen branches, so the state evaporated mid-return.
+- **`AREA_SLACK` < `AREA_HOLD` < `AREA_LEAVE`, and they are one chain.** A new
+  target may sit `AREA_SLACK` outside the paint (a monster a step over the line
+  is killable from inside, and refusing it makes the whole boundary band
+  unfarmable); one already being fought is kept to `AREA_HOLD`; and *we* only
+  count as having left at `AREA_LEAVE = AREA_HOLD + MEM_ARRIVE`. Measured with
+  a single slack number instead: the bot chased a legal target past the paint,
+  reaching it put the character outside, that instantly triggered the walk
+  back, and the target was still legal -- so it alternated `dist` and `back in`
+  forever, which from outside is a character walking left, right, left, right.
+  Reaching anything we are allowed to hit must never itself be a violation.
+- **The area filter is applied *after* the sort, not inside it.** Filtering
+  first meant `held` was looked up in the filtered list, so a monster stepping
+  over the line vanished, `held` came back `None`, and the bot took a different
+  target -- bypassing `TARGET_SWITCH` entirely, which is the only rule stopping
+  it flapping between two monsters at a similar distance. `--targetlog` prints
+  one line per target change and is how this was told apart from a single
+  monster simply running away; both look identical on screen.
+- **A wander point must be committed to, or the bot shakes on the spot.**
+  `spot()` is uniform over the area, so on a small one most picks land inside
+  `AREA_WANDER_REACHED` and count as *arrived the moment they are chosen* --
+  the next frame picks another, 20 changes of direction a second. Reported as
+  the bot "walking left and right continuously". Two things fix it and both are
+  needed: `_wander_spot()` prefers a point at least `AREA_WANDER_MIN` away, and
+  `AREA_WANDER_COMMIT_S` refuses to change target more often than that whatever
+  happens -- an area too small to hold a distant point cannot flap either way.
+  The demo asserts the *rate of change*, not the destination, because that is
+  what the symptom actually was.
+- **`spot()` picks uniformly from cells, which is uniform over area for free**
+  -- the thing the deleted `patrol_point()` needed a `sqrt()` bias to fake on a
+  circle.
+- **The cell you stand in is always painted**, whatever the brush: its centre
+  can be further from you than `AREA_BRUSH`, and then a whole walk records
+  nothing at all.
+- **`--record` and the bot must not run at once.** Both poll End through
+  `GetAsyncKeyState`, whose low bit is consumed by whichever reads it first.
 
 ### Loot pickup
 

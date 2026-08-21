@@ -13,6 +13,7 @@ import heapq
 import json
 import math
 import os
+import random
 import struct
 import sys
 import threading
@@ -120,6 +121,8 @@ CHAR_BG = ((0.03, 0.50), (0.50, 0.06), (0.70, 0.85), (0.06, 0.60))
 # what a thing IS -- monster, pet, player -- so the pet, other players' pets,
 # mushroom terrain art and the minimap's rotation all stop mattering at once.
 # Falls back to the screen path when the offsets go stale, which a patch does.
+# The master switch. `targeting_mode()` picks per run; this only says the
+# memory path may be used at all.
 MEMORY_TARGETING = True
 MEM_REFRESH_S = 2.0      # rediscovering units scans GBs; positions are re-read
 MEM_RANGE = 70.0         # world units; roughly what the minimap used to cover
@@ -206,7 +209,7 @@ LOOT_IGNORE_S = 30.0
 # name still works, and a short entry catches everything containing it.
 # `python memscan.py --loot` prints the names lying around you, which is the
 # list to write this from.
-LOOT_NAMES = ("Grape", "Card", "Essence", "Gem" )          # e.g. ("Flax", "Slingshot", "Pioneer Relic")
+LOOT_NAMES = ("Grape", "idol", "termite", "Acorn", "Card", "Essence", "Gem")          # e.g. ("Flax", "Slingshot", "Pioneer Relic")
 # --lootlog: why a drop was or was not walked to, every frame. An item ignored
 # at the character's feet has three possible causes -- not in the sweep's cache
 # at all, blacklisted, or losing the arbitration -- and they look identical from
@@ -251,7 +254,30 @@ WALK_CELL = 1.5          # world units per grid cell; under MEM_ARRIVE (2.5)
 # slide gives ~0.5 and is real headway, so this sits between them.
 # ponytail: a calibration knob, not a measurement -- --walklog prints the number.
 WALK_BLOCK_PROGRESS = 0.25   # world units per frame, projected onto the push
-WALK_BLOCK_FRAMES = 3    # consecutive such frames before calling it a wall
+# Only frames that carried a *fresh* position count. UNIT_POSITION is
+# _lastValidPosition -- server-validated, not the live transform -- and it
+# repeats for several frames at a time as a matter of course. Measured at 20 Hz:
+# walking by hand, 4% of frames repeated with one run of 8; with the bot driving,
+# runs of 3, 4, 5, 6 and 7 inside a single 8 s window. So a repeat is the normal
+# state of the feed, not evidence of anything, and counting consecutive frames
+# cannot separate the two cases -- a slow feed and a wall both read as "did not
+# move". At 6 that fired twice in 8 s, roughly 15 fake walls a minute, and the
+# bot spent the session walking three steps and turning away from nothing.
+WALK_BLOCK_FRAMES = 6    # consecutive *fresh* such frames before calling it a wall
+# A repeat says nothing until it lasts far longer than the feed's own hiccups.
+# The longest measured is 8 frames (0.4 s), so this is well clear of it, and it
+# is the only sensor that can see a character the physics has jammed: wedged, no
+# Being jammed cannot be timed off repeated reads either, and a threshold was
+# tried and failed: 1.0 s was set against a measured worst stall of 8 frames,
+# then a loaded run produced runs of 15, 17 and 26 frames (1.3 s) with the
+# feed down at 12.4 Hz, and the bot called every one of them a jam. Any such
+# limit races a feed that slows under load. What separates the two is that a
+# stall *ends* with the position jumping to where the character actually
+# walked, while a jammed one reads the same after it as before -- so measure
+# displacement across a window and let the sample count be whatever it is.
+# Walking covers ~14 units/s, so a free character clears tens of units here.
+WALK_JAM_S = 2.5         # window the jam test measures displacement over
+WALK_JAM_MIN = 1.5       # world units of travel in it that counts as moving
 # The push test only catches a steep hit. Measured against 0.81 free walking, a
 # slide sees 0.81*cos(angle into the wall)^2: 0.00 head on, 0.20 at 60 degrees --
 # both caught -- but 0.41 at 45 and 0.61 at 30, which read as ordinary walking.
@@ -295,13 +321,76 @@ WALK_SAVE_S = 30.0       # the map is written from the scanner thread
 # stops taking new cells. Age them out if that ever turns out to matter.
 WALK_FLOOR_MAX = 200000  # cells of proven floor kept, ~2 MB of JSON
 WALK_LOG = "--walklog" in sys.argv   # print what the wall sensor sees
+# --targetlog: one line every time the chased monster changes. A bot that
+# walks left, right, left is either following one monster that is running
+# or flipping between two, and those need opposite fixes.
+TARGET_LOG = "--targetlog" in sys.argv
+
+# A named patch of ground to farm, recorded by walking it. The shape is the
+# cells walked through, fattened by AREA_BRUSH -- a mask, not a shape. There is
+# no centre and no radius, which is the point: a farming spot is a strip of road
+# or a clearing with a tail, and the circle the deleted leash used either cut
+# half of it off or swallowed the next camp.
+# Deliberately 2x WALK_CELL, and that is the hysteresis quantum: one cell of
+# commit is ~4 frames of travel at the measured ~0.7 units/frame. At WALK_CELL
+# it would be two frames, which is single-frame-flap territory -- the exact
+# failure the leash died of.
+AREA_CELL = 3.0          # world units per cell
+# Must stay at least ~1.5x AREA_CELL or `core` comes out empty and the bot can
+# never finish walking back in. recore() falls back rather than hang, but this
+# is a real tuning trap.
+AREA_BRUSH = 6.0         # painted either side of the walked line, ~12 wide
+AREA_STEP = 1.5          # recorder repaints only after moving this far
+AREA_SAMPLE_S = 0.2      # nobody walks AREA_STEP in less
+# A monster one step over the line is still killable from inside, and refusing
+# it makes the whole boundary band unfarmable. This is a test on the *target*,
+# and is deliberately not hysteretic -- entangling the two is how the leash
+# ended up oscillating.
+AREA_SLACK = 4.0         # units a *new* target may sit outside the paint
+# These three are one chain and must stay ordered, or the bot fights itself.
+# Measured: with only AREA_SLACK, the bot chased a legal target four units out,
+# stepped over the line to reach it, instantly called that "outside the area"
+# and walked home -- then chased the same legal target again. The status line
+# alternated `dist` and `back in` forever, which from outside is a character
+# walking left, right, left, right.
+# So: a target already being fought gets more rope than a new one (the same
+# hysteresis idea as TARGET_SWITCH, and it stops a monster loitering on the
+# line from being dropped and re-taken every frame), and we only count as
+# having *left* at AREA_HOLD plus melee reach -- so reaching anything we are
+# allowed to hit can never itself trigger the walk back.
+AREA_HOLD = 6.0          # units the target we are already on may sit outside
+AREA_LEAVE = AREA_HOLD + MEM_ARRIVE   # how far out *we* go before walking back
+AREA_WANDER_HOLD_S = 6.0 # give up on one wander point after this
+AREA_WANDER_REACHED = 4.0
+# A point picked closer than AREA_WANDER_REACHED counts as arrived the moment
+# it is chosen, so the next frame picks another -- 20 changes of direction a
+# second, which from outside is a character shaking left and right on the spot.
+# Two answers, and both are needed: prefer somewhere actually worth walking to,
+# and refuse to change target more often than this whatever happens, so even an
+# area too small to hold a distant point cannot flap.
+AREA_WANDER_MIN = 12.0   # how far away a new wander point should be
+AREA_WANDER_TRIES = 12   # random picks tried before taking what we can get
+AREA_WANDER_COMMIT_S = 1.5
+# Further out than this is another map, not a stray step -- nothing records
+# which map an area belongs to, so `--area` on the wrong one puts home
+# thousands of units away. Walking "back" then is an hour of leaning into
+# scenery on the wrong continent.
+# ponytail: store a map id beside the cells if this ever fires by accident.
+AREA_ABANDON = 150.0     # further than this from home: give up, unfence
+AREA_RETURN_MAX_S = 45.0 # returning this long means it is not working
+# Next to the script, not in the cwd: WALK_FILE is a bare relative name, so
+# recording from one directory and running from another would silently disagree.
+AREA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "areas.json")
 
 
 def wake_controller(pad):
     """SpiritVale stays in keyboard mode until it sees stick motion, and button
     presses sent before that are dropped. A there-and-back nudge flips it."""
+    # L1 stays down through every push that moves the character: a warp portal
+    # takes a walker but not an attacker, and a map change tears down our unit,
+    # the basis and the walk map. Same reason in calibrate() and camera_check().
     for sx, sy in ((0.0, WAKE_AMP), (0.0, -WAKE_AMP), (0.0, 0.0)):
-        pad.stick(sx, sy, False)
+        pad.stick(sx, sy, True)
         time.sleep(WAKE_STEP_S)
     # The game eats the first button press while it swaps input modes, which is
     # why the leading d-pad press went missing. Let the swap finish.
@@ -379,9 +468,9 @@ def camera_rotation(pad, sct, win, legs=((1.0, 0.0), (0.0, 1.0),
         before = gray()
         t0 = time.time()
         while time.time() - t0 < CAMERA_LEG_S:
-            pad.stick(sx, sy, False)
+            pad.stick(sx, sy, True)
             time.sleep(0.05)
-        pad.stick(0.0, 0.0, False)
+        pad.stick(0.0, 0.0, True)
         time.sleep(0.2)
         (mx, my), _ = cv2.phaseCorrelate(before, gray(), han)
         pairs.append(((sx, sy), (mx, my)))
@@ -759,8 +848,9 @@ class WalkMap:
         self.hits = {}            # (cx, cz) -> [sightings, last seen]
         self.floor = set()        # (cx, cz) something has walked in
         self.lock = threading.Lock()
-        self.still = 0            # frames in a row we asked to move and did not
+        self.still = 0            # fresh frames in a row we asked to move and did not
         self.last_pos = None      # our position at the previous observation
+        self.anchor = None        # (time, x, z) the jam window measures from
         self.mark = None          # (time, x, z, goal) the slow sensor judges from
         self.wedged = False       # the last wall came from being unable to move
         self.capped = False       # the last route ran out of budget, not of map
@@ -913,6 +1003,7 @@ class WalkMap:
         """
         if mode not in ("chasing", "far", "loot"):
             self.still, self.last_pos, self.mark = 0, None, None
+            self.anchor = None
             return None
         self.free(px, pz)
         was, self.last_pos = self.last_pos, (px, pz)
@@ -920,6 +1011,7 @@ class WalkMap:
         # sensor may judge: the window has to start again when we do.
         if was is None or not basis or not (sx or sy):
             self.still, self.mark = 0, None
+            self.anchor = None
             return None
         wx, wz = world_for(basis, sx, sy)
         n = math.hypot(wx, wz)
@@ -927,6 +1019,18 @@ class WalkMap:
             self.still, self.mark = 0, None
             return None
         ux, uz = wx / n, wz / n
+        jam = self._jammed(now, px, pz, ux, uz)
+        if jam:
+            return jam
+        # A repeat is the feed hiccuping, not a measurement: there is no travel
+        # to project, and counting it as "did not move" is what stamped walls
+        # across open ground. Neither sensor may judge on one -- the slow one is
+        # fooled just as badly, since a stall long enough to span its window
+        # leaves both of its endpoints holding the same repeated value and it
+        # reads a walking character as having gained nothing. Wait for a fresh
+        # position; the jam window above is what notices when none ever comes.
+        if was == (px, pz):
+            return None
         # Speed is not the test. Pushed into a wall the game slides the
         # character along it at nearly full pace, so travel stays high while
         # nothing is gained -- which is why measuring speed learned almost no
@@ -948,6 +1052,33 @@ class WalkMap:
             self.still = 0
             return self._wall(now, px, pz, ux, uz, "push")
         return self._creeping(now, px, pz, goal)
+
+    def _jammed(self, now, px, pz, ux, uz):
+        """Wall from the jam window: pushing for `WALK_JAM_S` and still here.
+
+        Repeated position reads cannot answer this. The feed serves the same
+        value for runs of 26 frames under load, so any "no fresh position for
+        N seconds" test fires on ordinary hiccups -- measured, it fired on every
+        one of them. Displacement over a window does not care how many samples
+        arrived: a stall ends with the position jumping to where the character
+        walked, and a jam ends where it started.
+        """
+        if self.anchor is None:
+            self.anchor = (now, px, pz)
+            return None
+        since, ax, az = self.anchor
+        if now - since < WALK_JAM_S:
+            return None
+        gone = math.hypot(px - ax, pz - az)
+        self.anchor = (now, px, pz)
+        if WALK_LOG:
+            print()
+            print(f"walklog jam window {now - since:4.1f}s moved {gone:6.2f}"
+                  f" (need {WALK_JAM_MIN})")
+        if gone >= WALK_JAM_MIN:
+            return None
+        self.still = 0
+        return self._wall(now, px, pz, ux, uz, "push")
 
     def _creeping(self, now, px, pz, goal):
         """Wall from the slow sensor: a window that brought us no closer.
@@ -1015,6 +1146,7 @@ class WalkMap:
     def forget_walk(self):
         """Our unit changed or the bot was paused; the world did not."""
         self.still, self.last_pos, self.mark = 0, None, None
+        self.anchor = None
 
     # -- persistence --------------------------------------------------------
     def load(self):
@@ -1041,6 +1173,165 @@ class WalkMap:
         try:
             with open(self.path, "w") as f:
                 json.dump({"cell": self.cell, "blocked": rows, "floor": floor}, f)
+        except OSError:
+            return False
+        return True
+
+
+class Area:
+    """A named patch of ground to farm, painted by walking it.
+
+    Cells the character walked through, fattened by `AREA_BRUSH`. Two questions
+    are asked of it and they are deliberately different: `inside()` is the
+    boundary, `deep()` is the line the bot has to get back over before it
+    counts as returned. The gap between them is one cell, and it is the whole
+    hysteresis -- the deleted leash had none at first and bounced along its
+    circle forever against a monster standing on the line.
+    """
+
+    def __init__(self, name, cells=None, path=AREA_FILE, cell=AREA_CELL):
+        self.name, self.path, self.cell = name, path, cell
+        self.cells = set(cells or ())
+        self._core = set()       # cells with all eight neighbours painted
+        self._core_list = []     # the same, ordered, so a pick is reproducible
+        self._stale = True       # recompute those on the next question asked
+
+    def at(self, x, z):
+        return (math.floor(x / self.cell), math.floor(z / self.cell))
+
+    def centre(self, c):
+        return ((c[0] + 0.5) * self.cell, (c[1] + 0.5) * self.cell)
+
+    def paint(self, x, z):
+        """Stamp the brush disc around one sampled position."""
+        n = int(AREA_BRUSH / self.cell) + 1
+        cx, cz = self.at(x, z)
+        # The cell we are standing in always counts, whatever the brush: its
+        # centre can be further from us than AREA_BRUSH, and then a walk would
+        # paint nothing at all.
+        self.cells.add((cx, cz))
+        for dx in range(-n, n + 1):
+            for dz in range(-n, n + 1):
+                k = (cx + dx, cz + dz)
+                kx, kz = self.centre(k)
+                if math.hypot(kx - x, kz - z) <= AREA_BRUSH:
+                    self.cells.add(k)
+        self._stale = True
+
+    @property
+    def core(self):
+        """Cells it is safe to *stand* in: painted, and not on the fringe.
+
+        Everything that picks a point to walk to -- returning, wandering --
+        picks from here, so arriving always satisfies `deep()` and the bot is
+        never left one step short of being back inside.
+
+        Recomputed lazily rather than per brush stamp: the recorder paints
+        several times a second and an area runs to thousands of cells, so
+        rebuilding this on every stamp is the one place this could get slow.
+        """
+        self._recore()
+        return self._core
+
+    @property
+    def core_list(self):
+        self._recore()
+        return self._core_list
+
+    def _recore(self):
+        if not self._stale:
+            return
+        self._stale = False
+        self._core = {c for c in self.cells
+                     if all((c[0] + dx, c[1] + dz) in self.cells
+                            for dx in (-1, 0, 1) for dz in (-1, 0, 1))}
+        if not self._core:
+            # A recording too thin to have a middle. Better a bot with no
+            # hysteresis than one that can never finish walking back in.
+            self._core = set(self.cells)
+        self._core_list = sorted(self._core)
+
+    def inside(self, x, z, slack=0.0):
+        """Painted here, or within `slack` world units of painted ground."""
+        c = self.at(x, z)
+        if c in self.cells:
+            return True
+        if slack <= 0.0:
+            return False
+        n = int(slack / self.cell) + 1
+        for dx in range(-n, n + 1):
+            for dz in range(-n, n + 1):
+                k = (c[0] + dx, c[1] + dz)
+                if k not in self.cells:
+                    continue
+                kx, kz = self.centre(k)
+                if math.hypot(kx - x, kz - z) <= slack + self.cell * 0.5:
+                    return True
+        return False
+
+    def deep(self, x, z):
+        """Well inside, not merely inside. See `AREA_CELL`."""
+        return self.at(x, z) in self.core
+
+    def home(self, x, z):
+        """Nearest cell it is safe to stand in.
+
+        Linear over the cell set, and only ever called while the character is
+        outside the area, which is rare and brief.
+        """
+        if not self.core_list:
+            return x, z
+        c = min(self.core_list,
+                key=lambda k: (self.centre(k)[0] - x) ** 2
+                + (self.centre(k)[1] - z) ** 2)
+        return self.centre(c)
+
+    def spot(self, rng):
+        """Somewhere random to stand. Uniform over cells is uniform over area,
+        which is what the deleted patrol_point() needed a sqrt() to fake."""
+        return self.centre(rng.choice(self.core_list)) if self.core_list else None
+
+    def bounds(self):
+        xs = [c[0] for c in self.cells]
+        zs = [c[1] for c in self.cells]
+        return ((min(xs) * self.cell, min(zs) * self.cell),
+                ((max(xs) + 1) * self.cell, (max(zs) + 1) * self.cell))
+
+    # -- persistence --------------------------------------------------------
+    @staticmethod
+    def _blob(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    @staticmethod
+    def names(path=AREA_FILE):
+        return sorted(Area._blob(path).get("areas", {}))
+
+    def load(self):
+        blob = self._blob(self.path)
+        # Same rule as WalkMap: a file written at another cell size cannot be
+        # rescaled honestly, and pretending otherwise fences off the wrong ground.
+        if blob.get("cell") != self.cell:
+            return self
+        got = blob.get("areas", {}).get(self.name)
+        if got:
+            self.cells = {(c[0], c[1]) for c in got.get("cells", ())}
+            self._stale = True
+        return self
+
+    def save(self):
+        """Read-modify-write: saving one area must not drop the others."""
+        blob = self._blob(self.path)
+        if blob.get("cell") != self.cell:
+            blob = {"cell": self.cell, "areas": {}}
+        blob.setdefault("areas", {})[self.name] = {
+            "cells": [[c[0], c[1]] for c in sorted(self.cells)]}
+        try:
+            with open(self.path, "w") as f:
+                json.dump(blob, f)
         except OSError:
             return False
         return True
@@ -1291,13 +1582,26 @@ class MemoryEyes:
     path_at = escape_until = 0.0
     escape_side, escapes = 1, 0
     routing = sealed = False
+    # The fence, or None for the roam-anywhere bot. `returning` is a plain flag
+    # and deliberately not derived from `self.mode`: mode is also the status
+    # string and half a dozen branches overwrite it, which is how the deleted
+    # leash lost track of the fact it was walking home.
+    area = None
+    returning = False
+    home_goal = wander = None
+    wander_until = returning_since = wander_committed = 0.0
 
-    def __init__(self):
+    def __init__(self, area=None):
         import memscan
         self.ms = memscan
         self.mem = memscan.Mem()
         self.classes = memscan.type_classes(self.mem)
         self.me = None            # our own BaseUnitController
+        self.area = area          # the fence, or None to roam anywhere
+        self.returning = False    # walking back inside it right now
+        self.home_goal = self.wander = None
+        self.wander_until = self.returning_since = 0.0
+        self.wander_committed = 0.0
         self.basis = None         # stick push -> world travel
         self.units = []           # cached (kind, addr, x, y, z)
         self.chasing = None       # unit held between frames, so it does not flap
@@ -1467,9 +1771,9 @@ class MemoryEyes:
             before = self._positions(players)
             t0 = time.time()
             while time.time() - t0 < MEM_CAL_PUSH_S:
-                pad.stick(sx, sy, False)
+                pad.stick(sx, sy, True)
                 time.sleep(0.05)
-            pad.stick(0.0, 0.0, False)
+            pad.stick(0.0, 0.0, True)
             time.sleep(0.2)
             after = self._positions(players)
             return {a: (after[a][0] - before[a][0], after[a][2] - before[a][2])
@@ -1644,7 +1948,9 @@ class MemoryEyes:
             drops = list(self.loot.items())
         ranked = sorted((((x - px) ** 2 + (z - pz) ** 2) ** 0.5, d, x, z, n)
                         for d, (x, _, z, n) in drops
-                        if self.loot_ignored.get(d, 0) < now and wanted_item(n))
+                        if self.loot_ignored.get(d, 0) < now and wanted_item(n)
+                        and (self.area is None
+                             or self.area.inside(x, z, AREA_SLACK)))
         ranked = [r for r in ranked if r[0] <= LOOT_RANGE]
         if not ranked:
             self.loot_target = self.loot_since = None
@@ -1757,6 +2063,109 @@ class MemoryEyes:
 
         self.scanner = threading.Thread(target=loop, daemon=True)
         self.scanner.start()
+
+    def _why_switched(self, now, ranked):
+        """Which test the previous target failed. Diagnosis only.
+
+        A bot that walks left, right, left looks the same whether it is killing
+        things quickly, losing track of one, or flapping between two -- and
+        those need different fixes. Naming the reason is what tells them apart.
+        """
+        was = self.chasing
+        if was is None:
+            return "nothing held"
+        entry = next((e for e in ranked if e[1] == was), None)
+        if entry is None:
+            if self.ignored.get(was, 0.0) >= now:
+                return "held one blacklisted"
+            return "held one left the unit list"
+        if self.area is not None and not self.area.inside(entry[2], entry[4],
+                                                          AREA_HOLD):
+            return "held one walked out of the area"
+        if not self._fightable(was):
+            return "held one died or stopped being fightable"
+        if entry[0] > MEM_RANGE:
+            return f"held one is {entry[0]:.0f} away, past MEM_RANGE"
+        return "something clearly nearer (TARGET_SWITCH)"
+
+    def _wander_spot(self, px, pz):
+        """Somewhere in the area worth walking to -- not where we already are.
+
+        `spot()` is uniform over the area, so on a small one most picks land
+        inside AREA_WANDER_REACHED and count as arrived immediately. Try a few
+        times for somewhere further off, and take whatever the last try gives
+        if the area is genuinely too small to hold one.
+        """
+        pick = None
+        for _ in range(AREA_WANDER_TRIES):
+            pick = self.area.spot(random)
+            if pick is None:
+                return None
+            if math.hypot(pick[0] - px, pick[1] - pz) >= AREA_WANDER_MIN:
+                return pick
+        return pick
+
+    def _wander(self, now, px, pz):
+        """Nothing left to kill inside the area, so move rather than stand.
+
+        Monsters respawn and roam; a bot parked on one spot farms whatever
+        happens to walk into it, which over an hour is close to nothing. A
+        cell picked uniformly is uniform over *area* for free -- which is what
+        the deleted patrol_point() needed a sqrt() to fake on a circle.
+        """
+        reached = (self.wander is not None
+                   and math.hypot(px - self.wander[0], pz - self.wander[1])
+                   < AREA_WANDER_REACHED)
+        stale = now > self.wander_until
+        # The commit floor is what actually stops the shaking: without it an
+        # arrival re-picks on the very next frame, and a point chosen closer
+        # than AREA_WANDER_REACHED has already "arrived" when it is chosen.
+        settled = now < self.wander_committed
+        if self.wander is None or ((reached or stale) and not settled):
+            self.wander = self._wander_spot(px, pz)
+            self.wander_until = now + AREA_WANDER_HOLD_S
+            self.wander_committed = now + AREA_WANDER_COMMIT_S
+        if self.wander is None:
+            self.mode = "no monster"
+            return None, None, None
+        gx, gz = self.route_to(now, px, pz, *self.wander)
+        s = stick_for(self.basis, gx - px, gz - pz)
+        if not s:
+            self.wander = None
+            self.mode = "no monster"
+            return None, None, None
+        self.goal = (gx, gz)
+        self.mode = "wander"
+        return s[0], s[1], math.hypot(self.wander[0] - px, self.wander[1] - pz)
+
+    def _go_home(self, now, px, pz):
+        """Walk back inside the area, or give the fence up saying why.
+
+        Routed, never a straight line: the leash steered raw at its anchor and
+        so leaned into rock for as long as it took someone to notice. The
+        distance returned is the real one -- `loot_wins()` compares it against
+        the nearest drop, and a hard zero would make walking home unbeatable
+        by an item lying two steps ahead of it, the same trap `unwedge` sets.
+        """
+        hx, hz = self.home_goal or (px, pz)
+        away = math.hypot(hx - px, hz - pz)
+        if away > AREA_ABANDON or now - self.returning_since > AREA_RETURN_MAX_S:
+            # Either another map entirely -- nothing records which map an area
+            # belongs to -- or a walk back that simply is not working. Both
+            # used to be an hour of pressing into scenery.
+            print(chr(10) + f"gave up returning to area {self.area.name!r}"
+                  f" ({away:.0f} units away) -- confinement OFF")
+            self.area, self.returning = None, False
+            self.mode = "no area"
+            return None, None, None
+        gx, gz = self.route_to(now, px, pz, hx, hz)
+        s = stick_for(self.basis, gx - px, gz - pz)
+        if not s:
+            self.mode = "no area"
+            return None, None, None
+        self.goal = (gx, gz)        # so observe_move judges the right goal
+        self.mode = "going back"
+        return s[0], s[1], away
 
     def route_to(self, now, px, pz, tx, tz):
         """Where to actually steer -- the target, or a way round a known wall.
@@ -1894,8 +2303,9 @@ class MemoryEyes:
             self.ignored = {}
             self.seen_at, self.fight_ok = {}, {}
             # The route and the travel history belong to a unit that is gone;
-            # the map itself describes the world and stays.
+            # the map and the area both describe the world and stay.
             self.path = self.last_pos = None
+            self.returning, self.home_goal, self.wander = False, None, None
             if self.walk:
                 self.walk.forget_walk()
             self.mode = "no unit"
@@ -1918,6 +2328,25 @@ class MemoryEyes:
             self.mode = "unwedge"
             return self.escape[0], self.escape[1], 0.0
         self.escape = None
+        # Confinement. Sits below the unwedge override on purpose: while the
+        # character physically cannot move, nothing it decides matters -- and
+        # that escape is also what stops a walk-back leaning on stone, which
+        # is what the deleted leash did for minutes at a time.
+        if self.area is not None:
+            # Two different tests, not one with a margin. Leaving is "not
+            # painted"; coming back is "painted with a whole cell to spare".
+            # Evaluated before the walk-back acts, or the flag clears a frame
+            # late and the bot takes one extra outward step every re-entry.
+            if self.returning:
+                if self.area.deep(px, pz):
+                    self.returning, self.home_goal = False, None
+            elif not self.area.inside(px, pz, AREA_LEAVE):
+                self.returning, self.returning_since = True, now
+                self.home_goal = self.area.home(px, pz)
+            if self.returning:
+                out = self._go_home(now, px, pz)
+                if out:
+                    return out
         self.mode = "chasing"
         fresh = [(k, u, *live[u]) for k, u, *_ in cached if u in live]
         # Most of the list is pooled or dead objects that keep their position
@@ -1926,26 +2355,48 @@ class MemoryEyes:
         # and walking straight back if you drag the character away.
         ranked = sorted(((((x - px) ** 2 + (z - pz) ** 2) ** 0.5, u, x, y, z)
                          for k, u, x, y, z in fresh if k == "monster"
-                         and self.ignored.get(u, 0.0) < now),
+                         and self.ignored.get(u, 0.0) < now
+                         # Slack, not the bare mask: a monster a step over the
+                         # line is killable from inside, and refusing it makes
+                         # the whole boundary band unfarmable.
+                         ),
                         key=lambda e: e[0])
+        if self.area is not None:
+            # Filtered *after* the sort so the held target can be looked up in
+            # the full list below: searching only the filtered one meant a
+            # monster stepping over the line vanished, `held` came back None,
+            # and the bot took a different target -- bypassing TARGET_SWITCH,
+            # which is the whole rule that stops it flapping between two.
+            allowed = [e for e in ranked
+                       if self.area.inside(e[2], e[4], AREA_SLACK)]
+        else:
+            allowed = ranked
 
         # Hold the current target rather than re-picking the nearest every
         # frame. Two monsters a similar distance away swap which is closer
         # constantly, and the bot answers by walking left, right, left, right
         # instead of going to either. It only switches for something clearly
         # nearer, or when this one is gone.
-        held = next((e for e in ranked if e[1] == self.chasing), None)
+        held = next((e for e in ranked if e[1] == self.chasing
+                     and (self.area is None
+                          or self.area.inside(e[2], e[4], AREA_HOLD))), None)
         if held and held[0] <= MEM_RANGE and self._fightable(held[1]):
             hit, dist = (held[1], held[2], held[3], held[4]), held[0]
         else:
             # Checked in distance order and stopped at the first one that is
             # really there, so the liveness reads cost a handful per frame
             # rather than one per monster on the map.
-            hit, dist = self._first_fightable(ranked)
+            hit, dist = self._first_fightable(allowed)
             if hit and held and held[0] <= MEM_RANGE                     and dist > held[0] * TARGET_SWITCH and self._fightable(held[1]):
                 hit, dist = (held[1], held[2], held[3], held[4]), held[0]
         if not hit:
             self.chasing = self.engaged_since = None
+            if self.area is not None:
+                # Inside a fence "nothing left" is normal, not the end of the
+                # map. Falling through to the pixel path here would be worse
+                # than standing still: it knows nothing about the area and
+                # would chase a red dot straight out of it.
+                return self._wander(now, px, pz)
             self.mode = "no monster"        # nothing real left anywhere
             return None, None, None
         if dist > MEM_RANGE:
@@ -1957,7 +2408,18 @@ class MemoryEyes:
             # Fall through rather than return: a far target needs the same
             # engagement clock as a near one, or an unreachable monster across
             # a wall is walked at forever.
+            # With an area set this is already confined and needs no test of
+            # its own: `ranked` above only ever contains monsters inside it, so
+            # the walk-anywhere chase is gone by construction. The *route*
+            # there may still bulge outside, which `returning` then corrects.
+            # ponytail: an area-aware cost inside WalkMap.route() would avoid
+            # the bulge, and is a whole new bug surface for a rare case.
         if hit[0] != self.chasing:
+            if TARGET_LOG:
+                print(chr(10) + f"targetlog switch 0x{self.chasing or 0:X}"
+                      f" -> 0x{hit[0]:X} at {dist:6.1f}"
+                      f"  because {self._why_switched(now, ranked)}"
+                      f"  candidates {len(allowed)}")
             self.chasing, self.engaged_since, self.escapes = hit[0], now, 0
         elif self.escapes >= WALK_ESCAPE_GIVEUP:
             # Backed out of the same approach this many times and still here.
@@ -2158,8 +2620,51 @@ class ArduinoPad:
         self.ser.close()
 
 
-def main(port=None):
+def targeting_mode(argv, area=None):
+    """Which target source this run uses: "memory" or "minimap".
+
+    Minimap is the default. It needs nothing from the game's memory, so it
+    survives a patch, starts instantly, and is the honest thing to hand someone
+    who has not calibrated anything. The memory path is better when it works --
+    it knows what a thing IS, so pets and other players stop being targets --
+    but it costs a heap sweep at startup and goes stale every patch.
+
+    `--area` only exists on the memory path (a recorded area is world
+    coordinates, which the screen cannot give), so asking for one asks for
+    memory. An explicit `--minimap` still wins: saying so out loud should never
+    be silently overridden.
+    """
+    if "--minimap" in argv:
+        return "minimap"
+    if "--memory" in argv or area:
+        return "memory"
+    return "minimap"
+
+
+def main(port=None, area=None):
     import mss
+
+    mode = targeting_mode(sys.argv, area)
+    if area and mode != "memory":
+        # A recorded area is world coordinates; the screen cannot say where in
+        # the world anything is, so there is nothing for the fence to test.
+        print(f"--minimap was asked for, so --area {area!r} is IGNORED:"
+              f" areas only exist on the memory path")
+        area = None
+    zone = None
+    if area:
+        zone = Area(area).load()
+        if not zone.cells:
+            # Never fall back to roaming: an unconfined run started by a typo
+            # is a whole session farming the wrong side of the map.
+            known = ", ".join(Area.names()) or "(none recorded yet)"
+            print(f"no area named {area!r} in {AREA_FILE}")
+            print(f"recorded areas: {known}")
+            print(f"record one with:  python minimap_bot.py --record {area}")
+            return
+        (x0, z0), (x1, z1) = zone.bounds()
+        print(f"confined to area {area!r}: {len(zone.cells)} cells,"
+              f" x {x0:.0f}..{x1:.0f}  z {z0:.0f}..{z1:.0f}")
 
     win = find_window()
     pad = ArduinoPad(port) if port else VirtualPad()
@@ -2170,9 +2675,12 @@ def main(port=None):
     had_unit = False   # so the 'unit rebuilt' notice prints once
     next_cal = 0.0     # earliest retry after a failed calibration
     eyes = None
-    if MEMORY_TARGETING:
+    print(f"targeting: {mode}"
+          + ("  (--memory for the unit list)" if mode == "minimap"
+             else "  (--minimap for red dots only)"))
+    if MEMORY_TARGETING and mode == "memory":
         try:
-            eyes = MemoryEyes()
+            eyes = MemoryEyes(zone)
             if not eyes.available():
                 # Do NOT drop eyes here. This is precisely the case heal() was
                 # written for, and it runs on the scanner thread -- tearing the
@@ -2224,6 +2732,8 @@ def main(port=None):
                         # The route is stale for the same reason; the walls it
                         # avoided are not, so the map itself is left alone.
                         eyes.path = eyes.last_pos = None
+                        eyes.returning, eyes.home_goal = False, None
+                        eyes.wander = None
                         eyes.walk.forget_walk()
                     print(f"\n{'STOPPED' if paused else 'STARTED'} (End)")
                     if (not paused and eyes is not None and
@@ -2388,7 +2898,8 @@ def main(port=None):
                                  "lost": "lost     ",
                                  "dead": "DEAD     ",
                                  "walled": "walled   ",
-                                 "gave up": "gave up  "}.get(eyes.mode,
+                                 "gave up": "gave up  ",
+                                 "no area": "NO AREA  "}.get(eyes.mode,
                                                              "no monster")
                     else:
                         sx, sy = msx, msy
@@ -2401,6 +2912,8 @@ def main(port=None):
                             # thing routing looks like from the outside.
                             state = {"on it": "on it  ",
                                      "unwedge": "unwedge",
+                                     "going back": "back in",
+                                     "wander": "wander ",
                                      "far": "far    "}.get(eyes.mode,
                                                            "dist  ") + (
                                 f"{mdist:6.1f}" if not eyes.routing
@@ -2663,6 +3176,117 @@ def demo():
     _, _, pd = pooled.target(1.0)
     assert pooled.chasing == 0x2000, "must skip the pooled one right beside us"
     assert pd > MEM_RANGE, pd
+
+    # --- confined to a recorded area ---
+    # A strip of ground along +x, the shape a walk down a road produces.
+    pen = Area("pen", path=os.devnull)
+    for i in range(10):
+        pen.paint(i * 2.0, 0.0)
+
+    # A monster outside the fence is not a target at all, and with nothing left
+    # inside the bot wanders rather than standing in a field for an hour.
+    caged = _Far(MEM_RANGE / 2)          # monster far up +x, well outside
+    caged.area = pen
+    wsx, wsy, _ = caged.target(1.0)
+    assert caged.mode == "wander", caged.mode
+    assert wsx is not None and (wsx or wsy), "wander must move, not park the bot"
+    assert caged.chasing is None, "nothing outside the fence is a target"
+    assert pen.inside(*caged.wander), "wander may only aim inside the area"
+
+    # Wandering must not re-pick every frame. A point chosen nearer than
+    # AREA_WANDER_REACHED counts as arrived the moment it is chosen, so without
+    # a commit floor the bot changes direction 20 times a second -- which from
+    # outside is a character shaking left and right on the spot.
+    small = Area("small", path=os.devnull)
+    small.paint(0.0, 0.0)                 # one brush disc: everything is close
+    jitter = _Far(MEM_RANGE * 3)          # the monster is far outside it
+    jitter.area = small
+    picks, t = [], 1.0
+    for _ in range(40):                   # two seconds at 20 Hz
+        jitter.target(t)
+        picks.append(jitter.wander)
+        t += 1 / LOOP_HZ
+    changes = sum(1 for a, b in zip(picks, picks[1:]) if a != b)
+    assert jitter.mode == "wander", jitter.mode
+    assert changes <= 2, f"wander re-picked {changes} times in 2 s"
+
+    # On an area big enough, it should aim somewhere worth walking to.
+    roomy = Area("roomy", path=os.devnull)
+    for i in range(30):
+        roomy.paint(i * 3.0, 0.0)
+    far_pick = _Far(MEM_RANGE * 30)       # nothing inside to distract it
+    far_pick.area = roomy
+    far_pick.target(1.0)
+    assert math.hypot(*far_pick.wander) >= AREA_WANDER_MIN, far_pick.wander
+
+    # Outside it: walk back, and toward the area rather than away from it.
+    lost = _Far(MEM_RANGE * 3)
+    lost.area, lost.spots = pen, {0x1000: 40.0}   # the strip ends well short
+    lsx, _, ld = lost.target(1.0)
+    assert lost.mode == "going back", lost.mode
+    assert lost.returning and lsx < 0, (lsx, lost.returning)
+    assert ld > 0, "a zero distance makes the walk-back unbeatable by loot"
+
+    # Reaching a target we are *allowed* to hit must never itself count as
+    # leaving. With one slack number it did: the bot chased a legal monster a
+    # few units past the paint, called standing there "outside", walked home,
+    # and chased it again -- `dist`, `back in`, `dist`, `back in` forever.
+    (_, _), (edge_x, _) = pen.bounds()
+    lean = _Far(MEM_RANGE * 3)
+    lean.area, lean.spots = pen, {0x1000: edge_x + AREA_HOLD}
+    lean.target(1.0)
+    assert not lean.returning, "standing within reach of a legal target is not leaving"
+    assert lean.mode != "going back", lean.mode
+    # Genuinely out is still out.
+    gone = _Far(MEM_RANGE * 3)
+    gone.area, gone.spots = pen, {0x1000: edge_x + AREA_LEAVE * 4}
+    gone.target(1.0)
+    assert gone.returning and gone.mode == "going back", gone.mode
+
+    # A monster loitering on the line must not be dropped and re-taken every
+    # frame: `held` is looked up in the unfiltered list with more rope, or the
+    # area filter silently bypasses TARGET_SWITCH.
+    edgy = _Far(MEM_RANGE * 3, extra=[("monster", 0x5000, 0.0, 0.0, 0.0)],
+                real=(0x2000, 0x5000))
+    edgy.area = pen
+    edgy.spots = {0x5000: edge_x + (AREA_SLACK + AREA_HOLD) / 2}
+    edgy.chasing = 0x5000
+    edgy.target(1.0)
+    assert edgy.chasing == 0x5000, "a held target on the line keeps being held"
+
+    # Crossing back over the line is not being back in. The deleted leash had
+    # one threshold and bounced along it forever against a monster on the edge.
+    edge = _Far(MEM_RANGE * 3)
+    fringe = next(pen.centre(c)[0] for c in sorted(pen.cells)
+                  if c not in pen.core and c[1] == pen.at(0.0, 0.0)[1])
+    edge.area, edge.returning = pen, True
+    edge.home_goal, edge.spots = pen.home(fringe, 0.0), {0x1000: fringe}
+    edge.target(1.0)
+    assert pen.inside(fringe, 0.0) and edge.returning,         "the fringe is inside, but not yet back in"
+
+    # ...and being properly back in does release it.
+    homed = _Far(MEM_RANGE * 3)
+    homed.area, homed.returning, homed.spots = pen, True, {0x1000: 10.0}
+    homed.home_goal = pen.home(10.0, 0.0)
+    homed.target(1.0)
+    assert not homed.returning, "deep inside must release the walk-back"
+    assert homed.mode != "going back", homed.mode
+
+    # Another map is not a stray step -- nothing records which map an area
+    # belongs to, so --area on the wrong one puts home thousands of units away.
+    # Switch the fence off loudly rather than lean into scenery for an hour.
+    elsewhere = _Far(MEM_RANGE * 3)
+    elsewhere.area, elsewhere.spots = pen, {0x1000: AREA_ABANDON * 3}
+    esx, _, _ = elsewhere.target(1.0)
+    assert elsewhere.mode == "no area" and elsewhere.area is None
+    assert esx is None, "giving up must park the bot, not steer it"
+    assert hold_still("no area"), "and must not fall through to the pixel path"
+
+    # With no area recorded at all the whole feature is inert.
+    free = _Far(MEM_RANGE * 3)
+    assert free.area is None
+    free.target(1.0)
+    assert free.mode == "far", free.mode
 
     # In melee the bot circles the target instead of standing on it: standing
     # on a monster is a character with no room to swing, and the game gives no
@@ -2991,6 +3615,16 @@ def demo():
                             wake=lambda pad: pad.calls.append("wake"))
     assert paused and toggle_pad.calls[-1] == (0.0, 0.0, False)
     assert toggle_pad.calls.count("wake") == 1 and toggle_pets.resets == 2
+
+    # The wake nudge walks the character, and walking with L1 released is how a
+    # warp portal takes the bot to another map.
+    warp_pad = TogglePad()
+    old_sleep, time.sleep = time.sleep, lambda _s: None
+    try:
+        wake_controller(warp_pad)
+    finally:
+        time.sleep = old_sleep
+    assert all(c[2] is True for c in warp_pad.calls), "wake dropped attack"
     img = np.zeros((200, 200, 3), np.uint8)
     cv2.circle(img, (150, 60), 4, (0, 0, 255), -1)   # far, up-right
     cv2.circle(img, (120, 100), 4, (0, 0, 255), -1)  # near, right
@@ -3162,6 +3796,74 @@ def demo():
     pad.tap_button(3)             # same button by index
     assert sent == [b"B3\n", b"B3\n"], sent
 
+    # --- which target source runs -----------------------------------------
+    # Minimap is the default: it needs nothing from the game's memory, so it
+    # survives a patch and starts instantly.
+    assert targeting_mode([]) == "minimap"
+    assert targeting_mode(["minimap_bot.py"]) == "minimap"
+    assert targeting_mode(["--memory"]) == "memory"
+    assert targeting_mode(["--minimap"]) == "minimap"
+    # An area is world coordinates, which the screen cannot supply, so asking
+    # for one asks for the memory path.
+    assert targeting_mode([], area="lunaris") == "memory"
+    # ...but saying --minimap out loud is never silently overridden.
+    assert targeting_mode(["--minimap"], area="lunaris") == "minimap"
+    assert targeting_mode(["--memory", "--minimap"]) == "minimap"
+
+    # --- farming areas ---------------------------------------------------
+    # The brush is wide on purpose: one walk down the middle of a field should
+    # cover it, so a painted point reaches well past where the character stood.
+    a = Area("demo", path=os.devnull)
+    a.paint(0.0, 0.0)
+    assert a.inside(0.0, 0.0)
+    assert a.inside(AREA_BRUSH - AREA_CELL, 0.0), "the brush is wide, not a point"
+    assert not a.inside(AREA_BRUSH * 3, 0.0)
+    # Slack is a test on the target, not on us: a monster a step over the line
+    # is killable from inside, and refusing it makes the boundary unfarmable.
+    out = AREA_BRUSH + AREA_CELL
+    assert not a.inside(out, 0.0)
+    assert a.inside(out, 0.0, AREA_SLACK + AREA_CELL)
+
+    # A walked line -- the shape the recorder actually produces.
+    walked = Area("walk", path=os.devnull)
+    for i in range(20):
+        walked.paint(i * 2.0, 0.0)
+    assert walked.core and walked.core <= walked.cells
+    # Crossing back over the line is not being back in. Without this gap a
+    # monster parked on the boundary has the bot stepping in and out forever.
+    assert walked.deep(20.0, 0.0), "the middle of the strip is deep"
+    fringe = next(walked.centre(c) for c in sorted(walked.cells)
+                  if c not in walked.core)
+    assert walked.inside(*fringe) and not walked.deep(*fringe), fringe
+    # home() must land somewhere deep, or arriving never clears the walk-back.
+    assert walked.deep(*walked.home(20.0, 60.0))
+    # spot() may only ever offer ground it is safe to stand in.
+    rng = random.Random(7)
+    for _ in range(50):
+        assert walked.deep(*walked.spot(rng))
+    # A recording too thin to have a middle must degrade, not hang the bot
+    # walking back in to somewhere that is never deep enough.
+    thin = Area("thin", path=os.devnull, cell=AREA_BRUSH * 4)
+    thin.paint(0.0, 0.0)
+    assert thin.cells, "the cell we stand in is painted whatever the brush"
+    assert thin.core, "no core means no hysteresis, not no bot"
+
+    # Persistence: WalkMap's rules, plus one -- saving one area keeps the rest.
+    tmp = os.path.join(os.environ.get("TEMP", "."), "areas_demo.json")
+    walked.path = tmp
+    assert walked.save()
+    two = Area("second", path=tmp)
+    two.paint(500.0, 500.0)
+    assert two.save()
+    back = Area("walk", path=tmp).load()
+    assert back.cells == walked.cells, (len(back.cells), len(walked.cells))
+    assert back.core == walked.core
+    assert Area("second", path=tmp).load().cells, "one save must not eat the other"
+    assert Area.names(tmp) == ["second", "walk"], Area.names(tmp)
+    assert not Area("missing", path=tmp).load().cells
+    assert not Area("walk", path=tmp, cell=AREA_CELL * 2).load().cells,         "a file at another cell size is dropped, never rescaled"
+    os.remove(tmp)
+
     # --- the walk map ----------------------------------------------------
     # One sighting is not a wall: another player standing in a doorway would
     # otherwise seal it permanently.
@@ -3174,6 +3876,26 @@ def demo():
     # Standing in a cell proves it walkable, whatever we believed before.
     wm.free(10.0, 10.0)
     assert not wm.blocked(wm.at(10.0, 10.0), 100.0), "standing there clears it"
+
+    # A repeated position is the feed hiccuping, not a wall. Measured at 20 Hz,
+    # runs of 3 to 26 identical reads happen while walking normally, so neither
+    # counting frames nor timing the repeat can mean anything.
+    ident = ((1.0, 0.0), (0.0, 1.0))      # basis: stick x -> world x
+    feed = WalkMap(path=os.devnull)
+    for i in range(WALK_BLOCK_FRAMES * 3):
+        got = feed.observe(200.0 + i * 0.01, 5.0, 5.0, 1.0, 0.0, ident,
+                           "chasing", goal=(50.0, 5.0))
+        assert got is None, f"stalled feed read as a wall on frame {i}"
+    # The long stall that broke the first fix: 26 frames of the same value while
+    # the character was walking the whole time. It ends with the position where
+    # the walking actually got to, and that must not read as a wall.
+    stall = WalkMap(path=os.devnull)
+    stall.observe(500.0, 5.0, 5.0, 1.0, 0.0, ident, "chasing", goal=(90.0, 5.0))
+    for i in range(26):
+        assert stall.observe(500.0 + i * 0.08, 5.0, 5.0, 1.0, 0.0, ident,
+                             "chasing", goal=(90.0, 5.0)) is None, "stall is not a wall"
+    assert stall.observe(500.0 + 26 * 0.08, 40.0, 5.0, 1.0, 0.0, ident,
+                         "chasing", goal=(90.0, 5.0)) is None, "the catch-up is not a wall"
 
     # A wall across x = 0, from z = -9 to z = 9, with the map open beyond it.
     wall = WalkMap(path=os.devnull)
@@ -3237,10 +3959,17 @@ def demo():
     # pace. Progress along the push is what a wall actually takes away.
     ident = ((1.0, 0.0), (0.0, 1.0))
     learn = WalkMap(path=os.devnull)
-    for i in range(WALK_BLOCK_FRAMES + 1):
-        hit = learn.observe(100.0 + i * 0.05, 5.0, 5.0, 1.0, 0.0, ident, "chasing")
-    assert hit, "a push that goes nowhere must mark"
+    # Frames alone will not do it any more: a position that never changes is
+    # what the feed looks like while hiccuping, and it hiccups for up to 8
+    # frames on its own. Only a window that gains no ground means jammed.
+    hit = None
+    for i in range(int((WALK_JAM_S + 0.3) / 0.05)):
+        # it fires once and then restarts its clock, so keep the first answer
+        hit = learn.observe(100.0 + i * 0.05, 5.0, 5.0, 1.0, 0.0,
+                            ident, "chasing") or hit
+    assert hit, "a push that goes nowhere for long enough must mark"
     assert learn.at(5.0 + WALK_BLOCK_AHEAD, 5.0) in learn.hits, learn.hits
+    assert learn.wedged, "a jam must ask for the sideways escape"
 
     # The regression: sliding sideways at full speed while pushing east. Travel
     # is 0.7 a frame -- the speed test saw a bot walking happily -- and progress
@@ -3337,7 +4066,7 @@ def demo():
     # pushed the same heading for minutes. Two answers, both needed. A fan of
     # cells, so the route cannot sidestep the obstacle by one cell...
     fan = WalkMap(path=os.devnull)
-    for i in range(WALK_BLOCK_FRAMES + 1):
+    for i in range(int((WALK_JAM_S + 0.3) / 0.05)):
         fan.observe(100.0 + i * 0.05, 5.0, 5.0, 1.0, 0.0, ident, "chasing")
     assert len(fan.hits) >= 4, fan.hits
     assert fan.wedged, "a push that moved us nowhere is a wedge"
@@ -3356,7 +4085,7 @@ def demo():
             self.escape_side, self.escapes, self.escape_until = 1, 0, 0.0
             self.escape, self.path = None, None
     stuck = Wedge()
-    for i in range(WALK_BLOCK_FRAMES + 1):
+    for i in range(int((WALK_JAM_S + 0.3) / 0.05)):
         stuck.observe_move(100.0 + i * 0.05, 1.0, 0.0)
     assert stuck.escape, "a wedge must produce a way out"
     assert stuck.escape[0] < 0, ("the way out is backwards", stuck.escape)
@@ -3403,6 +4132,80 @@ def demo():
     os.remove(tmp)
 
     print("demo ok")
+
+
+def record_area(name):
+    """Walk the character round the ground you want farmed; End saves it.
+
+    Reads only our own position. No pad, no calibration, no minimap: the basis
+    exists to turn a direction into a stick push and nothing here pushes, and
+    the minimap cannot say where in the world anything is anyway.
+
+    Do not run this while the bot itself is running -- both poll End through
+    GetAsyncKeyState, whose low bit is consumed by whoever reads it first.
+    """
+    if not name:
+        known = ", ".join(Area.names()) or "(none recorded yet)"
+        print("usage: python minimap_bot.py --record <name>")
+        print(f"recorded areas: {known}")
+        return
+    area = Area(name).load()
+    if area.cells:
+        # Never silently replace ten minutes of hand-walking. Adding is what
+        # you want anyway: a big field takes more than one session. Printed
+        # before the slow sweep, so there is time to change your mind.
+        print(f"area {name!r} already has {len(area.cells)} cells -- this ADDS"
+              f" to it.  ctrl+c now to leave it alone.")
+    import memscan
+    print("finding your character -- the first heap sweep takes ~15 s,"
+          " it is not hung", flush=True)
+    mem = memscan.Mem()
+    units = memscan.world_units(mem)
+    me = memscan.local_player(mem, units[0][1]) if units else None
+    if not me:
+        print("no local player found -- is the character actually in the world?")
+        return
+    print(f"unit 0x{me:X} -- walk the area now."
+          f"   End = save,   ctrl+c = abandon")
+    last, misses = None, 0
+    try:
+        while True:
+            blob = mem.read(me + memscan.UNIT_POSITION, 12)
+            if blob:
+                misses = 0
+                x, _, z = struct.unpack("<fff", blob)
+                # Only repaint after real travel: the position feed repeats a
+                # value for many frames at a time, so counting samples would
+                # say nothing about ground covered.
+                if last is None or math.hypot(x - last[0], z - last[1]) >= AREA_STEP:
+                    area.paint(x, z)
+                    last = (x, z)
+                print(f"  {len(area.cells):6} cells   at {x:8.1f},{z:8.1f}   ",
+                      end=chr(13), flush=True)
+            else:
+                # A relog or a map change kills the pointer. Say so rather than
+                # sit painting the last position for ever.
+                misses += 1
+                print(f"  position unreadable x{misses} (relog? map change?)  ",
+                      end=chr(13), flush=True)
+                if misses > MEM_LOST_FRAMES * 4:
+                    print(chr(10) + "lost the character -- saving what was recorded")
+                    break
+            if toggle_key_hit():
+                break
+            time.sleep(AREA_SAMPLE_S)
+    except KeyboardInterrupt:
+        print(chr(10) + "abandoned -- nothing written")
+        return
+    if not area.cells:
+        print(chr(10) + "nothing recorded")
+        return
+    (x0, z0), (x1, z1) = area.bounds()
+    ok = area.save()
+    print(chr(10) + f"{'saved' if ok else 'COULD NOT SAVE'} {name!r}:"
+          f" {len(area.cells)} cells, x {x0:.0f}..{x1:.0f}  z {z0:.0f}..{z1:.0f}")
+    print(f"  -> {AREA_FILE}")
+    print(f"run it with:  python minimap_bot.py --area {name}")
 
 
 def snap(path="minimap_snap.png"):
@@ -3628,7 +4431,7 @@ def stick_test(port=None, seconds=12):
         while time.time() - t0 < seconds:
             a = (time.time() - t0) * 1.2
             sx, sy = np.cos(a), np.sin(a)
-            pad.stick(float(sx), float(sy), False)
+            pad.stick(float(sx), float(sy), True)
             print(f"stick {sx:+.2f},{sy:+.2f}   ", end="\r")
             time.sleep(1 / LOOP_HZ)
     except KeyboardInterrupt:
@@ -3641,6 +4444,10 @@ def stick_test(port=None, seconds=12):
 if __name__ == "__main__":
     if "--demo" in sys.argv:
         demo()
+    elif "--record" in sys.argv:
+        j = sys.argv.index("--record")
+        rest = [a for a in sys.argv[j + 1:] if not a.startswith("--")]
+        record_area(rest[0] if rest else None)
     elif "--snap" in sys.argv:
         snap()
     elif "--watch" in sys.argv:
@@ -3664,4 +4471,6 @@ if __name__ == "__main__":
         stick_test(sys.argv[i + 1] if i >= 0 else None)
     else:
         i = sys.argv.index("--port") if "--port" in sys.argv else -1
-        main(sys.argv[i + 1] if i >= 0 else None)
+        j = sys.argv.index("--area") if "--area" in sys.argv else -1
+        named = [a for a in sys.argv[j + 1:] if not a.startswith("--")] if j >= 0 else []
+        main(sys.argv[i + 1] if i >= 0 else None, named[0] if named else None)

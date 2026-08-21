@@ -111,6 +111,52 @@ the character; green circles = monsters, red circles = rejected. Nudge
 on your character marker. **Get this right:** the centre *is* the origin now, so a
 mis-centred box biases every heading the bot takes.
 
+## Choosing how it finds monsters
+
+```
+python minimap_bot.py             # minimap: red dots on screen (default)
+python minimap_bot.py --memory    # memory: the game's own unit list
+python minimap_bot.py --minimap   # force the screen path
+```
+
+**Minimap** needs nothing from the game's memory. It starts instantly and keeps
+working after a game update. It cannot tell a monster from your own pet, so it
+will sometimes chase the pet.
+
+**Memory** reads the game's unit list, so it knows what each thing *is* --
+monster, player or pet -- and never chases a pet. It costs about 15 seconds of
+scanning at startup, and a game update can break it until the classes are found
+again.
+
+`--area` only works on the memory path, so asking for an area turns memory on.
+Writing `--minimap` yourself always wins, and the bot says so instead of
+quietly ignoring you.
+
+## Farming one area only
+
+By default the bot roams wherever the kills lead. To keep it on one patch of
+ground, walk that ground once and record it:
+
+```
+python minimap_bot.py --record lunaris     # walk the area, press End to save
+python minimap_bot.py --area lunaris       # run confined to it
+```
+
+Recording reads only your own position -- no gamepad, no calibration. The first
+heap sweep takes about 15 seconds before it starts following you. Everything
+within about 6 units either side of your path is recorded, so one walk down the
+middle of a field covers it; recording the same name again adds to it rather
+than replacing it, so a big area can be walked over several sessions.
+
+With `--area` set, the bot never targets a monster or an item outside the area,
+walks back in if it ends up outside, and wanders inside it when nothing is left
+to kill. Areas live in `areas.json`.
+
+One caveat worth knowing: nothing in the game tells the bot which map it is on,
+so `--area` pointed at an area recorded on a *different* map would put "home"
+thousands of units away. It notices that and turns the confinement off with a
+message rather than walking into scenery for an hour.
+
 ## Diagnostics
 
 | Command | What it checks |
@@ -123,6 +169,8 @@ mis-centred box biases every heading the bot takes.
 | `--probe` | Presses every X360 button in turn, named, to find a mapping. |
 | `--press` | Fires one control at a time on the Arduino, typed in by hand. |
 | `--relogin [--dry]` | Handles the login screen showing now. `--dry` looks without clicking. |
+| `--record <name>` | Records a farming area: walk the ground, End saves it. |
+| `--targetlog` | One line each time the chased monster changes. |
 | `python memscan.py --demo` | Memory layer self-check. No game needed. |
 | `python memscan.py --units` | What the unit sweep classifies right now: monsters, players, pets. |
 
