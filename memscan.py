@@ -78,12 +78,16 @@ SUMMONING_SUMMONER = 0x140   # SummoningComponent._Summoner -> BaseUnitControlle
 SUMMONING_ACTIVE = 0x118     # SummoningComponent.ActiveSummons -> List<Monster>
 MONSTER_ID = 0x218           # MonsterController.MonsterId, string
 MONSTER_SPAWNER = 0x288      # MonsterController.Spawner
-# Summoned units are MonsterControllers with a MonsterId like any other, and
-# nothing structural separates them: measured on a live map, all 38 targetable
-# monsters had a null Spawner *and* a null summoner, so neither field can be the
-# test. What does separate them is the id itself -- real spawns come in numbers
-# (32 Zombie Goblin Soldier, 18 Zombie Goblin Minion, 17 Monster Bat) and a
-# summon is a singleton. Deny by name; add to the set when one turns up.
+# PlayerController -> PlayerSave -> CharacterData -> character name. Verified
+# against the current build's IL2CPP layout and live for the local character;
+# remote clients do not always carry CharacterData, so player_name() may be None.
+PLAYER_SAVE = 0x248
+PLAYERSAVE_DATA = 0x160
+CHARACTER_NAME = 0x50
+# Summoned units are MonsterControllers with a MonsterId like any other. Their
+# own summoner field is unreliable, but every PlayerController's ActiveSummons
+# list is structural ownership data and is the primary pet test. Names remain a
+# fallback for summons missing from both fields; add one when --ids exposes it.
 MONSTER_DENY = {"skeleton mage", "seraphim arbiter", "skeleton", "abomination", "wraith king"}
 # Pets carry the game's own naming, e.g. 'Pet_Earth', and they reach the target
 # list for the same reason: their summoner field reads null, so the pet test
@@ -99,6 +103,10 @@ MONSTER_DENY_PREFIX = ("pet_",)
 # within 98 units down to 20, against 13 red dots on the minimap.
 UNIT_VISIBLE = 0x18D         # BaseUnitController.IsVisible, bool
 UNIT_HEALTH = 0x128          # BaseUnitController.Health -> HealthComponent
+UNIT_STATUS = 0x140          # BaseUnitController.Status -> StatusComponent
+STATUS_FLAGS = 0x188         # StatusComponent.Flags -> SyncVar<uint>
+SYNCVAR_VALUE = 0x74         # current value inside FishNet SyncVar<T>
+STATUS_INVISIBLE = 0x20      # StatusComponent.StatusFlags.Invisible
 HEALTH_CURRENT = 0x138       # HealthComponent._health, int
 
 # Loot on the ground. A LootDrop is a FishNet NetworkBehaviour; unlike a unit it
@@ -1160,6 +1168,14 @@ def monster_id(mem, unit):
     return cs_string(mem, read_ptr(mem, unit + MONSTER_ID))
 
 
+def player_name(mem, unit):
+    """Loaded character name for a PlayerController, or None."""
+    save = read_ptr(mem, unit + PLAYER_SAVE)
+    data = read_ptr(mem, save + PLAYERSAVE_DATA) if save else 0
+    name = cs_string(mem, read_ptr(mem, data + CHARACTER_NAME)) if data else None
+    return name if name and name.isprintable() else None
+
+
 def unit_health(mem, unit):
     """Current health, or None. Damage landing is the only proof of a hit."""
     health = read_ptr(mem, unit + UNIT_HEALTH)
@@ -1167,6 +1183,14 @@ def unit_health(mem, unit):
         return None
     blob = mem.read(health + HEALTH_CURRENT, 4)
     return struct.unpack("<i", blob)[0] if blob else None
+
+
+def unit_invisible(mem, unit):
+    """The game's BaseUnitController.IsInvisible property, read without a call."""
+    status = read_ptr(mem, unit + UNIT_STATUS)
+    flags = read_ptr(mem, status + STATUS_FLAGS) if status else 0
+    blob = mem.read(flags + SYNCVAR_VALUE, 4) if flags else None
+    return bool(blob and struct.unpack("<I", blob)[0] & STATUS_INVISIBLE)
 
 
 def worth_fighting(mem, unit):
@@ -1187,8 +1211,8 @@ def worth_fighting(mem, unit):
     return bool(blob) and struct.unpack("<i", blob)[0] > 0
 
 
-def real_monster(mem, unit):
-    """Is this a spawned monster that can actually be fought?
+def monster_target_state(mem, unit):
+    """Return (attackable, invisible) for one MonsterController.
 
     worth_fighting() is not enough on its own. Measured on a live map: 232
     monster objects were rendered and had health, but only 32 carried a
@@ -1198,16 +1222,29 @@ def real_monster(mem, unit):
     give-up timer fired, then started on the next of them. From the outside that
     is a bot that will not move and walks back if you drag it away.
 
-    The id is also the only thing that separates another player's summon from a
-    spawned monster -- see MONSTER_DENY.
+    Summoner and ActiveSummons filtering normally removes pets before this call;
+    the id denylist is the final fallback for a summon absent from both fields.
+    IsVisible is not the inverse of the game's IsInvisible property: that getter
+    tests StatusComponent.Flags.Invisible. An invisible monster can retain its
+    identity, health, and visibility byte while attacks cannot hit it.
     """
     if not worth_fighting(mem, unit):
-        return False
+        return False, False
+    if summoner_of(mem, unit):
+        return False, False
     name = monster_id(mem, unit)
     if not name:
-        return False
+        return False, False
+    if unit_invisible(mem, unit):
+        return False, True
     name = name.strip().lower()
-    return name not in MONSTER_DENY and not name.startswith(MONSTER_DENY_PREFIX)
+    ok = name not in MONSTER_DENY and not name.startswith(MONSTER_DENY_PREFIX)
+    return ok, False
+
+
+def real_monster(mem, unit):
+    """Is this a spawned monster that can actually be fought?"""
+    return monster_target_state(mem, unit)[0]
 
 
 def unit_at(mem, obj):
@@ -1454,17 +1491,27 @@ def unit_regions(mem, cls=None):
             if any(b <= h + 0xFFFFFF and b + s > h for h in hot)]
 
 
+def summoned_by_players(mem, players):
+    """MonsterController addresses owned by these players' ActiveSummons lists."""
+    out = set()
+    for player in players:
+        comp = read_ptr(mem, player + UNIT_SUMMONING)
+        if comp:
+            out.update(list_items(mem, read_ptr(mem, comp + SUMMONING_ACTIVE)))
+    return out
+
+
 def world_units(mem, regions=None):
     """[(kind, unit, x, y, z)] for every unit the client is tracking.
 
-    kind is 'monster', 'pet' or 'player'. No searching and no heuristics: the
-    class pointers come from the dump, and a unit is a pet exactly when its
-    SummoningComponent names a summoner.
+    kind is 'monster', 'pet' or 'player'. No heuristics: class pointers identify
+    the unit type, while player ActiveSummons lists identify pets even when a
+    pet's own _Summoner pointer is unexpectedly null.
     """
     cls = type_classes(mem)
     if not cls.get("monster"):
         return []
-    out = []
+    rows = []
     for name, kind in (("monster", None), ("player", "player")):
         if not cls.get(name):
             continue        # that class has not been initialised yet
@@ -1474,9 +1521,10 @@ def world_units(mem, regions=None):
             pos = read_vec3(mem, obj + UNIT_POSITION)
             if not pos or not looks_like_place(pos):
                 continue
-            k = kind or ("pet" if summoner_of(mem, obj) else "monster")
-            out.append((k, obj, pos[0], pos[1], pos[2]))
-    return out
+            rows.append((kind, obj, pos[0], pos[1], pos[2]))
+    summoned = summoned_by_players(mem, [u for k, u, *_ in rows if k == "player"])
+    return [(k or ("pet" if u in summoned or summoner_of(mem, u) else "monster"),
+             u, x, y, z) for k, u, x, y, z in rows]
 
 
 def local_player(mem, seed):
@@ -1957,7 +2005,9 @@ def demo():
         put(unit + UNIT_SUMMONING, comp)
         put(comp + SUMMONING_CONTROLLER, unit)       # the round trip
         put(unit, 0xC1A55)                           # same class for all
-    put(COMPS[PET] + SUMMONING_SUMMONER, ME)        # our pet: we summoned it
+    # Live evidence: some pets leave _Summoner null. ActiveSummons still lists
+    # them, so classification must use the owner's list as the stronger source.
+    put(COMPS[PET] + SUMMONING_SUMMONER, 0)
     put(COMPS[OTHER] + SUMMONING_SUMMONER, 0x900000)  # someone else's pet
     put(COMPS[MON] + SUMMONING_SUMMONER, 0)         # a monster has no summoner
     put(COMPS[ME] + SUMMONING_ACTIVE, 0x150000)     # our ActiveSummons list
@@ -2009,15 +2059,52 @@ def demo():
     spawned = NameMem("Zombie Goblin Soldier")
     assert monster_id(spawned, 0x10000) == "Zombie Goblin Soldier"
     assert real_monster(spawned, 0x10000)
+
+    class InvisibleMem(NameMem):
+        STATUS, FLAGS = 0x500000, 0x510000
+
+        def read(self, addr, size):
+            pointers = {0x10000 + 0x140: self.STATUS,
+                        self.STATUS + 0x188: self.FLAGS}
+            if addr in pointers:
+                return struct.pack("<Q", pointers[addr])
+            if addr == self.FLAGS + 0x74:
+                return struct.pack("<I", 0x20)
+            return super().read(addr, size)
+
+    invisible = InvisibleMem("Zombie Goblin Soldier")
+    assert unit_invisible(invisible, 0x10000)
+    assert monster_target_state(spawned, 0x10000) == (True, False)
+    assert monster_target_state(invisible, 0x10000) == (False, True)
+    assert not real_monster(invisible, 0x10000), "invisible units cannot be attacked"
     for denied in ("Skeleton Mage", "skeleton mage", " Skeleton Mage "):
         assert not real_monster(NameMem(denied), 0x10000), denied
     assert not real_monster(NameMem(""), 0x10000), "no id, cannot be damaged"
     assert not real_monster(NameMem("Pet_Earth"), 0x10000), "a pet is not a target"
 
+    class PlayerNameMem:
+        PLAYER, SAVE, DATA, TEXT = 0x410000, 0x420000, 0x430000, 0x440000
+
+        def read(self, addr, size):
+            pointers = {self.PLAYER + PLAYER_SAVE: self.SAVE,
+                        self.SAVE + PLAYERSAVE_DATA: self.DATA,
+                        self.DATA + CHARACTER_NAME: self.TEXT}
+            if addr in pointers:
+                return struct.pack("<Q", pointers[addr])
+            if addr == self.TEXT + 0x10:
+                return struct.pack("<i", len("Lepica"))
+            if addr == self.TEXT + 0x14:
+                return "Lepica".encode("utf-16-le")
+            return bytes(size)
+
+    assert player_name(PlayerNameMem(), PlayerNameMem.PLAYER) == "Lepica"
+    assert player_name(PlayerNameMem(), 0x450000) is None
+
     assert unit_at(um, ME) and unit_at(um, MON)
     assert not unit_at(um, 0x999000)                # no round trip, not a unit
     assert list_items(um, 0x150000) == [PET]
-    assert summoner_of(um, PET) == ME and summoner_of(um, MON) == 0
+    assert summoner_of(um, PET) == 0 and summoner_of(um, MON) == 0
+    assert summoned_by_players(um, [ME]) == {PET}
     me_obj, rows = classify(um, ME + UNIT_POSITION)
     kinds = {u: k for k, u, *_ in rows}
     assert me_obj == ME and kinds[ME] == "you", kinds

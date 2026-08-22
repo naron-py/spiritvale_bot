@@ -20,8 +20,8 @@ is read-only (`ReadProcessMemory`); nothing is written and nothing is injected.
 python -m venv .venv && .venv\Scripts\activate
 pip install -r requirements.txt
 
-python minimap_bot.py              # run, minimap targeting (default)
-python minimap_bot.py --memory     # run, memory targeting (unit list)
+python minimap_bot.py              # run, memory primary; pixels while recovering
+python minimap_bot.py --memory     # run, explicitly request memory primary
 python minimap_bot.py --minimap    # run, red dots only, never memory
 python minimap_bot.py --port auto  # run, Arduino Leonardo serial backend
 python minimap_bot.py --demo       # the test suite (see below)
@@ -75,9 +75,9 @@ scanning at the bottom of the file — no argparse in `minimap_bot.py`.
    which unit is ours, and the 2x2 `basis` mapping a stick push to world travel —
    so no world axis, camera angle or minimap rotation is ever assumed.
    `target(now)` returns a stick vector and reports a `mode` the status line
-   prints: `chasing`, `far`, `on it`, `gave up`, `no monster`, `lost`, `no unit`,
-   `DEAD`. Everything it depends on is checked rather than trusted — see the
-   constraints below.
+   prints: `chasing`, `far`, `on it`, `gave up`, `no monster`, `lost`, `no unit`.
+   Everything it depends on is checked rather than trusted — see the constraints
+   below.
    Loot rides on the same layer: the background sweep also calls
    `world_loot()`, `pick_loot(now)` returns a stick toward the nearest drop
    within `LOOT_RANGE` whose name passes `wanted_item()` (`LOOT_NAMES`), and
@@ -118,6 +118,16 @@ adjusting them over adding code paths.
 
 ### Memory targeting
 
+- **`IsVisible` does not mean "not invisible".** The game's
+  `BaseUnitController.get_IsInvisible()` reads
+  `StatusComponent.Flags.Invisible` (`unit +0x140 -> status +0x188 -> SyncVar
+  value +0x74`, mask `0x20`). A cloaked monster can retain `MonsterId`, health,
+  and the `IsVisible` byte while attacks cannot hit it. `real_monster()` rejects
+  that structural flag; when one is nearby and nothing attackable remains,
+  `MemoryEyes.target()` reports `invisible`, releases attack, and returns a
+  handled zero stick so the pixel fallback cannot immediately reacquire the same
+  red marker. The short liveness TTL admits it when the flag clears; do not
+  replace this with display inference or a permanent blacklist.
 - **A monster with no `MonsterId` cannot be damaged.** It is a real
   `MonsterController`, rendered, with a full health bar -- it passes every
   liveness test there is. Measured: 232 rendered-and-alive monster objects near
@@ -126,7 +136,7 @@ adjusting them over adding code paths.
   stick, swung for `MEM_ENGAGE_MAX_S`, gave up, and started on the next one --
   which from outside is a bot that will not move and walks back when you drag
   it away. `real_monster()` requires the id; `worth_fighting()` is the weaker
-  test and is what our *own* unit is checked with, since a player has no id.
+  monster liveness test.
 - **Most of the unit list is not there to be fought.** Pooled and despawned
   monsters keep their last position *and get their health reset to full*, so they
   are indistinguishable from a healthy monster standing still. Measured: 516
@@ -159,11 +169,11 @@ adjusting them over adding code paths.
   calibration outright with a healthy character standing there. `pick_me()`
   scores each unit by how well one 2x2 basis explains all its legs: our travel is
   a linear function of the stick, a passer-by's is not, whatever their speed.
-- **A dead character deals no damage and looks exactly like a targeting bug.**
-  It reads as "melee range must be wrong" and sent a whole session chasing a
-  `MEM_ARRIVE` change the evidence did not support. `target()` reports `DEAD`
-  instead of swinging from a corpse. `MEM_ARRIVE = 2.5` is correct — verified
-  killing at that distance on a living character.
+- **Player visibility/health is not a stop signal.** Reusing the monster
+  `worth_fighting()` check on our own unit produced false `DEAD` states while the
+  character was alive, ending unattended grinds. As long as our position remains
+  readable, targeting continues. Monster liveness still uses `real_monster()`;
+  `MEM_ARRIVE = 2.5` remains verified killing distance.
 - **In melee the bot circles the target; it neither stands still nor stands on
   it.** Two separate findings force this. A stick of exactly zero drops the game
   back to keyboard mode and the held attack silently stops landing (measured: hp
@@ -322,10 +332,12 @@ adjusting them over adding code paths.
 
 ### Choosing the target source
 
-- **Minimap is the default and memory is opt-in (`--memory`).** The pixel path
-  needs nothing from the game's memory, so it survives a patch and starts
-  instantly; the memory path is better when it works but costs a heap sweep at
-  startup and goes stale every patch. `targeting_mode()` holds the rule and is
+- **Memory is the default; pixels are its temporary safety fallback.** Memory
+  knows what each unit is and is therefore the preferred source. Pixels cover
+  startup, recalibration, scanner recovery and stale offsets. A sustained
+  contradiction (pixels see targets while calibrated memory says `no monster`)
+  invalidates the narrowed heap cache and requests a rate-limited full sweep.
+  `--minimap` is the explicit opt-out. `targeting_mode()` holds the rule and is
   asserted in `demo()`.
 - **`--area` implies `--memory`, and an explicit `--minimap` still wins.** A
   recorded area is world coordinates and the screen cannot say where in the
@@ -344,12 +356,16 @@ adjusting them over adding code paths.
   at the wrong map puts "home" thousands of units away. `AREA_ABANDON` and
   `AREA_RETURN_MAX_S` turn the fence off with a printed reason rather than let
   the bot lean into scenery on another continent for an hour.
-- **Two thresholds, never one.** `inside()` is the boundary and `deep()` (every
-  one of the eight neighbours painted) is the line to get back over before the
-  walk-back releases. The deleted leash had a single threshold and bounced along
-  it forever against a monster standing on the line; `AREA_CELL = 3.0` is twice
-  `WALK_CELL` precisely so one cell of commit is ~4 frames of travel rather
-  than two, which is single-frame-flap territory.
+- **Two thresholds, never one, and finish the committed return.** `inside()` is
+  the boundary and `deep()` (every one of the eight neighbours painted) defines
+  safe home cells. Crossing into an arbitrary deep cell does not release the
+  walk-back: it continues into the committed `home_goal` cell, or the next target
+  can reverse the stick immediately. A target that genuinely carries us beyond
+  `AREA_LEAVE` is temporarily ignored before returning, so it cannot restart the
+  same outward path as soon as home is reached. The deleted leash had a single
+  threshold and bounced along the line forever; `AREA_CELL = 3.0` is twice
+  `WALK_CELL` precisely so one cell of commit is ~4 frames of travel rather than
+  two, which is single-frame-flap territory.
 - **The walk-back is routed, never steered straight.** The leash aimed raw at
   its anchor with `stick_for` and so leaned on rock for minutes; `_go_home()`
   goes through `route_to()`, and sits *below* the `unwedge` override so the

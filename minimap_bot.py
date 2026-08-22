@@ -89,7 +89,6 @@ RECONNECT_SETTLE_S = 1.5  # wait after each click; these screens animate
 # real flow walks disconnected -> server -> character within a poll or two, so
 # repeating the same screen this many times means stop clicking, not click again.
 RECONNECT_MAX_REPEAT = 5
-RECONNECT_DUMP_MAX = 5    # frames written when it fires; the only evidence there is
 UI_BLUE = ((95, 90, 150), (112, 255, 255))    # the game's button blue, in HSV
 # (x, y, width) fractions. Width matters: Connect and Play sit only 0.033 apart
 # vertically, close enough that either matches the other on position alone -- the
@@ -167,6 +166,13 @@ CAL_RETRY_S = 15.0       # wait this long before trying to calibrate again
 # Tearing the calibration down on the first miss cost a whole run: the bot went
 # silent and only a double-End brought it back. Insist on a run of misses.
 MEM_LOST_FRAMES = 5
+# A healthy calibrated unit can still be paired with a narrowed heap sweep that
+# missed newly allocated monsters after a map/session transition. Pixels seeing
+# targets continuously while memory says "no monster" is direct evidence of that
+# disagreement. Re-open the full heap after this long, but not on every quiet
+# patch: a full sweep reads gigabytes and takes roughly 14 seconds.
+MEM_PIXEL_RESCAN_S = 8.0
+MEM_FULL_RESCAN_COOLDOWN_S = 60.0
 # Reading every unit's position every frame cost 9 ms with 1237 of them on the
 # map. Units far away cannot become the nearest one within a frame, so they are
 # refreshed on a timer and only the near ones every frame.
@@ -203,13 +209,28 @@ LOOT_TAP_GAP_S = 0.5     # between presses while standing on a drop
 # loses the arbitration -- so it is a real walking budget, not a wall clock.
 LOOT_MAX_S = 6.0
 LOOT_IGNORE_S = 30.0
-# Which items to walk to, matched against the name the tooltip shows. Empty
-# means every item the bot can see. Each entry is a case-insensitive substring,
-# so ("Card",) takes Bee Card, Rooster Card and any card added later; a full
-# name still works, and a short entry catches everything containing it.
-# `python memscan.py --loot` prints the names lying around you, which is the
-# list to write this from.
-LOOT_NAMES = ("Grape", "idol", "termite", "Acorn", "Card", "Essence", "Gem")          # e.g. ("Flax", "Slingshot", "Pioneer Relic")
+# Which items to walk to, matched against the name the tooltip shows. The config
+# is one case-insensitive substring per line, so "Card" takes Bee Card, Rooster
+# Card and any card added later. Leave only comments/blank lines to take every
+# item. `python memscan.py --loot` prints the names lying around you.
+LOOT_NAMES_FILE = "loot_names.txt"
+
+
+def load_loot_names(path=None):
+    """Wanted item substrings from the user-editable text file."""
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                LOOT_NAMES_FILE)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return tuple(line.strip() for line in fh
+                         if line.strip() and not line.lstrip().startswith("#"))
+    except OSError:
+        # A deleted/misplaced config must fail closed, not silently change the
+        # bot to collecting every item on the map.
+        return None
+
+
+LOOT_NAMES = load_loot_names()
 # --lootlog: why a drop was or was not walked to, every frame. An item ignored
 # at the character's feet has three possible causes -- not in the sweep's cache
 # at all, blacklisted, or losing the arbitration -- and they look identical from
@@ -230,6 +251,7 @@ CAMERA_CHECK = True      # False skips the startup measurement entirely
 CAMERA_MAX_DEG = 20      # refuse to run past this; relog to reset the camera
 CAMERA_LEG_S = 0.8       # per direction, four of them
 LOOP_HZ = 20
+DASHBOARD_HZ = 4          # terminal redraws; memory work remains on its 2s sweep
 
 # Walking round walls. There is no grid to read: checked against the game's own
 # global-metadata.dat, which carries every class name as plain text. A* Pathfinding
@@ -417,6 +439,176 @@ def hold_still(mode):
     bot that stands in a field forever because the unit list came back empty.
     """
     return mode != "no monster"
+
+
+def attack_active(now, buffing=False, blocked=False):
+    """Whether L1 should be down; buffs and unattackable targets release it."""
+    if buffing or blocked:
+        return False
+    return (now % ATTACK_PERIOD_S) < ATTACK_HOLD_S if ATTACK_MASH else True
+
+
+def dashboard_text(info):
+    """Fixed, compact terminal view built only from an already-cached snapshot."""
+    memory = info.get("memory") or {}
+    loot = info.get("loot") or {}
+
+    def row(label, value):
+        return f"{label:<10} {value or '-'}"
+
+    def rows(label, values):
+        values = tuple(values or ()) or ("-",)
+        return [row(label if i == 0 else "", value)
+                for i, value in enumerate(values)]
+
+    running = info.get("status") or (
+        "RUNNING" if info.get("running") else "STOPPED")
+    sx, sy = info.get("stick", (0.0, 0.0))
+    controls = (f"stick {sx:+.2f},{sy:+.2f}  attack "
+                f"{'ON' if info.get('attack') else 'OFF'}"
+                + (f"  button {info['action']}" if info.get("action") else ""))
+    scanner = (f"{memory.get('scanner', 'off')} | classes "
+               f"{memory.get('classes', '-')} | calibrated "
+               f"{'YES' if memory.get('calibrated') else 'NO'}")
+    lines = [
+        f"SPIRITVALE BOT  [{running}]  mode "
+        f"{info.get('bot_mode', 'minimap').upper()} | "
+        f"source {info.get('source', 'pixels').upper()}",
+        "=" * 78,
+        row("Bot", f"{info.get('state', '-')} | {controls}"),
+        row("Memory", scanner),
+        row("Detected", memory.get("counts", "-")),
+        row("Player", memory.get("player", "unknown")),
+    ]
+    lines += rows("Players", memory.get("players"))
+    lines += rows("Pets", memory.get("pets"))
+    lines += rows("Monsters", memory.get("monsters"))
+    lines += [row("Target", info.get("target", "none")),
+              row("Loot", f"{loot.get('detected', 0)} detected / "
+                          f"{loot.get('wanted', 0)} wanted")]
+    lines += rows("Ground", loot.get("ground"))
+    lines.append(row("Navigation", info.get("navigation", "-")))
+    if info.get("warning"):
+        lines.append(row("WARNING", info["warning"]))
+    return "\n".join(lines)
+
+
+def dashboard_snapshot(eyes, running, state, sx=0.0, sy=0.0, attack=False,
+                       action="", on_loot=False, distance=None,
+                       memory_driving=None, status=None, bot_mode=None):
+    """Copy dashboard inputs; every memory value here was cached elsewhere."""
+    memory = {"scanner": "off", "classes": "-", "calibrated": False,
+              "counts": "-", "player": "unknown", "players": (),
+              "pets": (), "monsters": ()}
+    loot = {"detected": 0, "wanted": 0, "ground": ()}
+    warning = ""
+    recovery = ""
+    if eyes is not None:
+        with eyes.lock:
+            report = dict(eyes.scan_summary)
+            drops = list(eyes.loot.values())
+            report_error = eyes.scan_error
+            recovery = getattr(eyes, "recovery", "")
+        scanner = ("running" if eyes.scanner and eyes.scanner.is_alive()
+                   else "not started")
+        resolved = "+".join(k for k in ("monster", "player", "pet", "loot")
+                            if eyes.classes.get(k)) or "none"
+        counts = report.get("counts", {})
+        memory = {"scanner": scanner, "classes": resolved,
+                  "calibrated": bool(eyes.me and eyes.basis),
+                  "counts": (f"{counts.get('monster', 0)} monster objects | "
+                             f"{counts.get('player', 0)} players | "
+                             f"{counts.get('pet', 0)} pets"),
+                  "player": report.get("player", "unknown"),
+                  "players": tuple(report.get("players", ()))[:6],
+                  "pets": tuple(report.get("pets", ()))[:6],
+                  "monsters": tuple(report.get("monsters", ()))[:5]}
+
+        name_counts = {}
+        for *_, name in drops:
+            name_counts[name] = name_counts.get(name, 0) + 1
+        wanted = sum(n for name, n in name_counts.items() if wanted_item(name))
+        ordered = sorted(name_counts.items(),
+                         key=lambda item: (not wanted_item(item[0]),
+                                           -item[1], item[0].lower()))
+        ground = [f"{name} x{n} [{'WANTED' if wanted_item(name) else 'filtered'}]"
+                  for name, n in ordered[:6]]
+        if len(ordered) > 6:
+            ground.append(f"+{len(ordered) - 6} more types")
+        loot = {"detected": len(drops), "wanted": wanted,
+                "ground": tuple(ground)}
+        if report_error:
+            warning = f"memory report failed: {report_error}"
+        elif LOOT_NAMES is None:
+            warning = f"{LOOT_NAMES_FILE} missing; loot fails closed"
+        elif drops and not wanted:
+            warning = f"loot filter matches nothing; edit {LOOT_NAMES_FILE}"
+
+    if memory_driving is None:
+        memory_driving = bool(eyes is not None and eyes.me)
+    if on_loot and eyes is not None:
+        target = f"LOOT {eyes.loot_name or 'unknown'}"
+    elif eyes is not None and eyes.chasing:
+        target = f"MONSTER {eyes.target_name or 'unknown'}"
+    elif memory_driving and eyes is not None:
+        # Memory is driving but not on a specific monster: wandering the
+        # area, walking back in, or unwedging.  Show the mode, not a
+        # phantom pixel target.
+        target = eyes.mode.upper()
+    else:
+        target = "PIXEL red marker" if running and state not in ("no monster", "no unit") else "none"
+    if distance is not None:
+        target += f" at {distance:.1f}"
+    navigation = "-"
+    if eyes is not None:
+        navigation = f"{eyes.loot_mode if on_loot else eyes.mode} / "
+        navigation += "route" if eyes.routing else "direct"
+    if not running:
+        target = "none"
+        navigation = "paused"
+    elif status:
+        # Login handling has released every control and old targets belong to
+        # the vanished gameplay session. Never display that stale frame while
+        # reconnect_step() waits for the next screen.
+        target = "none"
+        navigation = "waiting for gameplay"
+    bot_mode = bot_mode or ("memory" if eyes is not None else "minimap")
+    if running and bot_mode == "memory" and not memory_driving:
+        warning = recovery or warning or "memory primary; pixels are temporary fallback"
+    return {"running": running,
+            "status": status,
+            "bot_mode": bot_mode,
+            "source": "memory" if memory_driving else "pixels",
+            "state": state.strip(), "stick": (sx, sy), "attack": attack,
+            "action": action, "memory": memory, "target": target,
+            "loot": loot, "navigation": navigation, "warning": warning}
+
+
+class TerminalDashboard:
+    def __init__(self, bot_mode=None):
+        self.last = 0.0
+        self.bot_mode = bot_mode
+        if os.name == "nt":
+            # Python does not always enable VT sequences in classic conhost.
+            # Set the console flag directly; no shell window or subprocess.
+            import ctypes
+            kernel = ctypes.windll.kernel32
+            handle = kernel.GetStdHandle(-11)       # STD_OUTPUT_HANDLE
+            mode = ctypes.c_uint()
+            if kernel.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel.SetConsoleMode(handle, mode.value | 0x0004)
+
+    def update(self, eyes, running, state, sx=0.0, sy=0.0, attack=False,
+               action="", on_loot=False, distance=None, memory_driving=None,
+               status=None, force=False):
+        now = time.monotonic()
+        if not force and now - self.last < 1 / DASHBOARD_HZ:
+            return
+        self.last = now
+        info = dashboard_snapshot(eyes, running, state, sx, sy, attack,
+                                  action, on_loot, distance, memory_driving,
+                                  status, self.bot_mode)
+        print("\x1b[2J\x1b[H" + dashboard_text(info), end="", flush=True)
 
 
 def toggle_running(paused, pad, pet_filter, wake=wake_controller):
@@ -1550,7 +1742,7 @@ def stick_vector(dx, dy):
 
 
 def wanted_item(name):
-    """Is this item one we walk to? Empty LOOT_NAMES means all of them.
+    """Is this item one we walk to? Empty config means all; missing means none.
 
     Substring, case-insensitive: "Card" collects "Bee Card", "Rooster Card" and
     every other card, which is the point -- a whole family of items is usually
@@ -1558,6 +1750,8 @@ def wanted_item(name):
     The cost is that a short entry catches more than it looks like it will
     ("axe" also takes "Battle Axe"), so keep entries specific enough to mean it.
     """
+    if LOOT_NAMES is None:
+        return False
     if not LOOT_NAMES:
         return True
     # ("Card") is a string, not a tuple -- the missing comma is easy to write,
@@ -1565,6 +1759,82 @@ def wanted_item(name):
     want = (LOOT_NAMES,) if isinstance(LOOT_NAMES, str) else LOOT_NAMES
     got = name.strip().lower()
     return any(w.strip().lower() in got for w in want if w.strip())
+
+
+def memory_scan_summary(ms, mem, units, owner, max_monsters=5,
+                        max_players=8, max_pets=8, priority_monster=None):
+    """Human-readable names from one background sweep, never from the hot path."""
+    counts = {kind: sum(1 for row in units if row[0] == kind)
+              for kind in ("monster", "player", "pet")}
+    by_addr = {row[1]: row for row in units}
+    origin = by_addr.get(owner)
+
+    def closest(kind, limit):
+        rows = [row for row in units if row[0] == kind]
+        if origin:
+            ox, oz = origin[2], origin[4]
+            rows.sort(key=lambda row: math.hypot(row[2] - ox, row[4] - oz))
+        return rows[:limit]
+
+    player_rows = closest("player", max_players)
+    pet_rows = closest("pet", max_pets)
+    own_pets = ms.my_pets(mem, owner) if owner else set()
+    summoner_of = getattr(ms, "summoner_of", None)
+    if owner and summoner_of:
+        own_pets.update(unit for kind, unit, *_ in pet_rows
+                        if summoner_of(mem, unit) == owner)
+
+    players = []
+    own_name = ms.player_name(mem, owner) if owner else None
+    player_rows.sort(key=lambda row: row[1] != owner)
+    for kind, unit, *_ in player_rows:
+        visible = bool((mem.read(unit + ms.UNIT_VISIBLE, 1) or b"\0")[0])
+        if not visible and unit != owner:
+            continue
+        loaded_name = ms.player_name(mem, unit)
+        # Rebuilt/pool copies of our PlayerController can remain visible and
+        # retain our name. Character names are unique, so only the owner row is
+        # useful; listing three Lepicas makes the report look like three people.
+        if unit != owner and loaded_name and loaded_name == own_name:
+            continue
+        name = loaded_name or f"player@0x{unit:X}"
+        players.append(name + (" [YOU]" if unit == owner else ""))
+
+    pets = []
+    for kind, unit, *_ in pet_rows:
+        name = ms.monster_id(mem, unit) or f"pet@{unit & 0xFFFF:04X}"
+        pets.append(name + (" [YOURS]" if unit in own_pets else ""))
+
+    monster_counts = {}
+    monster_order = []
+    monster_names = {}
+    if origin:
+        ox, oz = origin[2], origin[4]
+        nearby = sorted((math.hypot(x - ox, z - oz), unit)
+                        for kind, unit, x, _, z in units if kind == "monster")
+        if priority_monster:
+            priority = next((row for row in nearby
+                             if row[1] == priority_monster), None)
+            if priority:
+                nearby = [priority] + [row for row in nearby
+                                       if row[1] != priority_monster]
+        # Bounded because real_monster() takes several reads. This runs on the
+        # two-second scanner thread, but an unbounded report can still starve it.
+        for _, unit in nearby[:12]:
+            if not ms.real_monster(mem, unit):
+                continue
+            name = ms.monster_id(mem, unit) or f"monster@{unit & 0xFFFF:04X}"
+            monster_names[unit] = name
+            if name not in monster_counts:
+                monster_order.append(name)
+                monster_counts[name] = 0
+            monster_counts[name] += 1
+            if len(monster_order) >= max_monsters:
+                break
+    monsters = tuple(f"{name} x{monster_counts[name]}" for name in monster_order)
+    return {"counts": counts, "player": own_name or "unknown",
+            "players": tuple(players), "pets": tuple(pets),
+            "monsters": monsters, "monster_names": monster_names}
 
 
 class MemoryEyes:
@@ -1605,6 +1875,7 @@ class MemoryEyes:
         self.basis = None         # stick push -> world travel
         self.units = []           # cached (kind, addr, x, y, z)
         self.chasing = None       # unit held between frames, so it does not flap
+        self.target_name = ""     # cached only when target changes, for dashboard
         self.approach = None      # last heading that closed on a target
         self.orbit_dir = 1        # which way round a target we circle
         self.orbit_mark = None    # (time, x, z) the orbit last made progress at
@@ -1614,7 +1885,7 @@ class MemoryEyes:
         self.misses = 0           # consecutive frames our position did not read
         self.seen_at = {}         # last known position per unit
         self.sweep_at = 0         # cursor into the far units, a slice per frame
-        self.fight_ok = {}        # unit -> (expiry, is it worth fighting)
+        self.fight_ok = {}        # unit -> (expiry, attackable, invisible)
         self.hot = None           # regions worth sweeping
         self.owner = None         # our unit, from the local connection
         self.loot = {}            # drop -> (x, y, z, name)
@@ -1624,6 +1895,13 @@ class MemoryEyes:
         self.loot_ignored = {}    # drop -> time it becomes fair game again
         self.loot_mode = "no loot"
         self.hot_loot = None      # regions worth sweeping for loot
+        self.scan_summary = {"counts": {}, "player": "unknown",
+                             "players": (), "pets": (), "monsters": (),
+                             "monster_names": {}}
+        self.scan_error = ""
+        self.recovery = ""
+        self.fallback_since = None
+        self.next_full_rescan = 0.0
         self.walk = WalkMap().load()   # learned walls; the world, not our unit
         self.path = None          # cells to the current goal, world points
         self.path_at = 0.0        # when it was planned
@@ -1639,6 +1917,7 @@ class MemoryEyes:
         self.escapes = 0          # on the current target
         self.scanner = None
         self.stop = None
+        self.generation = 0       # invalidates a sweep crossing a relog boundary
         self.lock = threading.Lock()
 
     def available(self):
@@ -1685,6 +1964,46 @@ class MemoryEyes:
             self.stop.set()
         self.mem.close()
 
+    def reset_session(self):
+        """Discard every address derived from the old login session.
+
+        Reconnecting keeps the process alive but rebuilds its heap objects. The
+        class pointers survive; unit/drop addresses, calibration and narrowed
+        heap regions do not. Emptying them makes target() hand control to pixels
+        until the scanner completes a fresh full-heap pass.
+        """
+        with self.lock:
+            self.generation += 1
+            self.units = []
+            self.loot = {}
+            self.me = self.basis = self.owner = self.hot = self.hot_loot = None
+            self.chasing = self.engaged_since = self.approach = None
+            self.target_name = ""
+            self.loot_target = self.loot_since = None
+            self.loot_name, self.loot_mode = "", "no loot"
+            self.scan_summary = {"counts": {}, "player": "unknown",
+                                 "players": (), "pets": (), "monsters": (),
+                                 "monster_names": {}}
+            self.scan_error = ""
+            self.recovery = ""
+            self.fallback_since = None
+            self.next_full_rescan = 0.0
+            self.ignored, self.loot_ignored = {}, {}
+            self.seen_at, self.fight_ok = {}, {}
+            self.misses = self.sweep_at = 0
+            self.path = self.path_to = self.last_pos = self.goal = self.loot_goal = None
+            self.path_at = self.escape_until = 0.0
+            self.escape = self.orbit_mark = None
+            self.escapes, self.orbit_dir = 0, 1
+            # The recorded area describes the world and survives. Its active
+            # walk-back/wander decision belongs to the character that did not.
+            self.returning, self.home_goal, self.wander = False, None, None
+            self.wander_until = self.returning_since = self.wander_committed = 0.0
+            self.routing = self.sealed = False
+            self.mode = "no unit"
+        if self.walk:
+            self.walk.forget_walk()
+
     def _positions(self, addrs):
         # Hot path: a few hundred of these per frame, so the read and the
         # sanity check are inline rather than three function calls deep.
@@ -1713,9 +2032,18 @@ class MemoryEyes:
         hit = self.fight_ok.get(unit)
         if hit and hit[0] > now:
             return hit[1]
-        ok = self.ms.real_monster(self.mem, unit)
-        self.fight_ok[unit] = (now + LIVE_TTL_S, ok)
+        state = getattr(self.ms, "monster_target_state", None)
+        if state:
+            ok, invisible = state(self.mem, unit)
+        else:                       # ponytail: compatibility for tiny test stubs
+            ok, invisible = self.ms.real_monster(self.mem, unit), False
+        self.fight_ok[unit] = (now + LIVE_TTL_S, ok, invisible)
         return ok
+
+    def _known_invisible(self, unit):
+        """Whether the liveness check just identified this candidate as cloaked."""
+        hit = self.fight_ok.get(unit)
+        return bool(hit and len(hit) > 2 and hit[2])
 
     def _first_fightable(self, ranked):
         """Nearest entry that is really there. `ranked` is sorted by distance."""
@@ -1858,7 +2186,7 @@ class MemoryEyes:
               + (f", slot cached (0x{rva:X})" if rva else ""))
         return True
 
-    def _sweep_loot(self, mem):
+    def _sweep_loot(self, mem, generation=None):
         """Refresh ground loot. world_loot() has already dropped the pool.
 
         LootDrop objects are pooled -- a fixed set, recycled, and picking an
@@ -1870,12 +2198,18 @@ class MemoryEyes:
         found = self.ms.world_loot(mem, self.classes.get("loot"),
                                    regions=self.hot_loot)
         with self.lock:
+            if generation is not None and generation != self.generation:
+                return
             self.loot = {d: (x, y, z, n) for d, x, y, z, n in found}
-        if self.hot_loot is None and found:
+            narrow = self.hot_loot is None and bool(found)
+        if narrow:
             spans = mem.regions()
             live = {d for d, *_rest in found}
-            self.hot_loot = [(b, s) for b, s in spans
-                             if any(b <= d < b + s for d in live)]
+            hot = [(b, s) for b, s in spans
+                   if any(b <= d < b + s for d in live)]
+            with self.lock:
+                if generation is None or generation == self.generation:
+                    self.hot_loot = hot
 
     def loot_here(self):
         """Is a wanted item lying under us right now? Sets loot_name if so.
@@ -2013,19 +2347,43 @@ class MemoryEyes:
                     if not self.available():
                         self.stop.wait(MEM_REFRESH_S)
                         continue
-                    found = self.ms.world_units(mem, regions=self.hot)
                     with self.lock:
+                        generation, hot = self.generation, self.hot
+                    found = self.ms.world_units(mem, regions=hot)
+                    with self.lock:
+                        if generation != self.generation:
+                            continue
                         self.units = found
                     if self.owner is None and found:
                         # Who we are, read instead of walked for: any unit
                         # carries the managers, so this is a pointer walk with
                         # nothing to search. Re-read whenever it is lost, since
                         # a map change rebuilds the object.
-                        self.owner = self.ms.local_player(mem, found[0][1])
+                        owner = self.ms.local_player(mem, found[0][1])
+                        with self.lock:
+                            if generation == self.generation:
+                                self.owner = owner
+                    with self.lock:
+                        report_owner = self.owner
+                        report_target = self.chasing
+                    try:
+                        report = memory_scan_summary(self.ms, mem, found,
+                                                     report_owner,
+                                                     priority_monster=report_target)
+                        report_error = ""
+                    except Exception as e:
+                        # Diagnostics must never take targeting down. The next
+                        # two-second sweep gets another chance at transient data.
+                        report, report_error = None, str(e)
+                    with self.lock:
+                        if generation == self.generation:
+                            if report is not None:
+                                self._accept_scan_summary(report)
+                            self.scan_error = report_error
                     if LOOT_PICKUP and not self.classes.get("loot") and looked:
                         looked = self._ensure_class(mem, "loot", "loot pickup")
                     if LOOT_PICKUP and self.classes.get("loot"):
-                        self._sweep_loot(mem)
+                        self._sweep_loot(mem, generation)
                     if PATHFIND:
                         # Everything alive walks the same navmesh we do, so a
                         # unit that moved since the last sweep has just proven
@@ -2043,8 +2401,11 @@ class MemoryEyes:
                         # be, rather than paying for the whole heap every time.
                         spans = mem.regions()
                         live = {u for _, u, *_ in found}
-                        self.hot = [(b, s) for b, s in spans
-                                    if any(b <= u < b + s for u in live)]
+                        hot = [(b, s) for b, s in spans
+                               if any(b <= u < b + s for u in live)]
+                        with self.lock:
+                            if generation == self.generation:
+                                self.hot = hot
                     self.stop.wait(MEM_REFRESH_S)
             finally:
                 mem.close()
@@ -2063,6 +2424,38 @@ class MemoryEyes:
 
         self.scanner = threading.Thread(target=loop, daemon=True)
         self.scanner.start()
+
+    def _accept_scan_summary(self, report):
+        """Publish a background report and fill a label that was pending."""
+        self.scan_summary = report
+        self.recovery = ""
+        name = report.get("monster_names", {}).get(self.chasing)
+        if name:
+            self.target_name = name
+
+    def note_pixel_fallback(self, now, evidence):
+        """Request a full sweep when pixels repeatedly contradict memory."""
+        healthy = bool(self.me and self.basis and self.mode == "no monster")
+        if not evidence or not healthy:
+            self.fallback_since = None
+            return False
+        if self.fallback_since is None:
+            self.fallback_since = now
+            return False
+        if (now - self.fallback_since < MEM_PIXEL_RESCAN_S
+                or now < self.next_full_rescan):
+            return False
+        with self.lock:
+            self.generation += 1
+            self.hot = None
+            self.units = []
+            self.scan_summary = {"counts": {}, "player": "unknown",
+                                 "players": (), "pets": (), "monsters": (),
+                                 "monster_names": {}}
+        self.fallback_since = None
+        self.next_full_rescan = now + MEM_FULL_RESCAN_COOLDOWN_S
+        self.recovery = "full memory rescan: pixels see targets memory missed"
+        return True
 
     def _why_switched(self, now, ranked):
         """Which test the previous target failed. Diagnosis only.
@@ -2286,12 +2679,19 @@ class MemoryEyes:
             # to search
             # the whole heap, because the new objects need not be where the old
             # ones were.
-            self.me = self.basis = self.hot = self.approach = None
+            self.me = self.basis = self.approach = None
             self.orbit_mark = None
             # The owner is a pointer to the object that was just rebuilt, so it
             # is as dead as the rest. It is also what the scanner checks before
             # looking us up again, so leaving it set meant we never recovered.
-            self.owner = None
+            # Invalidate any narrowed sweep already in flight. Without a new
+            # generation, that old sweep could publish its old-region results
+            # after `hot` was cleared, narrow the scanner right back to them,
+            # and leave memory recovery on pixels forever.
+            with self.lock:
+                self.generation += 1
+                self.owner = self.hot = None
+                self.units = []
             # Same reason as `hot`: the drops that survive a relog need not be
             # in the regions the old ones were, and a narrowed sweep that finds
             # nothing keeps finding nothing.
@@ -2309,19 +2709,10 @@ class MemoryEyes:
             if self.walk:
                 self.walk.forget_walk()
             self.mode = "no unit"
-            with self.lock:
-                self.units = []
             return None, None, None
         self.misses = 0
         px, _, pz = here
         self.last_pos = (px, pz)
-        if not self.ms.worth_fighting(self.mem, self.me):
-            # We are dead (or not rendered). Swinging at things from a corpse
-            # looks exactly like a bot that cannot kill anything -- it cost a
-            # whole debugging session once, with the conclusion that melee
-            # range was wrong when the character was simply lying down.
-            self.mode = "dead"
-            return None, None, None
         if self.escape and now < self.escape_until:
             # Backing out of a wedge. This overrides the target entirely: while
             # the character cannot move, nothing else it decides matters.
@@ -2338,11 +2729,21 @@ class MemoryEyes:
             # Evaluated before the walk-back acts, or the flag clears a frame
             # late and the bot takes one extra outward step every re-entry.
             if self.returning:
-                if self.area.deep(px, pz):
+                reached_home = (self.home_goal is None or
+                                self.area.at(px, pz) ==
+                                self.area.at(*self.home_goal))
+                if reached_home and self.area.deep(px, pz):
                     self.returning, self.home_goal = False, None
             elif not self.area.inside(px, pz, AREA_LEAVE):
                 self.returning, self.returning_since = True, now
                 self.home_goal = self.area.home(px, pz)
+                # Resuming the same target immediately after reaching home is
+                # the other half of the back-and-forth loop. If its chase or
+                # route genuinely carried us past AREA_LEAVE, give another
+                # candidate a turn before this one may be selected again.
+                if self.chasing is not None:
+                    self.ignored[self.chasing] = now + TARGET_IGNORE_S
+                    self.chasing = self.engaged_since = self.approach = None
             if self.returning:
                 out = self._go_home(now, px, pz)
                 if out:
@@ -2391,6 +2792,16 @@ class MemoryEyes:
                 hit, dist = (held[1], held[2], held[3], held[4]), held[0]
         if not hit:
             self.chasing = self.engaged_since = None
+            cloaked = next((e for e in allowed
+                            if e[0] <= MEM_RANGE and self._known_invisible(e[1])),
+                           None)
+            if cloaked:
+                # Do not hand this frame to pixels: its red marker is the same
+                # invisible monster memory just proved cannot be attacked.
+                # A non-None zero stick is the explicit source veto; as soon as
+                # the status flag clears, the short liveness TTL admits it.
+                self.mode = "invisible"
+                return 0.0, 0.0, cloaked[0]
             if self.area is not None:
                 # Inside a fence "nothing left" is normal, not the end of the
                 # map. Falling through to the pixel path here would be worse
@@ -2421,6 +2832,9 @@ class MemoryEyes:
                       f"  because {self._why_switched(now, ranked)}"
                       f"  candidates {len(allowed)}")
             self.chasing, self.engaged_since, self.escapes = hit[0], now, 0
+            report = getattr(self, "scan_summary", {})
+            self.target_name = report.get("monster_names", {}).get(hit[0],
+                                                                    "unknown")
         elif self.escapes >= WALK_ESCAPE_GIVEUP:
             # Backed out of the same approach this many times and still here.
             # Whatever is in the way, this monster is not the one to fight.
@@ -2623,22 +3037,18 @@ class ArduinoPad:
 def targeting_mode(argv, area=None):
     """Which target source this run uses: "memory" or "minimap".
 
-    Minimap is the default. It needs nothing from the game's memory, so it
-    survives a patch, starts instantly, and is the honest thing to hand someone
-    who has not calibrated anything. The memory path is better when it works --
-    it knows what a thing IS, so pets and other players stop being targets --
-    but it costs a heap sweep at startup and goes stale every patch.
+    Memory is the primary because it knows what a thing IS, so pets and other
+    players stop being targets. Pixels remain its startup/recovery fallback.
+    `--minimap` is the explicit opt-out for a run that must never use memory.
 
     `--area` only exists on the memory path (a recorded area is world
     coordinates, which the screen cannot give), so asking for one asks for
     memory. An explicit `--minimap` still wins: saying so out loud should never
     be silently overridden.
     """
-    if "--minimap" in argv:
+    if not MEMORY_TARGETING or "--minimap" in argv:
         return "minimap"
-    if "--memory" in argv or area:
-        return "memory"
-    return "minimap"
+    return "memory"
 
 
 def main(port=None, area=None):
@@ -2708,10 +3118,11 @@ def main(port=None, area=None):
     next_login_check = 0.0  # a whole-window grab, so kept to RECONNECT_POLL_S
     reconnecting = RECONNECT   # switched off if a screen refuses to advance
     same_screen = (None, 0)    # what reconnect_step did last, and how many in a row
-    dumps = 0                  # frames written, capped by RECONNECT_DUMP_MAX
+    awaiting_game = False      # Play clicked; next non-login frame is a new session
+    dashboard = TerminalDashboard(mode)
 
     pad.stick(0.0, 0.0, False)
-    print("STOPPED -- press End to start")
+    dashboard.update(eyes, False, "press End to start", force=True)
 
     with mss.mss() as sct:
         try:
@@ -2764,14 +3175,37 @@ def main(port=None, area=None):
                     #     else:
                     #         print(f"camera check: {deg:+.0f} degrees, good")
                 if paused:
+                    dashboard.update(eyes, False, "press End to start")
                     time.sleep(0.05)
                     continue
+
+                if (eyes is not None and
+                        (eyes.scanner is None or not eyes.scanner.is_alive())):
+                    # The sweep loop catches ordinary read errors itself. This
+                    # is the last guard for a thread that nevertheless exited:
+                    # memory remains the configured primary and is restarted
+                    # without requiring a double-End from the user.
+                    eyes.start_scanning()
+                    print("\nmemory scanner stopped -- restarted; pixels until it lands")
 
                 if reconnecting and time.time() >= next_login_check:
                     next_login_check = time.time() + RECONNECT_POLL_S
                     full = np.array(sct.grab(window_region(win)))[:, :, :3]
-                    if not login_screen(full):
+                    screen = login_screen(full)
+                    if not screen:
                         same_screen = (None, 0)
+                        if awaiting_game:
+                            # Play Character returned us to gameplay. The process
+                            # stayed alive, but every heap object belongs to the
+                            # old login session. Force a full scan and let pixels
+                            # drive until the new unit list and basis are ready.
+                            awaiting_game = False
+                            had_unit = False
+                            next_cal = 0.0
+                            if eyes is not None:
+                                eyes.reset_session()
+                                print("\nreconnect complete -- rescanning memory; "
+                                      "reading pixels until it lands")
                     else:
                         # Drop the stick and attack before touching the mouse: the
                         # character is gone, and a held button carries into the
@@ -2779,13 +3213,8 @@ def main(port=None, area=None):
                         pad.stick(0.0, 0.0, False)
                         did = reconnect_step(full, win)
                         print(f"\nreconnect: handled the {did} screen")
-                        if dumps < RECONNECT_DUMP_MAX:
-                            # Which blue blob matched is the one thing the log
-                            # cannot say, and a false positive can only be
-                            # guessed at without it. Capped, so a real
-                            # reconnect does not paper the folder.
-                            cv2.imwrite(f"reconnect_{did}_{dumps}.png", full)
-                            dumps += 1
+                        if did == "character":
+                            awaiting_game = True
                         seen, n = same_screen
                         same_screen = (did, n + 1 if did == seen else 1)
                         if same_screen[1] >= RECONNECT_MAX_REPEAT:
@@ -2797,8 +3226,7 @@ def main(port=None, area=None):
                             reconnecting = False
                             print(f"\nreconnect: the {did} screen did not "
                                   f"advance in {RECONNECT_MAX_REPEAT} tries -- "
-                                  f"reconnect OFF for this run; see "
-                                  f"reconnect_*.png. Restart to re-arm.")
+                                  f"reconnect OFF for this run. Restart to re-arm.")
                         target_lock.reset()
                         target_blacklist.reset()
                         stuck_watchdog.reset()
@@ -2806,6 +3234,19 @@ def main(port=None, area=None):
                         last = None
                         buff_queue = []
                         next_buff = next_press = next_spam = next_loot = 0.0
+                        if reconnecting:
+                            reconnect_state = (f"handling {did} screen "
+                                               f"({same_screen[1]}/"
+                                               f"{RECONNECT_MAX_REPEAT})")
+                            reconnect_status = "RECONNECTING"
+                        else:
+                            reconnect_state = (f"{did} screen stuck; reconnect "
+                                               "disabled until restart")
+                            reconnect_status = "RECONNECT OFF"
+                        dashboard.update(
+                            eyes, True, reconnect_state,
+                            memory_driving=False,
+                            status=reconnect_status, force=True)
                         continue
 
                 if not buff_queue and time.time() >= next_buff:
@@ -2818,6 +3259,9 @@ def main(port=None, area=None):
                 h, w = img.shape[:2]
                 now = time.time()
                 sx = sy = None
+                on_loot = False
+                display_distance = None
+                memory_driving = False
                 if (eyes is not None and eyes.me is None
                         and now >= next_cal and eyes.known_players()):
                     # The sweep has landed, so the two calibration pushes can
@@ -2846,7 +3290,6 @@ def main(port=None, area=None):
                     # also when the only monster is "far": an item two steps
                     # away is worth more than a walk across the map, and the
                     # monster is still there afterwards. Never mid-fight.
-                    on_loot = False
                     if LOOT_PICKUP and eyes.mode not in ("on it", "unwedge"):
                         lsx, lsy, ldist = eyes.pick_loot(now)
                         if lsx is not None and loot_wins(eyes.mode, mdist
@@ -2884,8 +3327,8 @@ def main(port=None, area=None):
                     elif msx is None:
                         # A zero stick reads as "handled" below, so the pixel
                         # path never runs. Right for the modes that mean stop
-                        # (a corpse swings at nothing, a rebuilt unit has no
-                        # basis) -- wrong for "no monster", which is the unit
+                        # (a rebuilt unit has no basis) -- wrong for "no
+                        # monster", which is the unit
                         # list saying it has nothing, not the screen. Leaving
                         # sx None there is what walks the bot to a red dot
                         # instead of standing still until it is restarted.
@@ -2896,7 +3339,6 @@ def main(port=None, area=None):
                         # a message that reads like a quiet patch of map.
                         state = {"no unit": "no unit  ",
                                  "lost": "lost     ",
-                                 "dead": "DEAD     ",
                                  "walled": "walled   ",
                                  "gave up": "gave up  ",
                                  "no area": "NO AREA  "}.get(eyes.mode,
@@ -2918,6 +3360,9 @@ def main(port=None, area=None):
                                                            "dist  ") + (
                                 f"{mdist:6.1f}" if not eyes.routing
                                 else f"{mdist:5.1f}~")
+                    if sx is not None:
+                        display_distance = mdist
+                        memory_driving = True
 
                 # Everything below is the pixel path, used when memory targeting
                 # is off or has gone stale. It is left exactly as it was.
@@ -2942,6 +3387,7 @@ def main(port=None, area=None):
                 elif dot is not None:
                     dx, dy = dot[0] - cx, dot[1] - cy
                     dist = (dx * dx + dy * dy) ** 0.5
+                    display_distance = dist
                     sx, sy = stick_vector(dx, dy)
                     last = (now, dist, sx, sy)
                     if dist < DEADZONE_PX:
@@ -2962,8 +3408,22 @@ def main(port=None, area=None):
                     last = None
                     state = "no monster"
 
-                # L1 held down continuously. Set ATTACK_MASH to mash it instead.
-                atk = (now % ATTACK_PERIOD_S) < ATTACK_HOLD_S if ATTACK_MASH else True
+                pixel_evidence = bool(
+                    not memory_driving and
+                    (dot is not None or target_lock.current is not None
+                     or last is not None))
+                if (eyes is not None and
+                        eyes.note_pixel_fallback(now, pixel_evidence)):
+                    state = "memory rescan"
+                    print("\nmemory and pixels disagree -- full memory rescan "
+                          "started; pixels remain temporary fallback")
+
+                # Buffs need a clean cast: release L1 before the first d-pad tap,
+                # keep it released through every gap, then resume after the last.
+                atk = attack_active(
+                    now, buffing=bool(buff_queue),
+                    blocked=bool(eyes is not None and memory_driving
+                                 and eyes.mode == "invisible"))
                 if eyes is not None:
                     # The stick that actually goes out is the one the walk map
                     # can learn a wall from -- loot may have won the arbitration
@@ -2971,9 +3431,9 @@ def main(port=None, area=None):
                     eyes.observe_move(now, sx, sy, on_loot)
                 pad.stick(sx, sy, atk)
 
-                # One d-pad press per pass, spaced by BUFF_GAP_S. The stick and L1
-                # keep their last value across a tap, so the buff casts mid-chase
-                # instead of parking the bot for a whole sequence.
+                # One d-pad press per pass, spaced by BUFF_GAP_S. The stick keeps
+                # its last value across a tap, while attack stays released for
+                # the complete sequence.
                 key = ""
                 if buff_queue and now >= next_press:
                     key = buff_queue.pop(0)
@@ -2998,20 +3458,202 @@ def main(port=None, area=None):
                     key = SPAM_BUTTON
                     next_spam = now + SPAM_PERIOD_S
 
-                how = "  memory" if (eyes and eyes.me) else "  pixels"
-                print(f"{state:12} stick {sx:+.2f},{sy:+.2f} "
-                      f"atk {'#' if atk else '.'} {key:5}{how}   ",
-                      end="\r")
+                dashboard.update(eyes, True, state, sx, sy, atk, key, on_loot,
+                                 display_distance, memory_driving)
                 time.sleep(1 / LOOP_HZ)
         except KeyboardInterrupt:
             print("\nstopped")
         finally:
             pad.close()
+            print()
 
 
 def demo():
     """Self-check: synthetic minimap, no game or gamepad needed."""
+    global LOOT_NAMES, MEMORY_TARGETING
+    import inspect
+    import tempfile
+
     assert SPAM_BUTTON is None or SPAM_BUTTON in ArduinoPad.FACE, SPAM_BUTTON
+    assert "cv2.imwrite" not in inspect.getsource(main), (
+        "automatic reconnect must not save screenshots")
+    assert "status=reconnect_status" in inspect.getsource(main), (
+        "reconnect must replace stale dashboard controls before continuing")
+    assert "target_lock.current is not None" in inspect.getsource(main)
+    assert "target_lock.target_id is not None" not in inspect.getsource(main), (
+        "a historical target id is not current pixel evidence")
+
+    dashboard = dashboard_text({
+        "running": True, "bot_mode": "memory", "source": "memory",
+        "state": "loot",
+        "stick": (0.25, -1.0), "attack": False, "action": "lt",
+        "memory": {"scanner": "running", "classes": "units+loot",
+                   "calibrated": True, "counts": "341M 8P 3pets",
+                   "player": "Lepica", "players": ("Lepica [YOU]", "unknown@D800"),
+                   "pets": ("Bat [YOURS]",),
+                   "monsters": ("Sun Lion x2", "Ember Wraith x1")},
+        "target": "LOOT Gold Ore at 8.4",
+        "loot": {"detected": 55, "wanted": 39,
+                 "ground": ("Gold Ore x39 [WANTED]", "Solar Spear x2 [filtered]")},
+        "navigation": "loot / direct", "warning": "",
+    })
+    for expected in ("SPIRITVALE BOT", "RUNNING", "mode MEMORY",
+                     "Lepica [YOU]", "Bat [YOURS]",
+                     "Sun Lion x2", "Gold Ore x39 [WANTED]", "39 wanted"):
+        assert expected in dashboard, (expected, dashboard)
+
+    class SummaryMem:
+        def read(self, addr, size):
+            return b"\x01" if addr in (0x1000 + 7, 0x2000 + 7, 0x3000 + 7) else bytes(size)
+
+    class SummaryMS:
+        UNIT_VISIBLE = 7
+
+        @staticmethod
+        def my_pets(mem, owner):
+            return {0x3000}
+
+        @staticmethod
+        def player_name(mem, unit):
+            return {0x1000: "Lepica", 0x2000: "Rin"}.get(unit)
+
+        @staticmethod
+        def monster_id(mem, unit):
+            return {0x3000: "Bat", 0x4000: "Wolf",
+                    0x5000: "Slime", 0x6000: "Slime"}.get(unit)
+
+        @staticmethod
+        def real_monster(mem, unit):
+            return unit in (0x5000, 0x6000)
+
+    summary = memory_scan_summary(SummaryMS, SummaryMem(), [
+        ("player", 0x1000, 0.0, 0.0, 0.0),
+        ("player", 0x2000, 2.0, 0.0, 0.0),
+        ("pet", 0x3000, 1.0, 0.0, 0.0),
+        ("pet", 0x4000, 3.0, 0.0, 0.0),
+        ("monster", 0x5000, 3.0, 0.0, 4.0),
+        ("monster", 0x6000, 6.0, 0.0, 8.0),
+        ("monster", 0x7000, 1.0, 0.0, 1.0),
+    ], 0x1000)
+    assert summary["player"] == "Lepica"
+    assert summary["players"] == ("Lepica [YOU]", "Rin")
+    assert summary["pets"] == ("Bat [YOURS]", "Wolf")
+    assert summary["monsters"] == ("Slime x2",), summary
+    assert summary["counts"] == {"monster": 3, "player": 2, "pet": 2}
+
+    class BoundedMS(SummaryMS):
+        player_reads = pet_reads = summoner_reads = monster_checks = 0
+
+        @classmethod
+        def player_name(cls, mem, unit):
+            cls.player_reads += 1
+            return f"Player{unit:X}"
+
+        @classmethod
+        def monster_id(cls, mem, unit):
+            cls.pet_reads += 1
+            return f"Unit{unit:X}"
+
+        @classmethod
+        def summoner_of(cls, mem, unit):
+            cls.summoner_reads += 1
+            return 0x1000 if unit == 0x3000 else 0
+
+        @classmethod
+        def real_monster(cls, mem, unit):
+            cls.monster_checks += 1
+            return False
+
+    many = [("player", 0x1000, 0.0, 0.0, 0.0)]
+    many += [("player", 0x2000 + i, float(i + 1), 0.0, 0.0)
+             for i in range(20)]
+    many += [("pet", 0x3000 + i, float(i + 1), 0.0, 1.0)
+             for i in range(20)]
+    many += [("monster", 0x5000 + i, float(i + 1), 0.0, 2.0)
+             for i in range(20)]
+    memory_scan_summary(BoundedMS, SummaryMem(), many, 0x1000,
+                        max_monsters=1, max_players=2, max_pets=1)
+    assert BoundedMS.player_reads <= 3, BoundedMS.player_reads
+    assert BoundedMS.pet_reads <= 2, BoundedMS.pet_reads
+    assert BoundedMS.summoner_reads <= 1, BoundedMS.summoner_reads
+    assert BoundedMS.monster_checks == 12, BoundedMS.monster_checks
+
+    class PriorityMS(SummaryMS):
+        @staticmethod
+        def real_monster(mem, unit):
+            return True
+
+        @staticmethod
+        def monster_id(mem, unit):
+            return "Current Boss" if unit == 0xDEAD else f"Other {unit:X}"
+
+    priority_units = [("player", 0x1000, 0.0, 0.0, 0.0)]
+    priority_units += [("monster", 0x6000 + i, float(i), 0.0, 0.0)
+                       for i in range(20)]
+    priority_units.append(("monster", 0xDEAD, 999.0, 0.0, 0.0))
+    priority = memory_scan_summary(PriorityMS, SummaryMem(), priority_units,
+                                   0x1000,
+                                   max_monsters=1,
+                                   priority_monster=0xDEAD)
+    assert priority["monster_names"] == {0xDEAD: "Current Boss"}, priority
+    refreshed = MemoryEyes.__new__(MemoryEyes)
+    refreshed.chasing, refreshed.target_name = 0xDEAD, "unknown"
+    refreshed.scan_summary = {}
+    refreshed._accept_scan_summary(priority)
+    assert refreshed.target_name == "Current Boss"
+
+    class DashboardEyes:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.scan_summary = summary
+            self.scan_error = ""
+            self.loot = {1: (1.0, 0.0, 1.0, "Gold Ore"),
+                         2: (2.0, 0.0, 2.0, "Solar Spear")}
+            self.scanner = None
+            self.classes = {"monster": 1, "player": 2, "pet": 3, "loot": 4}
+            self.me, self.basis = 0x1000, ((1.0, 0.0), (0.0, 1.0))
+            self.chasing, self.target_name = 0x5000, "Slime"
+            self.loot_name, self.loot_mode = "Gold Ore", "loot"
+            self.mode, self.routing = "chasing", False
+
+    saved_dashboard_names, LOOT_NAMES = LOOT_NAMES, ("Gold Ore",)
+    try:
+        snapshot = dashboard_snapshot(DashboardEyes(), True, "loot", 1.0, 0.0,
+                                      True, "lt", True, 8.0)
+        fallback = dashboard_snapshot(DashboardEyes(), True, "no monster",
+                                      memory_driving=False, bot_mode="memory")
+    finally:
+        LOOT_NAMES = saved_dashboard_names
+    assert snapshot["loot"]["detected"] == 2
+    assert snapshot["loot"]["wanted"] == 1
+    assert "Gold Ore x1 [WANTED]" in snapshot["loot"]["ground"]
+    assert snapshot["target"] == "LOOT Gold Ore at 8.0"
+    assert fallback["source"] == "pixels", fallback
+    assert fallback["bot_mode"] == "memory", fallback
+    assert "temporary fallback" in fallback["warning"], fallback
+    reconnect_view = dashboard_snapshot(DashboardEyes(), True,
+                                        "reconnect: character screen",
+                                        memory_driving=False,
+                                        status="RECONNECTING")
+    assert reconnect_view["status"] == "RECONNECTING"
+    assert reconnect_view["stick"] == (0.0, 0.0)
+    assert not reconnect_view["attack"]
+    assert reconnect_view["target"] == "none"
+    paused_view = dashboard_snapshot(DashboardEyes(), False,
+                                     "press End to start")
+    assert paused_view["target"] == "none"
+    assert paused_view["navigation"] == "paused"
+
+    # Wandering the area is memory driving with no monster held. The Target
+    # line must say so, not fall through to a phantom pixel target.
+    wander_eyes = DashboardEyes()
+    wander_eyes.chasing = None
+    wander_eyes.mode = "wander"
+    wander_view = dashboard_snapshot(wander_eyes, True, "wander",
+                                     -0.85, -0.53, True, "", False, 10.4)
+    assert wander_view["source"] == "memory", wander_view
+    assert wander_view["target"] == "WANDER at 10.4", wander_view
+    assert "PIXEL" not in wander_view["target"], wander_view
 
     # Nearest-from-scratch oscillates when two monsters exchange which is a pixel
     # closer. A lock must keep the original marker, then stop rather than coast
@@ -3071,6 +3713,9 @@ def demo():
                             now=TARGET_IGNORE_S + 0.01) == [moved_blocked, other]
 
     assert TOGGLE_VK == 0x23 and START_PAUSED
+    assert not attack_active(0.0, buffing=True), "buff sequence must release attack"
+    assert not attack_active(0.0, blocked=True), "do not swing at a cloaked target"
+    assert attack_active(0.0, buffing=False), "attack resumes after the last buff"
 
     # Memory targeting. stick_for inverts a measured basis, so the world's axes
     # and the camera's orientation never have to be known -- which is the point:
@@ -3114,8 +3759,9 @@ def demo():
     # and never falls through to the pixel path.
     class _Fights:
         """Stands in for memscan: says which stub units are worth fighting."""
-        def __init__(self, real, standing=True):
+        def __init__(self, real, standing=True, hidden=()):
             self.real, self.standing = set(real), standing
+            self.hidden = set(hidden)
 
         def worth_fighting(self, _, unit):
             if unit == 0x1000:              # 0x1000 is us; alive unless a corpse
@@ -3125,8 +3771,11 @@ def demo():
         def real_monster(self, mem, unit):
             return self.worth_fighting(mem, unit)
 
+        def monster_target_state(self, mem, unit):
+            return self.real_monster(mem, unit), unit in self.hidden
+
     class _Far(MemoryEyes):
-        def __init__(self, at, extra=(), real=(0x2000,)):
+        def __init__(self, at, extra=(), real=(0x2000,), hidden=()):
             self.me, self.basis = 0x1000, [[1.0, 0.0], [0.0, 1.0]]
             self.units = [("monster", 0x2000, at, 0.0, 0.0)] + list(extra)
             self.chasing = self.engaged_since = self.approach = None
@@ -3135,7 +3784,7 @@ def demo():
             self.orbit_dir, self.orbit_mark = 1, None
             self.at, self.mem = at, None
             self.seen_at, self.sweep_at, self.fight_ok = {}, 0, {}
-            self.ms = _Fights(real)
+            self.ms = _Fights(real, hidden=hidden)
             self.lock = threading.Lock()
 
         def _positions(self, addrs):
@@ -3144,11 +3793,34 @@ def demo():
                         if hasattr(self, "spots") else (0.0, 0.0, 0.0))
                     for a in addrs}
 
+    # Returning from the character screen creates a new heap session. Every
+    # address and the measured basis from the old one must be discarded at once,
+    # leaving pixels in charge until a full background sweep lands again.
+    relogged = _Far(5.0)
+    relogged.owner, relogged.hot = 0x1000, [(0x100000, 0x1000)]
+    relogged.hot_loot = [(0x200000, 0x1000)]
+    relogged.loot = {0x3000: (1.0, 0.0, 1.0, "Gem")}
+    relogged.loot_target, relogged.loot_since = 0x3000, 1.0
+    relogged.returning, relogged.home_goal = True, (9.0, 9.0)
+    relogged.wander, relogged.wander_until = (8.0, 8.0), 99.0
+    relogged.returning_since = relogged.wander_committed = 99.0
+    relogged.generation = 4
+    relogged.reset_session()
+    assert relogged.me is None and relogged.basis is None
+    assert relogged.owner is None and relogged.hot is None and relogged.hot_loot is None
+    assert relogged.units == [] and relogged.loot == {}
+    assert relogged.generation == 5
+    assert not relogged.returning and relogged.home_goal is None
+    assert relogged.wander is None and relogged.wander_until == 0.0
+
     far_off = _Far(MEM_RANGE * 3)              # way outside melee range
     fsx, fsy, fd = far_off.target(1.0)
     assert far_off.mode == "far", far_off.mode
     assert fsx is not None and (fsx or fsy), "must walk to it, not stand still"
     assert abs(fd - MEM_RANGE * 3) < 1.0, fd
+    cloaked = _Far(5.0, real=(), hidden=(0x2000,))
+    assert cloaked.target(1.0) == (0.0, 0.0, 5.0)
+    assert cloaked.mode == "invisible", cloaked.mode
     # An identity-less MonsterController sitting in melee range must not be a
     # target. It is rendered and has health, so it passes every liveness test,
     # but it takes no damage -- and being inside MEM_ARRIVE it pins the bot to
@@ -3240,8 +3912,11 @@ def demo():
     # Genuinely out is still out.
     gone = _Far(MEM_RANGE * 3)
     gone.area, gone.spots = pen, {0x1000: edge_x + AREA_LEAVE * 4}
+    gone.chasing = 0x2000
     gone.target(1.0)
     assert gone.returning and gone.mode == "going back", gone.mode
+    assert gone.ignored.get(0x2000, 0.0) > 1.0, \
+        "the target that led us out must not be resumed after walking back"
 
     # A monster loitering on the line must not be dropped and re-taken every
     # frame: `held` is looked up in the unfiltered list with more rope, or the
@@ -3267,10 +3942,23 @@ def demo():
     # ...and being properly back in does release it.
     homed = _Far(MEM_RANGE * 3)
     homed.area, homed.returning, homed.spots = pen, True, {0x1000: 10.0}
-    homed.home_goal = pen.home(10.0, 0.0)
+    homed.home_goal = pen.centre(pen.at(10.0, 0.0))
     homed.target(1.0)
     assert not homed.returning, "deep inside must release the walk-back"
     assert homed.mode != "going back", homed.mode
+
+    # Entering an arbitrary core cell is not arrival at the committed home
+    # point. Releasing here makes the next target reverse the stick immediately,
+    # which presents as `back in`, outward, `back in`, outward.
+    row = pen.at(0.0, 0.0)[1]
+    core_x = [pen.centre(c)[0] for c in pen.core_list if c[1] == row]
+    early = _Far(MEM_RANGE * 3)
+    early.area, early.returning = pen, True
+    early.spots = {0x1000: min(core_x)}
+    early.home_goal = (max(core_x), pen.centre((0, row))[1])
+    early.target(1.0)
+    assert early.returning and early.mode == "going back", \
+        "return must reach its committed safe point before releasing"
 
     # Another map is not a stray step -- nothing records which map an area
     # belongs to, so --area on the wrong one puts home thousands of units away.
@@ -3345,7 +4033,6 @@ def demo():
     # The tests below own this setting: it is a user config, and a self-check
     # that passes or fails depending on which items someone is farming today is
     # worse than no self-check at all.
-    global LOOT_NAMES
     kept_names, LOOT_NAMES = LOOT_NAMES, ()
 
     # Calibration with our unit already known: it still has to measure what a
@@ -3461,6 +4148,18 @@ def demo():
     assert stuck_loot.loot_mode == "loot skip", stuck_loot.loot_mode
     assert 0xA000 in stuck_loot.loot_ignored
 
+    # The user-facing loot config is one substring per line. Blank lines and
+    # comments are ignored so the shipped file can explain itself.
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as cfg:
+        cfg.write("# wanted item families\n Gem \n\ncard\nEssence\n")
+        cfg_path = cfg.name
+    try:
+        assert load_loot_names(cfg_path) == ("Gem", "card", "Essence")
+    finally:
+        os.remove(cfg_path)
+    assert load_loot_names(cfg_path) is None, (
+        "a missing config must disable filtered loot, not collect everything")
+
     # The allowlist: case-insensitive substrings, so one entry covers a family.
     LOOT_NAMES = ("card", " Flax ")
     try:
@@ -3493,19 +4192,21 @@ def demo():
     # handled in main(), so "no monster" has to reach the pixel path instead:
     # this is the branch that stood still for a whole session once.
     assert not hold_still("no monster")
-    assert hold_still("dead") and hold_still("lost") and hold_still("no unit")
+    assert hold_still("lost") and hold_still("no unit")
 
-    # A dead character must be reported as such, not left swinging: a corpse
-    # that keeps attacking reads as "melee range is wrong" and sends the next
-    # debugging session somewhere it should not go.
-    class _Corpse(_Far):
+    # Player visibility/health is not a reliable stop signal. IsVisible can go
+    # false while the character is still alive, and stopping there ends an
+    # unattended grind. Monster liveness still uses worth_fighting(); only our
+    # own unit must continue from its readable position.
+    class _HiddenPlayer(_Far):
         def __init__(self):
             _Far.__init__(self, 5.0)
-            self.ms = _Fights((), standing=False)   # we are the dead one
+            self.ms = _Fights((0x2000,), standing=False)
 
-    corpse = _Corpse()
-    assert corpse.target(1.0) == (None, None, None)
-    assert corpse.mode == "dead", corpse.mode
+    hidden = _HiddenPlayer()
+    hsx, hsy, _ = hidden.target(1.0)
+    assert hsx is not None and (hsx or hsy), "player visibility must not stop grinding"
+    assert hidden.mode == "chasing", hidden.mode
 
     near = _Far(MEM_RANGE / 2)                 # inside range: ordinary chase
     near.target(1.0)
@@ -3535,7 +4236,8 @@ def demo():
             self.me, self.basis = 0x1000, [[1.0, 0.0], [0.0, 1.0]]
             self.units, self.chasing, self.engaged_since = [], None, None
             self.ignored = {}
-            self.mode, self.misses, self.hot = "chasing", 0, None
+            self.mode, self.misses, self.hot = "chasing", 0, [(1, 2)]
+            self.generation = 7
             self.seen_at, self.sweep_at, self.fight_ok = {}, 0, {}
             self.ms, self.mem = _Fights((0x1000,)), None
             self.lock = threading.Lock()
@@ -3555,6 +4257,24 @@ def demo():
     # behalf of an object that no longer existed -- "no unit moved when pushed"
     # every 15s, forever, with a healthy character standing there.
     assert blind.owner is None, "the stale owner must go with the unit"
+    assert blind.generation == 8, "an in-flight narrowed sweep must be invalidated"
+
+    recovering = MemoryEyes.__new__(MemoryEyes)
+    recovering.lock = threading.Lock()
+    recovering.generation, recovering.hot = 3, [(1, 2)]
+    recovering.units = [("monster", 1, 0.0, 0.0, 0.0)]
+    recovering.fallback_since = None
+    recovering.next_full_rescan = 0.0
+    recovering.recovery = ""
+    recovering.mode = "no monster"
+    recovering.me, recovering.basis = 0x1000, ((1.0, 0.0), (0.0, 1.0))
+    assert not recovering.note_pixel_fallback(100.0, True)
+    assert not recovering.note_pixel_fallback(
+        100.0 + MEM_PIXEL_RESCAN_S - 0.1, True)
+    assert recovering.note_pixel_fallback(
+        100.0 + MEM_PIXEL_RESCAN_S, True)
+    assert recovering.generation == 4
+    assert recovering.hot is None and not recovering.units
 
 
     # Giving up on a target that will not die. Without this the bot parks on the
@@ -3797,12 +4517,18 @@ def demo():
     assert sent == [b"B3\n", b"B3\n"], sent
 
     # --- which target source runs -----------------------------------------
-    # Minimap is the default: it needs nothing from the game's memory, so it
-    # survives a patch and starts instantly.
-    assert targeting_mode([]) == "minimap"
-    assert targeting_mode(["minimap_bot.py"]) == "minimap"
+    # Memory is the default and pixels are its live fallback. --minimap is the
+    # explicit opt-out for a run that must never inspect the unit list.
+    assert targeting_mode([]) == "memory"
+    assert targeting_mode(["minimap_bot.py"]) == "memory"
     assert targeting_mode(["--memory"]) == "memory"
     assert targeting_mode(["--minimap"]) == "minimap"
+    memory_enabled = MEMORY_TARGETING
+    try:
+        MEMORY_TARGETING = False
+        assert targeting_mode([]) == "minimap"
+    finally:
+        MEMORY_TARGETING = memory_enabled
     # An area is world coordinates, which the screen cannot supply, so asking
     # for one asks for the memory path.
     assert targeting_mode([], area="lunaris") == "memory"

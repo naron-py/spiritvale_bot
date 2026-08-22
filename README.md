@@ -25,6 +25,10 @@ All tuning lives in one constant block at the top of `minimap_bot.py`:
 `BUFF_SEQUENCE` / `BUFF_PERIOD_S` for the buff, `ATTACK_MASH` to tap the attack
 button instead of holding it.
 
+Edit `loot_names.txt` to choose which ground items the memory bot collects. Put
+one case-insensitive name substring on each line; for example, `Card` matches
+every card. Leave only comments/blank lines to collect every named item.
+
 ## Setup
 
 ```
@@ -65,18 +69,21 @@ seconds to work out which unit is your character and how a stick push maps to wo
 movement. That calibration is why no camera angle or minimap rotation has to be
 assumed — a rotated camera is measured, not guessed.
 
-The status line tells you what it is doing:
+The terminal is an in-place dashboard. `mode MEMORY` says memory is the configured
+primary; `source MEMORY` or `source PIXELS` says which path actually won this frame.
+It also shows stick and attack state, scanner/class/calibration health, cached unit
+counts, your loaded character name, visible players, structurally identified pets,
+nearby real monster names, the current monster or loot target, route state, and the
+busiest detected ground-item types marked `WANTED` or `filtered`. In particular,
+`0 wanted` plus a warning means memory sees the drops but no line in
+`loot_names.txt` matches them.
 
-| Shows | Meaning |
-|---|---|
-| `dist  12.3` | walking to a monster 12.3 world units away |
-| `far   84.0` | nothing close; walking to the nearest one anywhere |
-| `on it   1.8` | in range, standing and swinging |
-| `gave up` | this one will not die — ignored for `MEM_IGNORE_S`, moving on |
-| `no monster` | nothing real left in range |
-| `DEAD` | your character is dead. It stops rather than swinging from a corpse |
-| `no unit` / `lost` | between calibrations, or the unit was rebuilt (map change, death, relog) |
-| `memory` / `pixels` | which path is driving right now |
+The monster state still distinguishes `far`, `on it`, `gave up`, `no monster`,
+`no unit`, and `lost`. During reconnect or a rebuilt unit, the dashboard reports
+pixels until a fresh heap sweep and calibration make memory safe again.
+If calibrated memory says `no monster` while pixels continuously see a target, the
+bot treats that disagreement as a stale narrowed scan and starts a full memory
+rescan after eight seconds. Full rescans are rate-limited to once a minute.
 
 `MEMORY_TARGETING = False` turns it off and leaves the minimap path.
 
@@ -114,8 +121,8 @@ mis-centred box biases every heading the bot takes.
 ## Choosing how it finds monsters
 
 ```
-python minimap_bot.py             # minimap: red dots on screen (default)
-python minimap_bot.py --memory    # memory: the game's own unit list
+python minimap_bot.py             # memory primary, pixels while recovering (default)
+python minimap_bot.py --memory    # explicitly request the same memory-primary mode
 python minimap_bot.py --minimap   # force the screen path
 ```
 
@@ -123,7 +130,7 @@ python minimap_bot.py --minimap   # force the screen path
 working after a game update. It cannot tell a monster from your own pet, so it
 will sometimes chase the pet.
 
-**Memory** reads the game's unit list, so it knows what each thing *is* --
+**Memory** is the default. It reads the game's unit list, so it knows what each thing *is* --
 monster, player or pet -- and never chases a pet. It costs about 15 seconds of
 scanning at startup, and a game update can break it until the classes are found
 again.

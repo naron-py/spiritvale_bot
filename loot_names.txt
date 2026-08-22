@@ -1,0 +1,16 @@
+# Loot item-name filters, one per line.
+# Matching is case-insensitive and checks whether the item name contains the text.
+# Example: Card matches Bee Card, Rooster Card, and future cards.
+# Remove an item line to stop collecting it.
+# Leave only comments/blank lines to collect every named item.
+# Run `python memscan.py --loot` to see item names currently on the ground.
+
+Grape
+idol
+termite
+Acorn
+Card
+Essence
+Gem
+Royal
+Idol

@@ -11,3 +11,6 @@ il2cpp_rva.json
 reconnect_*.png
 walkmap.json
 areas.json
+
+# local agent state
+.hermes/
