@@ -125,6 +125,18 @@ CHAR_BG = ((0.03, 0.50), (0.50, 0.06), (0.70, 0.85), (0.06, 0.60))
 MEMORY_TARGETING = True
 MEM_REFRESH_S = 2.0      # rediscovering units scans GBs; positions are re-read
 MEM_RANGE = 70.0         # world units; roughly what the minimap used to cover
+# The region caches (hot, hot_loot) narrow each sweep to the heap regions that
+# held units/drops when they were built, and are only rebuilt on a relog. New
+# monsters and drops spawn in fresh regions, so a bot that walks away keeps
+# sweeping the old regions and sees only the pooled corpses left behind there.
+# Past this radius from where a cache was built, the cache is dropped and the
+# next sweep is a full pass that rebuilds it where the character is now.
+HOT_RENARROW_RADIUS = 80.0
+# Backstop for the movement re-narrow: a narrowed cache can go stale for
+# reasons walking doesn't catch (everything in the old regions despawns). One
+# un-narrowed pass every this long is a cheap safety net -- it runs in the
+# background and the bot works from the cached list while it runs.
+HOT_SELF_HEAL_S = 300.0
 MEM_CAL_PUSH_S = 0.7     # per calibration push, two of them
 MEM_CAL_MIN = 0.5        # world units a push must move us to count
 MEM_CAL_LEGS = 3         # pushes to fit the basis from; more resists shoving
@@ -1887,6 +1899,7 @@ class MemoryEyes:
         self.sweep_at = 0         # cursor into the far units, a slice per frame
         self.fight_ok = {}        # unit -> (expiry, attackable, invisible)
         self.hot = None           # regions worth sweeping
+        self.hot_at = None        # (x, z) where the character was when hot was built
         self.owner = None         # our unit, from the local connection
         self.loot = {}            # drop -> (x, y, z, name)
         self.loot_name = ""       # what we are walking to, for the status line
@@ -1895,6 +1908,9 @@ class MemoryEyes:
         self.loot_ignored = {}    # drop -> time it becomes fair game again
         self.loot_mode = "no loot"
         self.hot_loot = None      # regions worth sweeping for loot
+        self.hot_loot_at = None   # (x, z) where the character was when hot_loot was built
+        self.hot_full_at = 0.0    # when the last full (un-narrowed) unit pass ran
+        self.hot_loot_full_at = 0.0
         self.scan_summary = {"counts": {}, "player": "unknown",
                              "players": (), "pets": (), "monsters": (),
                              "monster_names": {}}
@@ -1977,6 +1993,7 @@ class MemoryEyes:
             self.units = []
             self.loot = {}
             self.me = self.basis = self.owner = self.hot = self.hot_loot = None
+            self.hot_at = self.hot_loot_at = None
             self.chasing = self.engaged_since = self.approach = None
             self.target_name = ""
             self.loot_target = self.loot_since = None
@@ -2195,13 +2212,28 @@ class MemoryEyes:
         item at all: measured on a live field, 157 of 192 slots had no name and
         the 35 that did matched what was lying there.
         """
+        # Capture the region set once and use it for both the sweep and the
+        # narrowing decision: a movement reset that clears hot_loot mid-sweep
+        # must not turn this narrowed pass into a re-narrow to the old regions.
+        regions = self.hot_loot
+        # Same backstop as the unit sweep: a full pass every HOT_SELF_HEAL_S so
+        # a stale loot cache self-heals even when the character never walks
+        # far enough to trip the movement re-narrow.
+        if regions is not None and time.time() - self.hot_loot_full_at >= HOT_SELF_HEAL_S:
+            regions = None
         found = self.ms.world_loot(mem, self.classes.get("loot"),
-                                   regions=self.hot_loot)
+                                   regions=regions)
+        if regions is None:
+            with self.lock:
+                self.hot_loot_full_at = time.time()
         with self.lock:
             if generation is not None and generation != self.generation:
                 return
             self.loot = {d: (x, y, z, n) for d, x, y, z, n in found}
-            narrow = self.hot_loot is None and bool(found)
+            # Narrow only after a full pass (regions was None when the sweep
+            # ran), so an in-flight narrowed sweep cannot re-narrow to the old
+            # regions after a movement reset cleared them.
+            narrow = regions is None and bool(found)
         if narrow:
             spans = mem.regions()
             live = {d for d, *_rest in found}
@@ -2210,6 +2242,7 @@ class MemoryEyes:
             with self.lock:
                 if generation is None or generation == self.generation:
                     self.hot_loot = hot
+                    self.hot_loot_at = self.last_pos
 
     def loot_here(self):
         """Is a wanted item lying under us right now? Sets loot_name if so.
@@ -2349,7 +2382,19 @@ class MemoryEyes:
                         continue
                     with self.lock:
                         generation, hot = self.generation, self.hot
+                        # Backstop for the movement re-narrow: a narrowed cache
+                        # can go stale for reasons walking does not catch -- the
+                        # bot confined to a pen smaller than the re-narrow radius
+                        # never walks far enough to drop it, or everything in the
+                        # old regions despawns. One un-narrowed pass every
+                        # HOT_SELF_HEAL_S is a cheap safety net; the bot works
+                        # from the cached list while the full pass runs.
+                        if hot is not None and time.time() - self.hot_full_at >= HOT_SELF_HEAL_S:
+                            hot = None
                     found = self.ms.world_units(mem, regions=hot)
+                    if hot is None:
+                        with self.lock:
+                            self.hot_full_at = time.time()
                     with self.lock:
                         if generation != self.generation:
                             continue
@@ -2396,9 +2441,13 @@ class MemoryEyes:
                         if time.time() - saved >= WALK_SAVE_S:
                             self.walk.save()
                             saved = time.time()
-                    if self.hot is None and found:
-                        # Narrow the next sweep to where the units turned out to
-                        # be, rather than paying for the whole heap every time.
+                    if hot is None and found:
+                        # A full pass just ran (hot was None), so narrow the next
+                        # sweep to where the units turned out to be, rather than
+                        # paying for the whole heap every time. Keying off the
+                        # *captured* hot -- not re-reading self.hot -- is what
+                        # keeps an in-flight narrowed sweep from re-narrowing to
+                        # the old regions after a movement reset cleared them.
                         spans = mem.regions()
                         live = {u for _, u, *_ in found}
                         hot = [(b, s) for b, s in spans
@@ -2406,6 +2455,7 @@ class MemoryEyes:
                         with self.lock:
                             if generation == self.generation:
                                 self.hot = hot
+                                self.hot_at = self.last_pos
                     self.stop.wait(MEM_REFRESH_S)
             finally:
                 mem.close()
@@ -2448,6 +2498,7 @@ class MemoryEyes:
         with self.lock:
             self.generation += 1
             self.hot = None
+            self.hot_at = None
             self.units = []
             self.scan_summary = {"counts": {}, "player": "unknown",
                                  "players": (), "pets": (), "monsters": (),
@@ -2646,6 +2697,35 @@ class MemoryEyes:
         with self.lock:
             return [u for k, u, *_ in self.units if k == "player"]
 
+    def _renarrow_if_stale(self, px, pz):
+        """Drop a region cache once the character has walked past the radius
+        from where it was built.
+
+        The caches narrow each sweep to the heap regions that held units/drops
+        at build time, and were only rebuilt on a relog. New monsters and drops
+        spawn in fresh regions, so a bot that walks away kept sweeping the old
+        regions and saw only the pooled corpses left behind there -- the "5
+        monster objects, 0 loot" state. Dropping the cache makes the next
+        sweep a full pass that rebuilds it where the character is now. The
+        anchors are read with getattr so a stub that never set them simply
+        never re-narrows (the safe default).
+        """
+        r2 = HOT_RENARROW_RADIUS ** 2
+
+        def far(anchor):
+            if anchor is None:
+                return False
+            ax, az = anchor
+            return (px - ax) ** 2 + (pz - az) ** 2 > r2
+
+        with self.lock:
+            if getattr(self, "hot", None) is not None and far(getattr(self, "hot_at", None)):
+                self.hot = None
+                self.hot_at = None
+            if getattr(self, "hot_loot", None) is not None and far(getattr(self, "hot_loot_at", None)):
+                self.hot_loot = None
+                self.hot_loot_at = None
+
     def target(self, now):
         """(sx, sy, distance) toward the nearest monster, or (None, None, None).
 
@@ -2691,11 +2771,13 @@ class MemoryEyes:
             with self.lock:
                 self.generation += 1
                 self.owner = self.hot = None
+                self.hot_at = None
                 self.units = []
             # Same reason as `hot`: the drops that survive a relog need not be
             # in the regions the old ones were, and a narrowed sweep that finds
             # nothing keeps finding nothing.
             self.hot_loot = None
+            self.hot_loot_at = None
             with self.lock:
                 self.loot = {}
             self.loot_target = self.loot_since = None
@@ -2713,6 +2795,10 @@ class MemoryEyes:
         self.misses = 0
         px, _, pz = here
         self.last_pos = (px, pz)
+        # The character has walked on; the region caches were built somewhere
+        # else. Drop them past the radius so the next sweep is a full pass that
+        # re-narrows here, instead of sweeping the old regions forever.
+        self._renarrow_if_stale(px, pz)
         if self.escape and now < self.escape_until:
             # Backing out of a wedge. This overrides the target entirely: while
             # the character cannot move, nothing else it decides matters.
@@ -3812,6 +3898,29 @@ def demo():
     assert relogged.generation == 5
     assert not relogged.returning and relogged.home_goal is None
     assert relogged.wander is None and relogged.wander_until == 0.0
+
+    # The region caches narrow each sweep to the heap regions that held
+    # units/drops at build time. Built once and rebuilt only on a relog, a bot
+    # that walks away keeps sweeping the old regions and sees only the pooled
+    # corpses left behind there -- the "5 monster objects, 0 loot" state. Past
+    # HOT_RENARROW_RADIUS from where a cache was built, target() drops it so the
+    # next sweep is a full pass that re-narrows where the character is now.
+    class _Renarrow(MemoryEyes):
+        def __init__(self):
+            self.hot = [(0x100000, 0x1000)]
+            self.hot_at = (0.0, 0.0)
+            self.hot_loot = [(0x200000, 0x1000)]
+            self.hot_loot_at = (0.0, 0.0)
+            self.lock = threading.Lock()
+
+    rn_far = _Renarrow()
+    rn_far._renarrow_if_stale(HOT_RENARROW_RADIUS + 10.0, 0.0)
+    assert rn_far.hot is None and rn_far.hot_at is None
+    assert rn_far.hot_loot is None and rn_far.hot_loot_at is None
+    rn_near = _Renarrow()
+    rn_near._renarrow_if_stale(50.0, 0.0)   # inside the radius
+    assert rn_near.hot == [(0x100000, 0x1000)]
+    assert rn_near.hot_loot == [(0x200000, 0x1000)]
 
     far_off = _Far(MEM_RANGE * 3)              # way outside melee range
     fsx, fsy, fd = far_off.target(1.0)
