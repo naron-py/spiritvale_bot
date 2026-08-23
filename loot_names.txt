@@ -12,5 +12,5 @@ Acorn
 Card
 Essence
 Gem
-Royal
+Jelly
 Idol

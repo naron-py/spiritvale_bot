@@ -137,6 +137,11 @@ HOT_RENARROW_RADIUS = 80.0
 # un-narrowed pass every this long is a cheap safety net -- it runs in the
 # background and the bot works from the cached list while it runs.
 HOT_SELF_HEAL_S = 300.0
+# A narrowed sweep that comes back empty this many times in a row is sweeping
+# stale regions, not an empty world (the player name and loot still read), so
+# the cache is dropped and the next sweep is a full pass. Recovers a stale
+# cache in seconds instead of waiting out HOT_SELF_HEAL_S.
+HOT_EMPTY_STREAKS = 3
 MEM_CAL_PUSH_S = 0.7     # per calibration push, two of them
 MEM_CAL_MIN = 0.5        # world units a push must move us to count
 MEM_CAL_LEGS = 3         # pushes to fit the basis from; more resists shoving
@@ -1911,6 +1916,7 @@ class MemoryEyes:
         self.hot_loot_at = None   # (x, z) where the character was when hot_loot was built
         self.hot_full_at = 0.0    # when the last full (un-narrowed) unit pass ran
         self.hot_loot_full_at = 0.0
+        self.hot_empty_streak = 0  # consecutive empty narrowed sweeps
         self.scan_summary = {"counts": {}, "player": "unknown",
                              "players": (), "pets": (), "monsters": (),
                              "monster_names": {}}
@@ -2395,6 +2401,9 @@ class MemoryEyes:
                     if hot is None:
                         with self.lock:
                             self.hot_full_at = time.time()
+                        self.hot_empty_streak = 0
+                    else:
+                        self._drop_stale_hot(found)
                     with self.lock:
                         if generation != self.generation:
                             continue
@@ -2696,6 +2705,29 @@ class MemoryEyes:
     def known_players(self):
         with self.lock:
             return [u for k, u, *_ in self.units if k == "player"]
+
+    def _drop_stale_hot(self, found):
+        """Drop the unit region cache once narrowed sweeps stop finding units.
+
+        A narrowed sweep that keeps coming back empty is sweeping stale
+        regions, not an empty world: the player name still reads (owner is a
+        persistent pointer) and loot still lands (its own cache), so the units
+        are in memory, just not in these regions. The movement re-narrow never
+        fires in a small farming pen, so without this the dashboard reads
+        '0 monsters, 0 players, 0 pets' until HOT_SELF_HEAL_S runs. A few
+        empty passes is enough to know; the next sweep is then a full pass
+        that rebuilds the cache where the units actually are.
+        """
+        if not found:
+            self.hot_empty_streak += 1
+            if self.hot_empty_streak >= HOT_EMPTY_STREAKS:
+                with self.lock:
+                    self.hot = self.hot_at = None
+                self.hot_empty_streak = 0
+                return True
+        else:
+            self.hot_empty_streak = 0
+        return False
 
     def _renarrow_if_stale(self, px, pz):
         """Drop a region cache once the character has walked past the radius
@@ -3921,6 +3953,28 @@ def demo():
     rn_near._renarrow_if_stale(50.0, 0.0)   # inside the radius
     assert rn_near.hot == [(0x100000, 0x1000)]
     assert rn_near.hot_loot == [(0x200000, 0x1000)]
+
+    # A narrowed sweep that keeps coming back empty is sweeping stale regions,
+    # not an empty world (the player name and loot still read). A few empty
+    # passes drop the cache so the next sweep is a full pass that rebuilds it
+    # where the units actually are, instead of waiting out HOT_SELF_HEAL_S.
+    class _StaleHot(MemoryEyes):
+        def __init__(self):
+            self.hot = [(0x100000, 0x1000)]
+            self.hot_at = (0.0, 0.0)
+            self.hot_empty_streak = 0
+            self.lock = threading.Lock()
+
+    sh = _StaleHot()
+    assert not sh._drop_stale_hot([])
+    assert not sh._drop_stale_hot([])
+    assert sh._drop_stale_hot([])
+    assert sh.hot is None and sh.hot_at is None
+    sh2 = _StaleHot()
+    sh2.hot_empty_streak = HOT_EMPTY_STREAKS - 1
+    assert not sh2._drop_stale_hot([("monster", 0x2000, 1.0, 0.0, 1.0)])
+    assert sh2.hot == [(0x100000, 0x1000)]
+    assert sh2.hot_empty_streak == 0
 
     far_off = _Far(MEM_RANGE * 3)              # way outside melee range
     fsx, fsy, fd = far_off.target(1.0)
