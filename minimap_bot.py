@@ -22,6 +22,8 @@ import time
 import cv2
 import numpy as np
 
+from farming_zone import CircleZone, PolygonZone
+
 WINDOW_TITLE = "SpiritVale"
 # Square capture box centred on the player arrow. cx/cy are fractions of the
 # client area, r is a fraction of client width (the chase radius).
@@ -340,6 +342,19 @@ WALK_BLOCK_ARC = 0.6     # radians either side of it also marked, two deep
 WALK_ESCAPE_S = 0.6      # how long the sidestep runs
 WALK_ESCAPE_TURN = 2.4   # radians off the blocked heading (~135 degrees, back)
 WALK_ESCAPE_GIVEUP = 3   # escapes on one target before it is not worth chasing
+# The escape counter is per-location, not per-target. A wall does not care which
+# monster you are chasing, and a pack behind one wall cycles through its
+# members: a per-target counter resets on every switch, so the bot unwedged and
+# chased the same wall forever. The counter is anchored to where it first wedged
+# and clears only once the character is this far from that point, so it counts
+# unwedges at the same spot rather than across the whole session.
+WALK_WEDGE_RESET = 10.0  # world units from the wedge point before the counter clears
+# When the escape counter trips, ignore every monster within this of the one we
+# gave up on, not just that one. A pack behind the same wall is a handful of
+# units apart, and ignoring only the chased member would have the next one
+# walked into the same wall a frame later. Wide enough to cover a local cluster,
+# narrow enough not to blank the whole MEM_RANGE.
+WALK_WEDGE_CLUSTER = 30.0
 # Another player or a monster standing in the way reads exactly like a wall.
 # Two sightings, a decay, and clearing any cell we later stand in are what stop
 # those from rotting into the map permanently.
@@ -352,7 +367,7 @@ WALK_WAYPOINT = 3.0      # aim this far along the route
 # three times the price, not forbidden, or the bot would never explore.
 WALK_FLOOR_COST = 1
 WALK_UNKNOWN_COST = 3
-WALK_MAX_CELLS = 4000    # search expansion ceiling; past it, walk straight
+WALK_MAX_CELLS = 8000    # search expansion ceiling; past it, walk straight
 WALK_PAD = 12            # cells of detour room either side of the straight line
 WALK_FILE = "walkmap.json"
 WALK_SAVE_S = 30.0       # the map is written from the scanner thread
@@ -365,11 +380,9 @@ WALK_LOG = "--walklog" in sys.argv   # print what the wall sensor sees
 # or flipping between two, and those need opposite fixes.
 TARGET_LOG = "--targetlog" in sys.argv
 
-# A named patch of ground to farm, recorded by walking it. The shape is the
-# cells walked through, fattened by AREA_BRUSH -- a mask, not a shape. There is
-# no centre and no radius, which is the point: a farming spot is a strip of road
-# or a clearing with a tail, and the circle the deleted leash used either cut
-# half of it off or swallowed the next camp.
+# A named patch of ground to farm. Walked areas remain a cell mask for irregular
+# roads and clearings; `--circle` records an exact centre/radius for round camps.
+# The two shapes share the same targeting, return, wander and routing policy.
 # Deliberately 2x WALK_CELL, and that is the hysteresis quantum: one cell of
 # commit is ~4 frames of travel at the measured ~0.7 units/frame. At WALK_CELL
 # it would be two frames, which is single-frame-flap territory -- the exact
@@ -381,24 +394,9 @@ AREA_CELL = 3.0          # world units per cell
 AREA_BRUSH = 6.0         # painted either side of the walked line, ~12 wide
 AREA_STEP = 1.5          # recorder repaints only after moving this far
 AREA_SAMPLE_S = 0.2      # nobody walks AREA_STEP in less
-# A monster one step over the line is still killable from inside, and refusing
-# it makes the whole boundary band unfarmable. This is a test on the *target*,
-# and is deliberately not hysteretic -- entangling the two is how the leash
-# ended up oscillating.
-AREA_SLACK = 4.0         # units a *new* target may sit outside the paint
-# These three are one chain and must stay ordered, or the bot fights itself.
-# Measured: with only AREA_SLACK, the bot chased a legal target four units out,
-# stepped over the line to reach it, instantly called that "outside the area"
-# and walked home -- then chased the same legal target again. The status line
-# alternated `dist` and `back in` forever, which from outside is a character
-# walking left, right, left, right.
-# So: a target already being fought gets more rope than a new one (the same
-# hysteresis idea as TARGET_SWITCH, and it stops a monster loitering on the
-# line from being dropped and re-taken every frame), and we only count as
-# having *left* at AREA_HOLD plus melee reach -- so reaching anything we are
-# allowed to hit can never itself trigger the walk back.
-AREA_HOLD = 6.0          # units the target we are already on may sit outside
-AREA_LEAVE = AREA_HOLD + MEM_ARRIVE   # how far out *we* go before walking back
+AREA_SAFETY = 3.0        # controller aims this far inside an exact boundary
+AREA_LOOKAHEAD = 3.0     # world units used to validate the next stick step
+AREA_BOUNDARY_LOG_S = 2.0
 AREA_WANDER_HOLD_S = 6.0 # give up on one wander point after this
 AREA_WANDER_REACHED = 4.0
 # A point picked closer than AREA_WANDER_REACHED counts as arrived the moment
@@ -452,10 +450,28 @@ def hold_still(mode):
     """True when memory targeting means "stop", not merely "nothing here".
 
     main() reads a zero stick as handled and never falls through to the pixel
-    path, so this is the difference between a bot that waits out a death and a
-    bot that stands in a field forever because the unit list came back empty.
+    path. Both an empty monster list and a missing unit while the background
+    scanner is still landing must temporarily hand control to pixels. An active
+    farming area is guarded separately by area_holds(), because pixels cannot
+    enforce a world-coordinate fence.
     """
-    return mode != "no monster"
+    return mode not in ("no monster", "no unit")
+
+
+def area_holds(eyes, requested=None):
+    """True when a fence has a real stop state, not a scanner-wait state.
+
+    The user explicitly wants pixels to move and attack during every initial,
+    relog, and recovery scan. Before calibration lands those vectors cannot be
+    checked against a world-coordinate area; once basis/position exist the final
+    guard_area_step() still fences them. Construction failure and honest stop
+    modes continue to hold neutral rather than silently roam.
+    """
+    if eyes is None:
+        return requested is not None
+    if eyes.mode in ("no monster", "no unit"):
+        return False
+    return eyes.area is not None
 
 
 def attack_active(now, buffing=False, blocked=False):
@@ -465,49 +481,85 @@ def attack_active(now, buffing=False, blocked=False):
     return (now % ATTACK_PERIOD_S) < ATTACK_HOLD_S if ATTACK_MASH else True
 
 
-def dashboard_text(info):
-    """Fixed, compact terminal view built only from an already-cached snapshot."""
+def dashboard_text(info, color=True):
+    """Readable terminal dashboard with grouped state and dependency-free ANSI."""
     memory = info.get("memory") or {}
     loot = info.get("loot") or {}
+    reset = "\x1b[0m"
+    inner_width = 86
+    label_width = 16
+    value_width = inner_width - label_width - 3
 
-    def row(label, value):
-        return f"{label:<10} {value or '-'}"
+    def paint(text, code):
+        return f"\x1b[{code}m{text}{reset}" if color else str(text)
 
-    def rows(label, values):
-        values = tuple(values or ()) or ("-",)
-        return [row(label if i == 0 else "", value)
+    def row(label, value, tone="97"):
+        value = str(value or "-")
+        if len(value) > value_width:
+            value = value[:value_width - 1] + "…"
+        return (f"│ {paint(f'{label:<{label_width}}', '2;37')} "
+                f"{paint(f'{value:<{value_width}}', tone)} │")
+
+    def rows(label, values, tone="97"):
+        values = tuple(value for value in (values or ())
+                       if "[filtered]" not in str(value).lower()) or ("-",)
+        return [row(label if i == 0 else "", value, tone)
                 for i, value in enumerate(values)]
 
-    running = info.get("status") or (
+    def section(title):
+        fill = "─" * max(1, inner_width - len(title) - 3)
+        return paint(f"├─ {title} {fill}┤", "1;36")
+
+    status = info.get("status") or (
         "RUNNING" if info.get("running") else "STOPPED")
+    status_tone = "1;32" if status == "RUNNING" else (
+        "1;31" if status == "STOPPED" else "1;33")
+    primary = info.get("bot_mode", "minimap").upper()
+    source = info.get("source", "pixels").upper()
+    source_tone = "1;36" if source == "MEMORY" else "1;35"
     sx, sy = info.get("stick", (0.0, 0.0))
-    controls = (f"stick {sx:+.2f},{sy:+.2f}  attack "
-                f"{'ON' if info.get('attack') else 'OFF'}"
-                + (f"  button {info['action']}" if info.get("action") else ""))
-    scanner = (f"{memory.get('scanner', 'off')} | classes "
-               f"{memory.get('classes', '-')} | calibrated "
-               f"{'YES' if memory.get('calibrated') else 'NO'}")
-    lines = [
-        f"SPIRITVALE BOT  [{running}]  mode "
-        f"{info.get('bot_mode', 'minimap').upper()} | "
-        f"source {info.get('source', 'pixels').upper()}",
-        "=" * 78,
-        row("Bot", f"{info.get('state', '-')} | {controls}"),
-        row("Memory", scanner),
-        row("Detected", memory.get("counts", "-")),
-        row("Player", memory.get("player", "unknown")),
-    ]
-    lines += rows("Players", memory.get("players"))
-    lines += rows("Pets", memory.get("pets"))
-    lines += rows("Monsters", memory.get("monsters"))
-    lines += [row("Target", info.get("target", "none")),
-              row("Loot", f"{loot.get('detected', 0)} detected / "
-                          f"{loot.get('wanted', 0)} wanted")]
-    lines += rows("Ground", loot.get("ground"))
-    lines.append(row("Navigation", info.get("navigation", "-")))
+    attack = "ON" if info.get("attack") else "OFF"
+    controls = (f"stick {sx:+.2f}, {sy:+.2f}  |  attack {attack}"
+                + (f"  |  button {info['action']}" if info.get("action") else ""))
+    calibration = "READY" if memory.get("calibrated") else "WAITING"
+
+    title = paint(" SPIRITVALE COMBAT BOT ", "1;97;44")
+    title_pad = inner_width - len(" SPIRITVALE COMBAT BOT ")
+    lines = [f"╔{'═' * (title_pad // 2)}{title}"
+             f"{'═' * (title_pad - title_pad // 2)}╗", section("OVERVIEW"),
+             row("Status", status, status_tone),
+             row("Primary mode", primary, "1;36"),
+             row("Active source", source, source_tone),
+             row("Current task", info.get("state", "-"), "1;33"),
+             section("COMBAT & CONTROL"),
+             row("Target", info.get("target", "none"), "1;35"),
+             row("Controller", controls, "1;32" if info.get("attack") else "97"),
+             section("MEMORY SCANNER"),
+             row("Scanner", memory.get("scanner", "off"), "1;32"),
+             row("Calibration", calibration,
+                 "1;32" if calibration == "READY" else "1;33"),
+             row("Classes", memory.get("classes", "-"), "36"),
+             row("Detected", memory.get("counts", "-")),
+             section("WORLD ENTITIES"),
+             row("Your player", memory.get("player", "unknown"), "1;32")]
+    lines += rows("Players", memory.get("players"), "36")
+    lines += rows("Pets", memory.get("pets"), "35")
+    lines += rows("Monsters", memory.get("monsters"), "31")
+    lines += [section("LOOT"),
+              row("Summary", f"{loot.get('detected', 0)} on ground  |  "
+                             f"{loot.get('wanted', 0)} wanted", "1;33")]
+    lines += rows("Wanted items", loot.get("ground"), "33")
+    lines += [section("NAVIGATION"),
+              row("Movement", info.get("navigation", "-"), "36")]
     if info.get("warning"):
-        lines.append(row("WARNING", info["warning"]))
-    return "\n".join(lines)
+        lines += [section("ATTENTION"),
+                  row("WARNING", info["warning"], "1;33")]
+    command = "Press END to stop" if info.get("running") else "Press END to start"
+    lines += [paint("├" + "─" * inner_width + "┤", "2;37"),
+              row("Controls", command + "  |  Ctrl+C to exit", "1;97"),
+              paint("╚" + "═" * inner_width + "╝", "1;36")]
+    text = "\n".join(lines)
+    return text + reset if color else text
 
 
 def dashboard_snapshot(eyes, running, state, sx=0.0, sy=0.0, attack=False,
@@ -526,8 +578,11 @@ def dashboard_snapshot(eyes, running, state, sx=0.0, sy=0.0, attack=False,
             drops = list(eyes.loot.values())
             report_error = eyes.scan_error
             recovery = getattr(eyes, "recovery", "")
-        scanner = ("running" if eyes.scanner and eyes.scanner.is_alive()
-                   else "not started")
+        if eyes.scanner and eyes.scanner.is_alive():
+            scanner = ("READY - REFRESHING" if getattr(eyes, "scan_passes", 0)
+                       else "SCANNING FIRST PASS")
+        else:
+            scanner = "NOT STARTED"
         resolved = "+".join(k for k in ("monster", "player", "pet", "loot")
                             if eyes.classes.get(k)) or "none"
         counts = report.get("counts", {})
@@ -545,11 +600,10 @@ def dashboard_snapshot(eyes, running, state, sx=0.0, sy=0.0, attack=False,
         for *_, name in drops:
             name_counts[name] = name_counts.get(name, 0) + 1
         wanted = sum(n for name, n in name_counts.items() if wanted_item(name))
-        ordered = sorted(name_counts.items(),
-                         key=lambda item: (not wanted_item(item[0]),
-                                           -item[1], item[0].lower()))
-        ground = [f"{name} x{n} [{'WANTED' if wanted_item(name) else 'filtered'}]"
-                  for name, n in ordered[:6]]
+        ordered = sorted(((name, n) for name, n in name_counts.items()
+                          if wanted_item(name)),
+                         key=lambda item: (-item[1], item[0].lower()))
+        ground = [f"{name} x{n} [WANTED]" for name, n in ordered[:6]]
         if len(ordered) > 6:
             ground.append(f"+{len(ordered) - 6} more types")
         loot = {"detected": len(drops), "wanted": wanted,
@@ -565,7 +619,13 @@ def dashboard_snapshot(eyes, running, state, sx=0.0, sy=0.0, attack=False,
         memory_driving = bool(eyes is not None and eyes.me)
     if on_loot and eyes is not None:
         target = f"LOOT {eyes.loot_name or 'unknown'}"
-    elif eyes is not None and eyes.chasing:
+    elif (eyes is not None and eyes.chasing
+          and eyes.mode in ("chasing", "far", "on it")):
+        # Only while actually heading to that monster. During "going back"
+        # and "unwedge" the chase logic has not run this frame, so `chasing`
+        # still holds the stale monster that led us out, and `distance` is the
+        # home/escape distance -- printing the monster name there reads as the
+        # bot heading to a target outside the area when it is walking home.
         target = f"MONSTER {eyes.target_name or 'unknown'}"
     elif memory_driving and eyes is not None:
         # Memory is driving but not on a specific monster: wandering the
@@ -591,7 +651,10 @@ def dashboard_snapshot(eyes, running, state, sx=0.0, sy=0.0, attack=False,
         navigation = "waiting for gameplay"
     bot_mode = bot_mode or ("memory" if eyes is not None else "minimap")
     if running and bot_mode == "memory" and not memory_driving:
-        warning = recovery or warning or "memory primary; pixels are temporary fallback"
+        if eyes is not None and getattr(eyes, "scan_passes", 0):
+            warning = recovery or warning or "memory scan ready; pixels active because memory has no target"
+        else:
+            warning = recovery or warning or "memory first pass pending; pixels are temporary fallback"
     return {"running": running,
             "status": status,
             "bot_mode": bot_mode,
@@ -628,12 +691,12 @@ class TerminalDashboard:
         print("\x1b[2J\x1b[H" + dashboard_text(info), end="", flush=True)
 
 
-def toggle_running(paused, pad, pet_filter, wake=wake_controller):
+def toggle_running(paused, pad, pet_filter, wake=wake_controller, area=None):
     """Toggle run state, always clearing held controls and stale target state."""
     paused = not paused
     pad.stick(0.0, 0.0, False)
     pet_filter.reset()
-    if not paused:
+    if not paused and area is None:
         wake(pad)
     return paused
 
@@ -1126,7 +1189,7 @@ class WalkMap:
         return False
 
     # -- routing ------------------------------------------------------------
-    def route(self, px, pz, tx, tz, now):
+    def route(self, px, pz, tx, tz, now, allowed=None, edge_allowed=None):
         """World points from here to there avoiding known walls, or None.
 
         Dijkstra on an 8-connected grid, a cell something has walked in costing
@@ -1177,6 +1240,17 @@ class WalkMap:
                         continue
                     if self.blocked(n, now):
                         continue
+                    if (dx and dz
+                            and (self.blocked((c[0] + dx, c[1]), now)
+                                 or self.blocked((c[0], c[1] + dz), now))):
+                        continue
+                    nx, nz = self.centre(n)
+                    if allowed is not None and not allowed(nx, nz):
+                        continue
+                    if edge_allowed is not None:
+                        cx, cz = self.centre(c)
+                        if not edge_allowed(cx, cz, nx, nz):
+                            continue
                     step = here + (WALK_FLOOR_COST if n in self.floor
                                    else WALK_UNKNOWN_COST)
                     if step >= cost.get(n, 1 << 30):
@@ -1210,7 +1284,12 @@ class WalkMap:
         unit issues no stick at all -- and marking walls from those states fills
         the map with fiction centred on wherever the bot happened to stop.
         """
-        if mode not in ("chasing", "far", "loot"):
+        # "going back" is walking somewhere too: the bot pushes the stick toward
+        # home, so a wall hit on the way back is real and the jam detector plus
+        # wedge escape must run there. Without it a bot wedged on the return
+        # walk leans on the wall forever -- it can neither learn the wall nor
+        # fire wedge_off, and the timeout re-target keeps aiming at the same wall.
+        if mode not in ("chasing", "far", "loot", "going back", "wander"):
             self.still, self.last_pos, self.mark = 0, None, None
             self.anchor = None
             return None
@@ -1388,22 +1467,109 @@ class WalkMap:
 
 
 class Area:
-    """A named patch of ground to farm, painted by walking it.
+    """A named mask, circle union, or polygon in horizontal world coordinates.
 
-    Cells the character walked through, fattened by `AREA_BRUSH`. Two questions
-    are asked of it and they are deliberately different: `inside()` is the
-    boundary, `deep()` is the line the bot has to get back over before it
-    counts as returned. The gap between them is one cell, and it is the whole
-    hysteresis -- the deleted leash had none at first and bounced along its
-    circle forever against a monster standing on the line.
+    `inside()` is exact target admission; `safe()` is the inset used for player
+    movement. A return remains committed to `home_goal` after safe re-entry.
     """
 
-    def __init__(self, name, cells=None, path=AREA_FILE, cell=AREA_CELL):
+    def __init__(self, name, cells=None, path=AREA_FILE, cell=AREA_CELL,
+                 circle=None, circles=None, polygon=None, axes="xz"):
         self.name, self.path, self.cell = name, path, cell
+        self.axes = axes
         self.cells = set(cells or ())
+        self.circles = []          # (centre_x, centre_z, radius), exact world units
+        self.polygon = ()          # exact horizontal world points
+        self._polygon_zone = None
+        if circle is not None:
+            self.set_circle(*circle)
+        elif circles is not None:
+            for item in circles:
+                self.add_circle(*item)
+        elif polygon is not None:
+            self.set_polygon(polygon, axes)
         self._core = set()       # cells with all eight neighbours painted
         self._core_list = []     # the same, ordered, so a pick is reproducible
         self._stale = True       # recompute those on the next question asked
+
+    @property
+    def circle(self):
+        """First circle, retained for compatibility with single-circle callers."""
+        return self.circles[0] if self.circles else None
+
+    @property
+    def defined(self):
+        return bool(self.circles or self.polygon or self.cells)
+
+    @property
+    def runtime_supported(self):
+        # The game and the bot's calibrated movement model are Unity X/Z.
+        # Preserve XY metadata for honest round-trips, but never execute it as X/Z.
+        return self.axes == "xz"
+
+    def set_circle(self, x, z, radius):
+        self.circles = []
+        self.polygon, self._polygon_zone = (), None
+        return self.add_circle(x, z, radius)
+
+    def add_circle(self, x, z, radius):
+        """Add one disc to the union; circle areas never mix with painted cells."""
+        radius = float(radius)
+        if not all(math.isfinite(v) for v in (x, z, radius)) or radius <= 0.0:
+            raise ValueError("circle centre and radius must be finite; radius must be positive")
+        self.circles.append((float(x), float(z), radius))
+        self.cells.clear()
+        self.polygon, self._polygon_zone = (), None
+        self._stale = True
+        return self
+
+    def set_polygon(self, points, axes="xz"):
+        """Replace this area with one exact polygon."""
+        if axes not in ("xy", "xz"):
+            raise ValueError("area axes must be xy or xz")
+        zone = PolygonZone(points)
+        probe = zone.nearest_safe(zone.points[0], AREA_SAFETY)
+        if not zone.contains(probe, AREA_SAFETY):
+            raise ValueError(f"polygon is too narrow for {AREA_SAFETY:g}-unit safety margin")
+        self.axes = axes
+        self.polygon = zone.points
+        self._polygon_zone = zone
+        self.circles = []
+        self.cells.clear()
+        self._stale = True
+        return self
+
+    def describe(self):
+        if self.polygon:
+            return f"polygon {len(self.polygon)} points on {self.axes.upper()}"
+        if self.circles:
+            if len(self.circles) == 1:
+                x, z, radius = self.circles[0]
+                return f"circle centre {x:.1f},{z:.1f}, radius {radius:.1f}"
+            radii = [c[2] for c in self.circles]
+            return (f"{len(self.circles)} overlapping circles, radii "
+                    f"{min(radii):.1f}..{max(radii):.1f}")
+        return f"{len(self.cells)} painted cells"
+
+    @staticmethod
+    def _inner_radius(circle):
+        """Return radius used for safe return/wander points.
+
+        Normal circles keep the full safety margin. A circle narrower than that
+        margin has only one honest safe point: its centre.
+        """
+        radius = circle[2]
+        return max(0.0, radius - AREA_SAFETY)
+
+    @staticmethod
+    def _radial_point(circle, x, z, radius):
+        cx, cz, _ = circle
+        dx, dz = x - cx, z - cz
+        distance = math.hypot(dx, dz)
+        if distance < 1e-9:
+            return cx, cz
+        scale = radius / distance
+        return cx + dx * scale, cz + dz * scale
 
     def at(self, x, z):
         return (math.floor(x / self.cell), math.floor(z / self.cell))
@@ -1413,6 +1579,8 @@ class Area:
 
     def paint(self, x, z):
         """Stamp the brush disc around one sampled position."""
+        if self.circles or self.polygon:
+            raise ValueError("cannot paint into an exact-shape area")
         n = int(AREA_BRUSH / self.cell) + 1
         cx, cz = self.at(x, z)
         # The cell we are standing in always counts, whatever the brush: its
@@ -1462,6 +1630,14 @@ class Area:
 
     def inside(self, x, z, slack=0.0):
         """Painted here, or within `slack` world units of painted ground."""
+        if self._polygon_zone is not None:
+            # Target admission is exact for polygons. Safety is represented by
+            # an inward margin through safe(), never by expanding the fence.
+            return self._polygon_zone.contains((x, z))
+        if self.circles:
+            extra = max(0.0, slack)
+            return any(math.hypot(x - cx, z - cz) <= radius + extra
+                       for cx, cz, radius in self.circles)
         c = self.at(x, z)
         if c in self.cells:
             return True
@@ -1478,8 +1654,23 @@ class Area:
                     return True
         return False
 
+    def safe(self, x, z, margin=AREA_SAFETY):
+        """Inside with enough room for the next controller step."""
+        if self._polygon_zone is not None:
+            return self._polygon_zone.contains((x, z), margin)
+        if self.circles:
+            return any(CircleZone((cx, cz), radius).contains((x, z), margin)
+                       for cx, cz, radius in self.circles)
+        # A walked mask's core is its established one-cell safety margin.
+        return self.deep(x, z)
+
     def deep(self, x, z):
         """Well inside, not merely inside. See `AREA_CELL`."""
+        if self._polygon_zone is not None:
+            return self._polygon_zone.contains((x, z), AREA_CELL)
+        if self.circles:
+            return any(math.hypot(x - c[0], z - c[1]) <= self._inner_radius(c)
+                       for c in self.circles)
         return self.at(x, z) in self.core
 
     def home(self, x, z):
@@ -1488,6 +1679,14 @@ class Area:
         Linear over the cell set, and only ever called while the character is
         outside the area, which is rare and brief.
         """
+        if self._polygon_zone is not None:
+            return self._polygon_zone.nearest_safe((x, z), AREA_SAFETY)
+        if self.circles:
+            if self.deep(x, z):
+                return x, z
+            choices = [self._radial_point(c, x, z, self._inner_radius(c))
+                       for c in self.circles]
+            return min(choices, key=lambda p: (p[0] - x) ** 2 + (p[1] - z) ** 2)
         if not self.core_list:
             return x, z
         c = min(self.core_list,
@@ -1495,16 +1694,113 @@ class Area:
                 + (self.centre(k)[1] - z) ** 2)
         return self.centre(c)
 
+    def nearest(self, x, z):
+        """The centre of the nearest painted cell, whether or not it is core.
+
+        The home point is the nearest *core* cell, in the middle of the area.
+        When the bot is far from the area, the corridor to the home point is
+        huge and the route caps (search budget). The nearest *painted* cell is
+        on the boundary, closer, and the route to it succeeds. Once inside, we
+        navigate to the core on the next frame.
+        """
+        if self._polygon_zone is not None:
+            return self._polygon_zone.nearest_safe((x, z), 0.0)
+        if self.circles:
+            if self.inside(x, z):
+                return x, z
+            choices = [self._radial_point(c, x, z, c[2]) for c in self.circles]
+            return min(choices, key=lambda p: (p[0] - x) ** 2 + (p[1] - z) ** 2)
+        if not self.cells:
+            return x, z
+        c = min(self.cells,
+                key=lambda k: (self.centre(k)[0] - x) ** 2
+                + (self.centre(k)[1] - z) ** 2)
+        return self.centre(c)
+
     def spot(self, rng):
-        """Somewhere random to stand. Uniform over cells is uniform over area,
-        which is what the deleted patrol_point() needed a sqrt() to fake."""
+        """Somewhere random to stand, uniformly distributed over the area."""
+        if self._polygon_zone is not None:
+            return self._polygon_zone.random_safe(AREA_SAFETY, rng)
+        if self.circles:
+            # Pick a disc proportional to its area. Overlaps get proportionally
+            # more visits, but every point stays inside the exact union.
+            total = sum(c[2] ** 2 for c in self.circles)
+            pick = rng.random() * total
+            circle = self.circles[-1]
+            for candidate in self.circles:
+                pick -= candidate[2] ** 2
+                if pick <= 0.0:
+                    circle = candidate
+                    break
+            cx, cz, _ = circle
+            radius = self._inner_radius(circle) * math.sqrt(rng.random())
+            angle = rng.random() * math.tau
+            return cx + radius * math.cos(angle), cz + radius * math.sin(angle)
         return self.centre(rng.choice(self.core_list)) if self.core_list else None
 
     def bounds(self):
+        if self._polygon_zone is not None:
+            return self._polygon_zone.bounds()
+        if self.circles:
+            return ((min(x - radius for x, z, radius in self.circles),
+                     min(z - radius for x, z, radius in self.circles)),
+                    (max(x + radius for x, z, radius in self.circles),
+                     max(z + radius for x, z, radius in self.circles)))
         xs = [c[0] for c in self.cells]
         zs = [c[1] for c in self.cells]
         return ((min(xs) * self.cell, min(zs) * self.cell),
                 ((max(xs) + 1) * self.cell, (max(zs) + 1) * self.cell))
+
+    def guard_step(self, current, proposed, margin=AREA_SAFETY):
+        """Return (allowed, point) for one predicted horizontal movement step."""
+        if self._polygon_zone is not None:
+            return self._polygon_zone.guard_step(current, proposed, margin)
+        if self.circles:
+            zones = [CircleZone((x, z), radius) for x, z, radius in self.circles]
+            intervals = sorted((interval for zone in zones
+                                if (interval := zone.segment_interval(
+                                    current, proposed, margin)) is not None))
+            covered = 0.0
+            for low, high in intervals:
+                if low > covered + 1e-7:
+                    break
+                covered = max(covered, high)
+                if covered >= 1.0 - 1e-7:
+                    break
+            if covered >= 1.0 - 1e-7:
+                return True, proposed
+            if self.safe(*current, margin) and self.safe(*proposed, margin):
+                return False, current
+            choices = [zone.nearest_safe(proposed, margin) for zone in zones]
+            return False, min(choices,
+                              key=lambda p: (p[0] - proposed[0]) ** 2
+                              + (p[1] - proposed[1]) ** 2)
+        # Painted masks are exact grid unions. Endpoint-only validation can cut
+        # diagonally through a non-core cell, so split at every crossed grid line
+        # and check one point inside each traversed cell.
+        if self.safe(*current, margin) and self.safe(*proposed, margin):
+            breaks = {0.0, 1.0}
+            for axis in (0, 1):
+                start, end = current[axis], proposed[axis]
+                delta = end - start
+                if abs(delta) < 1e-9:
+                    continue
+                low, high = sorted((start, end))
+                first = math.floor(low / self.cell) + 1
+                last = math.floor(high / self.cell)
+                for grid in range(first, last + 1):
+                    t = (grid * self.cell - start) / delta
+                    if 0.0 < t < 1.0:
+                        breaks.add(t)
+            ordered = sorted(breaks)
+            for left, right in zip(ordered, ordered[1:]):
+                t = (left + right) / 2.0
+                point = (current[0] + (proposed[0] - current[0]) * t,
+                         current[1] + (proposed[1] - current[1]) * t)
+                if not self.safe(*point, margin):
+                    return False, current
+            return True, proposed
+        return False, self.home(*proposed)
 
     # -- persistence --------------------------------------------------------
     @staticmethod
@@ -1521,23 +1817,71 @@ class Area:
 
     def load(self):
         blob = self._blob(self.path)
+        got = blob.get("areas", {}).get(self.name)
+        if not got:
+            return self
+        if got.get("shape") == "circle":
+            centre, radius = got.get("center"), got.get("radius")
+            try:
+                if len(centre) != 2:
+                    return self
+                self.axes = got.get("axes", "xz")
+                self.set_circle(centre[0], centre[1], radius)
+            except (TypeError, ValueError):
+                pass
+            return self
+        if got.get("shape") == "polygon":
+            try:
+                self.set_polygon(got.get("points", ()), got.get("axes", "xz"))
+            except (TypeError, ValueError):
+                self.polygon, self._polygon_zone = (), None
+            return self
+        if got.get("shape") == "circles":
+            self.circles = []
+            self.axes = got.get("axes", "xz")
+            try:
+                for item in got.get("circles", ()):
+                    if len(item) != 3:
+                        raise ValueError
+                    self.add_circle(*item)
+            except (TypeError, ValueError):
+                self.circles = []
+            return self
         # Same rule as WalkMap: a file written at another cell size cannot be
         # rescaled honestly, and pretending otherwise fences off the wrong ground.
         if blob.get("cell") != self.cell:
             return self
-        got = blob.get("areas", {}).get(self.name)
-        if got:
-            self.cells = {(c[0], c[1]) for c in got.get("cells", ())}
-            self._stale = True
+        self.circles = []
+        self.polygon, self._polygon_zone = (), None
+        self.cells = {(c[0], c[1]) for c in got.get("cells", ())}
+        self._stale = True
         return self
 
     def save(self):
         """Read-modify-write: saving one area must not drop the others."""
         blob = self._blob(self.path)
         if blob.get("cell") != self.cell:
-            blob = {"cell": self.cell, "areas": {}}
-        blob.setdefault("areas", {})[self.name] = {
-            "cells": [[c[0], c[1]] for c in sorted(self.cells)]}
+            # Cell-size incompatibility invalidates only painted masks. Exact
+            # world-space shapes have no grid to rescale and must survive.
+            exact = {name: entry for name, entry in blob.get("areas", {}).items()
+                     if isinstance(entry, dict)
+                     and entry.get("shape") in ("circle", "circles", "polygon")}
+            blob = {"cell": self.cell, "areas": exact}
+        if self.polygon:
+            entry = {"shape": "polygon", "axes": self.axes,
+                     "points": [[x, z] for x, z in self.polygon]}
+        elif len(self.circles) == 1:
+            x, z, radius = self.circles[0]
+            entry = {"shape": "circle", "axes": self.axes,
+                     "center": [x, z], "radius": radius}
+        elif self.circles:
+            entry = {"shape": "circles", "axes": self.axes,
+                     "circles": [[x, z, radius]
+                                 for x, z, radius in self.circles]}
+        else:
+            entry = {"shape": "mask",
+                     "cells": [[c[0], c[1]] for c in sorted(self.cells)]}
+        blob.setdefault("areas", {})[self.name] = entry
         try:
             with open(self.path, "w") as f:
                 json.dump(blob, f)
@@ -1677,14 +2021,15 @@ def loot_wins(mode, mdist, ldist):
     always nearer, so a drop a few steps away lost every arbitration until it
     despawned. Inside LOOT_FIRST_RANGE the item takes precedence outright.
 
-    Two modes are never interrupted. "on it" is a fight already joined, and
+    Three modes are never interrupted. "on it" is a fight already joined, and
     walking out of one is how a bot dies -- an item under our feet is collected
     by LOOT_BUTTON anyway, without moving. "unwedge" is the character backing
     out of something it is jammed against, and it reports a distance of zero:
     overriding that push would leave the bot stuck against the wall it is in
-    the middle of escaping.
+    the middle of escaping. "going back" is authoritative confinement; loot
+    remains filtered to the zone but cannot delay the committed safe return.
     """
-    if ldist is None or mode in ("on it", "unwedge"):
+    if ldist is None or mode in ("on it", "unwedge", "going back"):
         return False
     if mdist is None or mode == "far":
         return True
@@ -1892,12 +2237,15 @@ class MemoryEyes:
         self.basis = None         # stick push -> world travel
         self.units = []           # cached (kind, addr, x, y, z)
         self.chasing = None       # unit held between frames, so it does not flap
+        self.chasing_id = None    # FishNet ObjectId; pointer remains the read handle
         self.target_name = ""     # cached only when target changes, for dashboard
         self.approach = None      # last heading that closed on a target
         self.orbit_dir = 1        # which way round a target we circle
         self.orbit_mark = None    # (time, x, z) the orbit last made progress at
         self.engaged_since = None # when we started on the current target
         self.ignored = {}         # unit -> time it becomes fair game again
+        self.ignored_ptr_ids = {} # unit -> ObjectId when that pointer was ignored
+        self.ignored_ids = {}     # FishNet ObjectId -> the same, across wrappers
         self.mode = "no unit"
         self.misses = 0           # consecutive frames our position did not read
         self.seen_at = {}         # last known position per unit
@@ -1910,8 +2258,12 @@ class MemoryEyes:
         self.loot_name = ""       # what we are walking to, for the status line
         self.loot_target = None   # drop held between frames
         self.loot_since = None    # when we started walking to it
-        self.loot_ignored = {}    # drop -> time it becomes fair game again
+        self.loot_ignored = {}    # spawn key -> time it becomes fair game again
         self.loot_mode = "no loot"
+        self.clock_at = None      # last time issued movement ownership was charged
+        self.movement_owner = "idle"
+        self.zone_rejected = None # last outside-target count printed
+        self.boundary_log_at = 0.0 # throttle final movement-guard logs
         self.hot_loot = None      # regions worth sweeping for loot
         self.hot_loot_at = None   # (x, z) where the character was when hot_loot was built
         self.hot_full_at = 0.0    # when the last full (un-narrowed) unit pass ran
@@ -1936,9 +2288,11 @@ class MemoryEyes:
         self.escape = None        # stick that backs us out of a wedge
         self.escape_until = 0.0
         self.escape_side = 1      # alternated, so a corner is tried both ways
-        self.escapes = 0          # on the current target
+        self.escapes = 0          # unwedges at the current wedge point
+        self.wedge_anchor = None  # (x, z) where the current streak first wedged
         self.scanner = None
         self.stop = None
+        self.scan_passes = 0     # scanner stays alive; >0 means first pass landed
         self.generation = 0       # invalidates a sweep crossing a relog boundary
         self.lock = threading.Lock()
 
@@ -1966,7 +2320,9 @@ class MemoryEyes:
             print("memory targeting: could not find the classes by name either. "
                   "Staying on pixels.")
             return False
-        self.classes = found
+        # A targeted/partial recovery must not discard valid classes that were
+        # already resolved for this process.
+        self.classes = dict(self.classes, **found)
         rvas = {}
         for label, ptr in found.items():
             rva = self.ms.class_slot_rva(mem, ptr)
@@ -1986,6 +2342,18 @@ class MemoryEyes:
             self.stop.set()
         self.mem.close()
 
+    def account_pursuit_time(self, now, owner=None):
+        """Charge elapsed time only to the pursuit that owned the issued stick."""
+        if self.clock_at is not None:
+            elapsed = max(0.0, now - self.clock_at)
+            if self.movement_owner != "monster" and self.engaged_since is not None:
+                self.engaged_since += elapsed
+            if self.movement_owner != "loot" and self.loot_since is not None:
+                self.loot_since += elapsed
+        self.clock_at = now
+        if owner is not None:
+            self.movement_owner = owner
+
     def reset_session(self):
         """Discard every address derived from the old login session.
 
@@ -2001,6 +2369,7 @@ class MemoryEyes:
             self.me = self.basis = self.owner = self.hot = self.hot_loot = None
             self.hot_at = self.hot_loot_at = None
             self.chasing = self.engaged_since = self.approach = None
+            self.chasing_id = None
             self.target_name = ""
             self.loot_target = self.loot_since = None
             self.loot_name, self.loot_mode = "", "no loot"
@@ -2009,15 +2378,19 @@ class MemoryEyes:
                                  "monster_names": {}}
             self.scan_error = ""
             self.recovery = ""
+            self.scan_passes = 0
             self.fallback_since = None
             self.next_full_rescan = 0.0
-            self.ignored, self.loot_ignored = {}, {}
+            self.ignored, self.ignored_ptr_ids, self.ignored_ids = {}, {}, {}
+            self.loot_ignored = {}
+            self.clock_at, self.movement_owner = None, "idle"
             self.seen_at, self.fight_ok = {}, {}
             self.misses = self.sweep_at = 0
             self.path = self.path_to = self.last_pos = self.goal = self.loot_goal = None
             self.path_at = self.escape_until = 0.0
             self.escape = self.orbit_mark = None
             self.escapes, self.orbit_dir = 0, 1
+            self.wedge_anchor = None
             # The recorded area describes the world and survives. Its active
             # walk-back/wander decision belongs to the character that did not.
             self.returning, self.home_goal, self.wander = False, None, None
@@ -2035,12 +2408,13 @@ class MemoryEyes:
         limit = self.ms.POS_MAX
         for a in addrs:
             blob = read(a + off, 12)
-            if not blob:
+            if not blob or len(blob) != 12:
                 continue
             x, y, z = struct.unpack("<fff", blob)
             # NaN fails every comparison, which is what excludes it here, and a
             # zeroed triple is recycled memory rather than a place.
-            if -limit < x < limit and -limit < y < limit and -limit < z < limit                     and (x > 1e-3 or x < -1e-3) and (z > 1e-3 or z < -1e-3):
+            if (-limit < x < limit and -limit < y < limit and -limit < z < limit
+                    and (abs(x) > 1e-3 or abs(z) > 1e-3)):
                 out[a] = (x, y, z)
         return out
 
@@ -2063,15 +2437,50 @@ class MemoryEyes:
         self.fight_ok[unit] = (now + LIVE_TTL_S, ok, invisible)
         return ok
 
+    def _stable_id(self, unit):
+        """Preferred held-target identity; absent on old test stubs/failed reads."""
+        reader = getattr(self.ms, "network_object_id", None)
+        if reader is None:
+            return None
+        try:
+            return reader(self.mem, unit)
+        except (OSError, ValueError, struct.error):
+            return None
+
+    def _target_ignored(self, unit, now, stable_id=None):
+        """Blacklist by read handle and, when available, FishNet spawn identity."""
+        if self.ignored.get(unit, 0.0) >= now:
+            old_id = getattr(self, "ignored_ptr_ids", {}).get(unit)
+            current_id = self._stable_id(unit) if stable_id is None else stable_id
+            # A positive different ObjectId proves the pooled pointer now names
+            # another spawn. Failed/transient reads remain conservatively ignored.
+            if old_id is None or current_id is None or current_id == old_id:
+                return True
+        stable_id = self._stable_id(unit) if stable_id is None else stable_id
+        return (stable_id is not None
+                and getattr(self, "ignored_ids", {}).get(stable_id, 0.0) >= now)
+
+    def _ignore_target(self, unit, until, stable_id=None):
+        """Ignore a spawn through wrapper churn, retaining pointer fallback."""
+        self.ignored[unit] = until
+        stable_id = self._stable_id(unit) if stable_id is None else stable_id
+        if not hasattr(self, "ignored_ptr_ids"):
+            self.ignored_ptr_ids = {}
+        self.ignored_ptr_ids[unit] = stable_id
+        if stable_id is not None:
+            if not hasattr(self, "ignored_ids"):
+                self.ignored_ids = {}
+            self.ignored_ids[stable_id] = until
+
     def _known_invisible(self, unit):
         """Whether the liveness check just identified this candidate as cloaked."""
         hit = self.fight_ok.get(unit)
         return bool(hit and len(hit) > 2 and hit[2])
 
-    def _first_fightable(self, ranked):
+    def _first_fightable(self, ranked, now=None):
         """Nearest entry that is really there. `ranked` is sorted by distance."""
         for d, u, x, y, z in ranked:
-            if self._fightable(u):
+            if not self._target_ignored(u, now) and self._fightable(u, now):
                 return (u, x, y, z), d
         return None, None
 
@@ -2086,8 +2495,9 @@ class MemoryEyes:
         """
         me = self.seen_at.get(self.me)
         if not me:                       # nothing to measure distance from yet
-            self.seen_at = self._positions(addrs)
-            return self.seen_at
+            fresh = self._positions(addrs)
+            self.seen_at.update(fresh)
+            return fresh
         near, far = [], []
         for a in addrs:
             was = self.seen_at.get(a)
@@ -2103,8 +2513,15 @@ class MemoryEyes:
             start = self.sweep_at % len(far)
             near += far[start:start + step] or far[:step]
             self.sweep_at = start + step
-        self.seen_at.update(self._positions(near))
-        return self.seen_at
+        fresh = self._positions(near)
+        self.seen_at.update(fresh)
+        # `seen_at` is scheduling history for the far-unit slices. An address we
+        # actually attempted this frame must come from this frame, especially
+        # our player: returning its old coordinate makes MEM_LOST_FRAMES
+        # unreachable after a relog or object rebuild.
+        attempted = set(near)
+        return {a: p for a, p in self.seen_at.items()
+                if a not in attempted or a in fresh}
 
     def calibrate(self, pad):
         """Find which unit is us, and how a stick push maps to world travel.
@@ -2114,14 +2531,46 @@ class MemoryEyes:
         works mid-combat, unlike anything built on walking a clean line.
         """
         players = self.known_players()   # from the background sweep, never blocks
+        if self.owner is not None and self.owner not in players:
+            # local_player() resolves from any NetworkBehaviour and does not need
+            # the PlayerController class slot. A partial patch recovery can know
+            # our owner before player enumeration works; that is enough for the
+            # two owner-only calibration legs.
+            players.append(self.owner)
         if not players:
             return False
 
+        me = self.owner
+
+        def calibration_safe():
+            if self.area is None:
+                return True
+            if me is None:
+                return False
+            position = self._positions([me]).get(me)
+            if not position:
+                return False
+            px, pz = position[0], position[2]
+            if not self.area.inside(px, pz):
+                # Startup/reconnect pixels are intentionally allowed while the
+                # basis is unknown. They can carry us over the recorded edge;
+                # refusing every calibration push there creates a permanent
+                # deadlock: no basis means we cannot route back inside, so the
+                # bot remains on pixels forever. Calibrate, then target()'s
+                # area return immediately takes over. A player still inside but
+                # too near the edge remains protected from an outward probe.
+                return True
+            return self.area.safe(px, pz, AREA_SAFETY + AREA_LOOKAHEAD)
+
         def push(sx, sy):
             """World delta per unit over one push."""
+            if not calibration_safe():
+                return {}
             before = self._positions(players)
             t0 = time.time()
             while time.time() - t0 < MEM_CAL_PUSH_S:
+                if not calibration_safe():
+                    break
                 pad.stick(sx, sy, True)
                 time.sleep(0.05)
             pad.stick(0.0, 0.0, True)
@@ -2141,9 +2590,12 @@ class MemoryEyes:
         # us, calibration locks onto them, and every later leg is thrown away
         # as "not us" -- failing outright with a healthy character standing
         # right there.
-        me = self.owner
-        if me is not None and not any(u == me for _, u, *_ in self.units):
-            me = self.owner = None       # from before a relog; look again
+        if (me is not None
+                and not any(u == me for _, u, *_ in self.units)
+                and me not in self._positions([me])):
+            # Missing player-class rows are not evidence against local_player(),
+            # but an unreadable owner address is evidence of a relog/rebuild.
+            me = self.owner = None
         pushes = ((1.0, 0.0), (0.0, 1.0)) if me else (
             (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0),
             (0.7, 0.7), (-0.7, 0.7))
@@ -2186,28 +2638,45 @@ class MemoryEyes:
                 return True
         return False
 
-    def _ensure_class(self, mem, label, why):
-        """Find one class by name once, and cache its slot as an RVA.
+    def _ensure_classes(self, mem, requests):
+        """Find missing optional classes in one heap pass and cache together.
 
-        Separate from heal() on purpose: the units can be perfectly healthy
-        while a class the bot never needed before has no cached slot at all,
-        and heal() only fires when the *monster* class is missing. Searching
-        for the single name we lack costs a fraction of a full heal, and it
-        happens once per patch.
+        Units can be healthy while optional player/loot slots are stale.
+        `find_classes` streams the same multi-gigabyte regions whatever subset
+        is requested, so those names must share one pass instead of taking
+        several minutes each in series.
         """
-        found = self.ms.find_classes(mem, {label: self.ms.CLASS_NAMES[label]})
-        if not found.get(label):
-            print(f"\n{why}: no {self.ms.CLASS_NAMES[label]} class "
-                  f"found; off this session")
-            return False
+        requests = tuple((label, why) for label, why in requests
+                         if not self.classes.get(label))
+        if not requests:
+            return set()
+        wanted = {label: self.ms.CLASS_NAMES[label] for label, _ in requests}
+        self.recovery = "recovering optional classes in one pass: " + "+".join(wanted)
+        found = {label: ptr for label, ptr in self.ms.find_classes(mem, wanted).items()
+                 if ptr}
         self.classes = dict(self.classes, **found)
-        rva = self.ms.class_slot_rva(mem, found[label])
-        if rva:
-            self.ms.save_rva_cache(dict(self.ms.load_rva_cache(), **{label: rva}))
-        print(f"\n{why}: {self.ms.CLASS_NAMES[label]} found at "
-              f"0x{found[label]:X}"
-              + (f", slot cached (0x{rva:X})" if rva else ""))
-        return True
+        rvas = {}
+        for label, ptr in found.items():
+            rva = self.ms.class_slot_rva(mem, ptr)
+            if rva:
+                rvas[label] = rva
+        if rvas:
+            self.ms.save_rva_cache(dict(self.ms.load_rva_cache(), **rvas))
+        for label, why in requests:
+            ptr = found.get(label)
+            if not ptr:
+                print(f"\n{why}: no {self.ms.CLASS_NAMES[label]} class "
+                      f"found; off this session")
+                continue
+            rva = rvas.get(label)
+            print(f"\n{why}: {self.ms.CLASS_NAMES[label]} found at 0x{ptr:X}"
+                  + (f", slot cached (0x{rva:X})" if rva else ""))
+        self.recovery = ""
+        return set(found)
+
+    def _ensure_class(self, mem, label, why):
+        """Compatibility wrapper for callers that need one optional class."""
+        return label in self._ensure_classes(mem, ((label, why),))
 
     def _sweep_loot(self, mem, generation=None):
         """Refresh ground loot. world_loot() has already dropped the pool.
@@ -2235,7 +2704,16 @@ class MemoryEyes:
         with self.lock:
             if generation is not None and generation != self.generation:
                 return
+            old_keys = {self._loot_key(d, x, z, n)
+                        for d, (x, _y, z, n) in self.loot.items()}
             self.loot = {d: (x, y, z, n) for d, x, y, z, n in found}
+            new_keys = {self._loot_key(d, x, z, n)
+                        for d, (x, _y, z, n) in self.loot.items()}
+            # Observing an occupancy disappear proves its give-up state belongs
+            # to the old pooled spawn. The same wrapper/name/position may later
+            # be reused for a collectible new drop.
+            for key in old_keys - new_keys:
+                self.loot_ignored.pop(key, None)
             # Narrow only after a full pass (regions was None when the sweep
             # ran), so an in-flight narrowed sweep cannot re-narrow to the old
             # regions after a movement reset cleared them.
@@ -2290,13 +2768,19 @@ class MemoryEyes:
             drops = list(self.loot.items())
         if not drops:
             return "cache empty -- the sweep is finding no drops at all"
-        near = sorted((math.hypot(x - px, z - pz), d, n)
+        near = sorted((math.hypot(x - px, z - pz),
+                       self._loot_key(d, x, z, n), n)
                       for d, (x, _, z, n) in drops)[:3]
         return f"{len(drops)} cached; nearest " + ", ".join(
             f"{n[:14]}@{dist:.1f}"
-            f"{' IGNORED' if self.loot_ignored.get(d, 0) > now else ''}"
+            f"{' IGNORED' if self.loot_ignored.get(key, 0) > now else ''}"
             f"{'' if wanted_item(n) else ' unwanted'}"
-            for dist, d, n in near)
+            for dist, key, n in near)
+
+    @staticmethod
+    def _loot_key(drop, x, z, name):
+        """Identity of one pooled-slot occupancy, not the reusable wrapper."""
+        return drop, name, x, z
 
     def pick_loot(self, now):
         """(sx, sy, distance) toward a dropped item, or (None, None, None).
@@ -2319,11 +2803,12 @@ class MemoryEyes:
         self.last_pos = (px, pz)
         with self.lock:
             drops = list(self.loot.items())
-        ranked = sorted((((x - px) ** 2 + (z - pz) ** 2) ** 0.5, d, x, z, n)
+        ranked = sorted((((x - px) ** 2 + (z - pz) ** 2) ** 0.5,
+                         self._loot_key(d, x, z, n), d, x, z, n)
                         for d, (x, _, z, n) in drops
-                        if self.loot_ignored.get(d, 0) < now and wanted_item(n)
-                        and (self.area is None
-                             or self.area.inside(x, z, AREA_SLACK)))
+                        if self.loot_ignored.get(self._loot_key(d, x, z, n), 0) < now
+                        and wanted_item(n)
+                        and (self.area is None or self.area.inside(x, z)))
         ranked = [r for r in ranked if r[0] <= LOOT_RANGE]
         if not ranked:
             self.loot_target = self.loot_since = None
@@ -2347,7 +2832,7 @@ class MemoryEyes:
             self.loot_mode = "loot skip"
             return None, None, None
 
-        dist, drop, x, z, name = pick
+        dist, _, drop, x, z, name = pick
         self.loot_name = name
         if dist <= LOOT_ARRIVE:
             self.loot_mode = "loot get"
@@ -2375,15 +2860,19 @@ class MemoryEyes:
 
         def sweep():
             mem = self.ms.Mem(self.mem.pid)
-            looked = True         # loot class not looked up yet; once only
+            class_retry = {"player": 0.0, "loot": 0.0}
+            heal_at = 0.0
             saved = 0.0           # the walk map is written from here, not the
                                   # 50 ms frame, and only when it changed
             before = {}           # last sweep's positions, to spot who moved
+            before_generation = None
             try:
-                if not self.available():
-                    self.heal(mem)
                 while not self.stop.is_set():
                     if not self.available():
+                        stamp = time.time()
+                        if stamp >= heal_at:
+                            self.heal(mem)
+                            heal_at = time.time() + HOT_SELF_HEAL_S
                         self.stop.wait(MEM_REFRESH_S)
                         continue
                     with self.lock:
@@ -2397,7 +2886,8 @@ class MemoryEyes:
                         # from the cached list while the full pass runs.
                         if hot is not None and time.time() - self.hot_full_at >= HOT_SELF_HEAL_S:
                             hot = None
-                    found = self.ms.world_units(mem, regions=hot)
+                    found = self.ms.world_units(mem, regions=hot,
+                                                classes=self.classes)
                     if hot is None:
                         with self.lock:
                             self.hot_full_at = time.time()
@@ -2408,12 +2898,13 @@ class MemoryEyes:
                         if generation != self.generation:
                             continue
                         self.units = found
+                        self.scan_passes += 1
                     if self.owner is None and found:
                         # Who we are, read instead of walked for: any unit
                         # carries the managers, so this is a pointer walk with
                         # nothing to search. Re-read whenever it is lost, since
                         # a map change rebuilds the object.
-                        owner = self.ms.local_player(mem, found[0][1])
+                        owner = self._find_owner(mem, found)
                         with self.lock:
                             if generation == self.generation:
                                 self.owner = owner
@@ -2434,8 +2925,22 @@ class MemoryEyes:
                             if report is not None:
                                 self._accept_scan_summary(report)
                             self.scan_error = report_error
-                    if LOOT_PICKUP and not self.classes.get("loot") and looked:
-                        looked = self._ensure_class(mem, "loot", "loot pickup")
+                    stamp = time.time()
+                    due = []
+                    for label, why, enabled in (
+                            ("player", "player classification", True),
+                            ("loot", "loot pickup", LOOT_PICKUP)):
+                        if (enabled and not self.classes.get(label)
+                                and stamp >= class_retry[label]):
+                            due.append((label, why))
+                    if due:
+                        self._ensure_classes(mem, due)
+                        # A class scan may itself outlast the retry interval.
+                        # Count from completion or one missing class immediately
+                        # starts another multi-minute pass and appears endless.
+                        retry_at = time.time() + HOT_SELF_HEAL_S
+                        for label, _ in due:
+                            class_retry[label] = retry_at
                     if LOOT_PICKUP and self.classes.get("loot"):
                         self._sweep_loot(mem, generation)
                     if PATHFIND:
@@ -2443,10 +2948,20 @@ class MemoryEyes:
                         # unit that moved since the last sweep has just proven
                         # its ground walkable. Free floor, hundreds of cells at
                         # a time, in places the bot has never been.
-                        walkers = [(x, z) for _, u, x, _, z in found
-                                   if u in before and before[u] != (x, z)]
-                        before = {u: (x, z) for _, u, x, _, z in found}
-                        self.walk.paint(walkers)
+                        with self.lock:
+                            if generation != self.generation:
+                                continue
+                            if before_generation != generation:
+                                before = {}
+                                before_generation = generation
+                            walkers = [(x, z) for _, u, x, _, z in found
+                                       if u in before and before[u] != (x, z)]
+                            before = {u: (x, z) for _, u, x, _, z in found}
+                            # reset_session() takes this same lock. It therefore
+                            # cannot advance the generation between this final
+                            # ownership check and painting movement history from
+                            # an obsolete session.
+                            self.walk.paint(walkers)
                         if time.time() - saved >= WALK_SAVE_S:
                             self.walk.save()
                             saved = time.time()
@@ -2532,8 +3047,7 @@ class MemoryEyes:
             if self.ignored.get(was, 0.0) >= now:
                 return "held one blacklisted"
             return "held one left the unit list"
-        if self.area is not None and not self.area.inside(entry[2], entry[4],
-                                                          AREA_HOLD):
+        if self.area is not None and not self.area.inside(entry[2], entry[4]):
             return "held one walked out of the area"
         if not self._fightable(was):
             return "held one died or stopped being fightable"
@@ -2602,15 +3116,31 @@ class MemoryEyes:
         """
         hx, hz = self.home_goal or (px, pz)
         away = math.hypot(hx - px, hz - pz)
-        if away > AREA_ABANDON or now - self.returning_since > AREA_RETURN_MAX_S:
-            # Either another map entirely -- nothing records which map an area
-            # belongs to -- or a walk back that simply is not working. Both
-            # used to be an hour of pressing into scenery.
-            print(chr(10) + f"gave up returning to area {self.area.name!r}"
-                  f" ({away:.0f} units away) -- confinement OFF")
-            self.area, self.returning = None, False
+        if away > AREA_ABANDON:
+            # Another map entirely -- nothing records which map an area
+            # belongs to. Never drop the fence here: the next frame would hand
+            # unrestricted actuation to pixels. Hold safely and require the run
+            # to be restarted with the correct named area.
+            failure = (self.area.name, round(away))
+            if getattr(self, "area_failed", None) != failure:
+                print(chr(10) + f"area {self.area.name!r} is {away:.0f} units away"
+                      " -- likely the wrong map; holding safely")
+                self.area_failed = failure
+            self.goal = None
             self.mode = "no area"
-            return None, None, None
+            return 0.0, 0.0, away
+        self.area_failed = None
+        if now - self.returning_since > AREA_RETURN_MAX_S:
+            # The walk back is not working. Do not drop the fence: unfencing
+            # lets the bot roam outside and chase monsters that are not in the
+            # area, which is the one failure that looks like a bot that "walks
+            # to the wrong place". Recompute the nearest inset-safe home point
+            # and restart the timer; targeting the exact boundary deadlocks the
+            # final movement guard at its safety margin.
+            self.home_goal = self.area.home(px, pz)
+            self.returning_since = now
+            hx, hz = self.home_goal
+            away = math.hypot(hx - px, hz - pz)
         gx, gz = self.route_to(now, px, pz, hx, hz)
         s = stick_for(self.basis, gx - px, gz - pz)
         if not s:
@@ -2630,9 +3160,23 @@ class MemoryEyes:
         main() reads a zero stick as handled and parks the bot.
         """
         self.routing = self.sealed = False
+        allowed = None
+        edge_allowed = None
+        if self.area is not None and self.area.safe(px, pz):
+            allowed = self.area.safe
+            edge_allowed = lambda x0, z0, x1, z1: self.area.guard_step(
+                (x0, z0), (x1, z1))[0]
+            if not self.area.safe(tx, tz):
+                # Exact target admission includes the boundary, while player
+                # movement is inset. Route to the nearest safe fighting point;
+                # the target distance still controls engagement/give-up.
+                tx, tz = self.area.home(tx, tz)
         if not (PATHFIND and self.walk):
             return tx, tz
-        if not self.walk.crossed(px, pz, tx, tz, now):
+        area_crossed = (edge_allowed is not None
+                        and not edge_allowed(px, pz, tx, tz))
+        if (not area_crossed
+                and not self.walk.crossed(px, pz, tx, tz, now)):
             self.path = None
             return tx, tz
         fresh = (self.path and now - self.path_at < WALK_REPLAN_S
@@ -2640,7 +3184,9 @@ class MemoryEyes:
                  and math.hypot(tx - self.path_to[0], tz - self.path_to[1])
                  < WALK_WAYPOINT)
         if not fresh:
-            self.path = self.walk.route(px, pz, tx, tz, now)
+            self.path = self.walk.route(px, pz, tx, tz, now,
+                                        allowed=allowed,
+                                        edge_allowed=edge_allowed)
             self.path_at, self.path_to = now, (tx, tz)
         if not self.path:
             # No path at all, and the search was not merely out of budget: the
@@ -2649,7 +3195,12 @@ class MemoryEyes:
             self.sealed = not self.walk.capped
             return tx, tz
         self.routing = True
-        return self.walk.waypoint(px, pz, self.path)
+        waypoint = self.walk.waypoint(px, pz, self.path)
+        if edge_allowed is not None and not edge_allowed(px, pz, *waypoint):
+            visible = [point for point in self.path
+                       if edge_allowed(px, pz, *point)]
+            waypoint = visible[-1] if visible else self.path[0]
+        return waypoint
 
     def observe_move(self, now, sx, sy, on_loot=False):
         """Feed the walk map the stick that actually went out this frame.
@@ -2664,13 +3215,96 @@ class MemoryEyes:
             return None
         px, pz = self.last_pos
         mode = self.loot_mode if on_loot else self.mode
+        goal = (getattr(self, "guard_goal", None)
+                or (self.loot_goal if on_loot else self.goal))
         hit = self.walk.observe(now, px, pz, sx or 0.0, sy or 0.0, self.basis,
-                                mode, self.loot_goal if on_loot else self.goal)
+                                mode, goal)
         if hit:
             self.path = None            # a new wall: the old route is a lie
             if self.walk.wedged:
                 self.wedge_off(now, sx or 0.0, sy or 0.0)
         return hit
+
+    def guard_area_step(self, sx, sy, now=None):
+        """Validate the final stick against the fence before controller output."""
+        now = time.time() if now is None else now
+        self.guard_goal = None
+        if not (self.area and self.last_pos and self.basis and (sx or sy)):
+            return sx, sy, False
+        px, pz = self.last_pos
+        dx, dz = world_for(self.basis, sx, sy)
+        length = math.hypot(dx, dz)
+        if length < 1e-9:
+            return 0.0, 0.0, False
+        proposed = (px + dx / length * AREA_LOOKAHEAD,
+                    pz + dz / length * AREA_LOOKAHEAD)
+        allowed, safe = self.area.guard_step((px, pz), proposed)
+        if allowed:
+            return sx, sy, False
+
+        # guard_step() returns a nearby safe point, but stick_for() is
+        # direction-only and normalizes it back to full magnitude. Revalidate the
+        # heading that would actually go out, and rotate inward until its complete
+        # lookahead segment is safe. This also gives an outward unwedge at the safe
+        # edge a real lateral/back escape instead of collapsing the whole interval
+        # to zero.
+        ux, uz = dx / length, dz / length
+        redirected = None
+        endpoint = safe
+        if not self.area.safe(px, pz):
+            # We may discover the character already outside after a relog or a
+            # target carried it over the line. No three-unit endpoint can be
+            # "inside" when home is farther away than that, so fail-closed must
+            # mean measurable progress toward home, not a zero stick forever.
+            hx, hz = self.area.home(px, pz)
+            ix, iz = hx - px, hz - pz
+            inward = math.hypot(ix, iz)
+            if inward > 1e-9:
+                side = 1.0 if ix * dz - iz * dx >= 0.0 else -1.0
+                inward_way = (ix / inward, iz / inward)
+                lateral_way = (inward_way[0] - inward_way[1] * 0.7 * side,
+                               inward_way[1] + inward_way[0] * 0.7 * side)
+                ways = ((lateral_way, inward_way) if self.mode == "unwedge"
+                        else (inward_way, lateral_way))
+                for wx, wz in ways:
+                    candidate = stick_for(self.basis, wx, wz)
+                    if not candidate:
+                        continue
+                    cdx, cdz = world_for(self.basis, *candidate)
+                    clen = math.hypot(cdx, cdz)
+                    issued = (px + cdx / clen * AREA_LOOKAHEAD,
+                              pz + cdz / clen * AREA_LOOKAHEAD)
+                    if (self.area.safe(*issued)
+                            or math.hypot(issued[0] - hx, issued[1] - hz) < inward):
+                        redirected, endpoint = candidate, issued
+                        break
+        for degrees in (0, 15, -15, 30, -30, 45, -45, 60, -60,
+                        75, -75, 90, -90, 105, -105, 120, -120,
+                        135, -135, 150, -150, 165, -165, 180):
+            if redirected is not None:
+                break
+            angle = math.radians(degrees)
+            wx = ux * math.cos(angle) - uz * math.sin(angle)
+            wz = ux * math.sin(angle) + uz * math.cos(angle)
+            candidate = stick_for(self.basis, wx, wz)
+            if not candidate:
+                continue
+            cdx, cdz = world_for(self.basis, *candidate)
+            clen = math.hypot(cdx, cdz)
+            if clen < 1e-9:
+                continue
+            issued = (px + cdx / clen * AREA_LOOKAHEAD,
+                      pz + cdz / clen * AREA_LOOKAHEAD)
+            if self.area.guard_step((px, pz), issued)[0]:
+                redirected, endpoint = candidate, issued
+                break
+        if now >= getattr(self, "boundary_log_at", 0.0):
+            print(f"\nzone boundary: blocked step at {proposed[0]:.1f},"
+                  f"{proposed[1]:.1f}; redirecting inside")
+            self.boundary_log_at = now + AREA_BOUNDARY_LOG_S
+        self.goal = endpoint
+        self.guard_goal = endpoint
+        return (*(redirected or (0.0, 0.0)), True)
 
     def wedge_off(self, now, sx, sy):
         """Back out sideways from whatever we are jammed against.
@@ -2687,6 +3321,13 @@ class MemoryEyes:
         self.escape_until = now + WALK_ESCAPE_S
         self.escape_side = -self.escape_side
         self.escapes += 1
+        # Anchor the counter to where we wedged. It is set on the first
+        # unwedge of a streak and left alone afterwards: the counter counts
+        # unwedges at this spot, and target() clears it once we are far away.
+        if getattr(self, "wedge_anchor", None) is None:
+            lp = getattr(self, "last_pos", None)
+            if lp:
+                self.wedge_anchor = lp
 
     def _orbit_way(self, now, px, pz):
         """Which way round the target to go. Reverses when the circle stops
@@ -2705,6 +3346,14 @@ class MemoryEyes:
     def known_players(self):
         with self.lock:
             return [u for k, u, *_ in self.units if k == "player"]
+
+    def _find_owner(self, mem, units):
+        """Resolve our player from several live NetworkBehaviour seeds."""
+        for _, unit, *_ in units[:64]:
+            owner = self.ms.local_player(mem, unit)
+            if owner:
+                return owner
+        return None
 
     def _drop_stale_hot(self, found):
         """Drop the unit region cache once narrowed sweeps stop finding units.
@@ -2779,11 +3428,13 @@ class MemoryEyes:
         # each frame was a quarter of the work for something never targeted.
         live = self._live_positions([u for _, u, *_ in cached] + [self.me])
         here = live.get(self.me)
-        if not here and self.misses < MEM_LOST_FRAMES:
-            # One empty read is not a death. Coast on the last known state.
+        if not here:
             self.misses += 1
-            self.mode = "lost"
-            return None, None, None
+            if self.misses < MEM_LOST_FRAMES:
+                # One empty read is not a death. Do not actuate, but keep the
+                # calibration until the configured run of misses is complete.
+                self.mode = "lost"
+                return None, None, None
         if not here:
             # Our unit was rebuilt -- map change, death or relog. Everything
             # derived from it is now meaningless: the basis was measured for a
@@ -2814,7 +3465,10 @@ class MemoryEyes:
                 self.loot = {}
             self.loot_target = self.loot_since = None
             self.chasing = self.engaged_since = None
+            self.chasing_id = None
             self.ignored = {}
+            self.ignored_ptr_ids = {}
+            self.ignored_ids = {}
             self.seen_at, self.fight_ok = {}, {}
             # The route and the travel history belong to a unit that is gone;
             # the map and the area both describe the world and stay.
@@ -2827,6 +3481,15 @@ class MemoryEyes:
         self.misses = 0
         px, _, pz = here
         self.last_pos = (px, pz)
+        wedge_anchor = getattr(self, "wedge_anchor", None)
+        if wedge_anchor and self.escapes:
+            # The counter is per-location: it counts unwedges at the same
+            # spot, not across the session. Clear it once the character is
+            # this far from where it first wedged, so a wall that is actually
+            # left behind stops counting against the next fight.
+            ax, az = wedge_anchor
+            if math.hypot(px - ax, pz - az) >= WALK_WEDGE_RESET:
+                self.escapes, self.wedge_anchor = 0, None
         # The character has walked on; the region caches were built somewhere
         # else. Drop them past the radius so the next sweep is a full pass that
         # re-narrows here, instead of sweeping the old regions forever.
@@ -2847,21 +3510,18 @@ class MemoryEyes:
             # Evaluated before the walk-back acts, or the flag clears a frame
             # late and the bot takes one extra outward step every re-entry.
             if self.returning:
-                reached_home = (self.home_goal is None or
-                                self.area.at(px, pz) ==
-                                self.area.at(*self.home_goal))
-                if reached_home and self.area.deep(px, pz):
+                if (self.home_goal is not None and self.area.safe(px, pz)
+                        and math.hypot(px - self.home_goal[0],
+                                       pz - self.home_goal[1]) <= MEM_ARRIVE):
                     self.returning, self.home_goal = False, None
-            elif not self.area.inside(px, pz, AREA_LEAVE):
+            elif not self.area.safe(px, pz):
                 self.returning, self.returning_since = True, now
                 self.home_goal = self.area.home(px, pz)
-                # Resuming the same target immediately after reaching home is
-                # the other half of the back-and-forth loop. If its chase or
-                # route genuinely carried us past AREA_LEAVE, give another
-                # candidate a turn before this one may be selected again.
-                if self.chasing is not None:
-                    self.ignored[self.chasing] = now + TARGET_IGNORE_S
-                    self.chasing = self.engaged_since = self.approach = None
+                self.chasing = self.engaged_since = None
+                self.chasing_id = None
+                self.target_name = ""
+                print(f"\nzone: player outside safe interior; returning to "
+                      f"{self.area.name!r}")
             if self.returning:
                 out = self._go_home(now, px, pz)
                 if out:
@@ -2874,10 +3534,6 @@ class MemoryEyes:
         # and walking straight back if you drag the character away.
         ranked = sorted(((((x - px) ** 2 + (z - pz) ** 2) ** 0.5, u, x, y, z)
                          for k, u, x, y, z in fresh if k == "monster"
-                         and self.ignored.get(u, 0.0) < now
-                         # Slack, not the bare mask: a monster a step over the
-                         # line is killable from inside, and refusing it makes
-                         # the whole boundary band unfarmable.
                          ),
                         key=lambda e: e[0])
         if self.area is not None:
@@ -2886,8 +3542,13 @@ class MemoryEyes:
             # monster stepping over the line vanished, `held` came back None,
             # and the bot took a different target -- bypassing TARGET_SWITCH,
             # which is the whole rule that stops it flapping between two.
-            allowed = [e for e in ranked
-                       if self.area.inside(e[2], e[4], AREA_SLACK)]
+            allowed = [e for e in ranked if self.area.inside(e[2], e[4])]
+            rejected = len(ranked) - len(allowed)
+            if rejected != getattr(self, "zone_rejected", None):
+                if rejected:
+                    print(f"\nzone: rejected {rejected} monster(s) outside "
+                          f"{self.area.name!r}")
+                self.zone_rejected = rejected
         else:
             allowed = ranked
 
@@ -2898,18 +3559,40 @@ class MemoryEyes:
         # nearer, or when this one is gone.
         held = next((e for e in ranked if e[1] == self.chasing
                      and (self.area is None
-                          or self.area.inside(e[2], e[4], AREA_HOLD))), None)
-        if held and held[0] <= MEM_RANGE and self._fightable(held[1]):
+                          or self.area.inside(e[2], e[4]))), None)
+        chasing_id = getattr(self, "chasing_id", None)
+        if held and chasing_id is None:
+            # Identity may have been unreadable on acquisition. Latch it as soon
+            # as the same pointer produces a verified ID so later wrapper churn
+            # does not reset the engagement clock.
+            chasing_id = self._stable_id(held[1])
+            if chasing_id is not None:
+                self.chasing_id = chasing_id
+        if held and chasing_id is not None:
+            held_id = self._stable_id(held[1])
+            if held_id is not None and held_id != chasing_id:
+                # A positive mismatch proves this pooled address was reused.
+                # None is only an unreadable identity this frame.
+                held = None
+        if held is None and chasing_id is not None:
+            # The managed wrapper can move while FishNet's spawn identity stays.
+            # This slow fallback runs only after the held pointer disappears.
+            held = next((e for e in allowed if self._stable_id(e[1]) == chasing_id),
+                        None)
+            if held is not None:
+                self.chasing = held[1]
+        # Apply one hysteresis rule at every distance. The old split selected a
+        # near held target before comparing candidates, but re-picked far targets
+        # every frame -- simultaneously sticky and flappy depending on range.
+        hit, dist = self._first_fightable(allowed, now)
+        held_ok = (held and not self._target_ignored(held[1], now, chasing_id)
+                   and self._fightable(held[1], now))
+        if held_ok and (hit is None or hit[0] == held[1]
+                        or dist >= held[0] * TARGET_SWITCH):
             hit, dist = (held[1], held[2], held[3], held[4]), held[0]
-        else:
-            # Checked in distance order and stopped at the first one that is
-            # really there, so the liveness reads cost a handful per frame
-            # rather than one per monster on the map.
-            hit, dist = self._first_fightable(allowed)
-            if hit and held and held[0] <= MEM_RANGE                     and dist > held[0] * TARGET_SWITCH and self._fightable(held[1]):
-                hit, dist = (held[1], held[2], held[3], held[4]), held[0]
         if not hit:
             self.chasing = self.engaged_since = None
+            self.chasing_id = None
             cloaked = next((e for e in allowed
                             if e[0] <= MEM_RANGE and self._known_invisible(e[1])),
                            None)
@@ -2937,35 +3620,45 @@ class MemoryEyes:
             # Fall through rather than return: a far target needs the same
             # engagement clock as a near one, or an unreachable monster across
             # a wall is walked at forever.
-            # With an area set this is already confined and needs no test of
-            # its own: `ranked` above only ever contains monsters inside it, so
-            # the walk-anywhere chase is gone by construction. The *route*
-            # there may still bulge outside, which `returning` then corrects.
-            # ponytail: an area-aware cost inside WalkMap.route() would avoid
-            # the bulge, and is a whole new bug surface for a rare case.
-        if hit[0] != self.chasing:
+            # With an area set this is already confined: `ranked` only contains
+            # admitted monsters, route_to() excludes unsafe cells, and the final
+            # guard validates the issued segment.
+        hit_id = self._stable_id(hit[0])
+        if (hit[0] != self.chasing
+                or (chasing_id is not None and hit_id is not None
+                    and hit_id != chasing_id)):
             if TARGET_LOG:
                 print(chr(10) + f"targetlog switch 0x{self.chasing or 0:X}"
                       f" -> 0x{hit[0]:X} at {dist:6.1f}"
                       f"  because {self._why_switched(now, ranked)}"
                       f"  candidates {len(allowed)}")
-            self.chasing, self.engaged_since, self.escapes = hit[0], now, 0
+            # The escape counter is NOT reset here: it is per-location, and a
+            # pack behind one wall cycles through its members. Resetting on
+            # every switch is what let the bot unwedge and chase the same wall
+            # forever. It clears on its own once we are far from the wedge.
+            self.chasing, self.chasing_id, self.engaged_since = hit[0], hit_id, now
             report = getattr(self, "scan_summary", {})
             self.target_name = report.get("monster_names", {}).get(hit[0],
                                                                     "unknown")
         elif self.escapes >= WALK_ESCAPE_GIVEUP:
-            # Backed out of the same approach this many times and still here.
-            # Whatever is in the way, this monster is not the one to fight.
-            self.ignored[hit[0]] = now + MEM_IGNORE_S
+            # Backed out of the same spot this many times and still here.
+            # Whatever is in the way, this whole cluster is not worth walking
+            # at: ignoring only the chased member would have the next one in
+            # the pack walked into the same wall a frame later.
+            for k, u, x, y, z in fresh:
+                if k == "monster" and math.hypot(x - hit[1], z - hit[3]) <= WALK_WEDGE_CLUSTER:
+                    self._ignore_target(u, now + MEM_IGNORE_S)
             self.chasing = self.engaged_since = None
-            self.escapes, self.mode = 0, "walled"
+            self.chasing_id = None
+            self.escapes, self.wedge_anchor, self.mode = 0, None, "walled"
             return None, None, None
         elif stale_target(now, self.engaged_since):
             # Long enough on one target that it is not going to die: already
             # dead and still listed, unreachable, or not attackable. Parking on
             # it forever is the one failure that looks exactly like a hung bot.
-            self.ignored[hit[0]] = now + MEM_IGNORE_S
+            self._ignore_target(hit[0], now + MEM_IGNORE_S, hit_id)
             self.chasing = self.engaged_since = None
+            self.chasing_id = None
             self.mode = "gave up"
             return None, None, None
         if FIGHT_LOG and self.mem and dist <= MEM_RANGE:
@@ -2973,7 +3666,20 @@ class MemoryEyes:
             # is what the distance says anyway.
             hp = self.ms.unit_health(self.mem, hit[0])
             print(f"\nfightlog {hit[0]:012X} dist {dist:5.2f} hp {hp}")
-        if dist <= MEM_ARRIVE:
+        boundary_standoff = False
+        if (self.area is not None and self.area.inside(hit[1], hit[3])
+                and not self.area.safe(hit[1], hit[3])):
+            fight_x, fight_z = self.area.home(hit[1], hit[3])
+            # Exact admission includes the boundary while player movement keeps
+            # the inward safety margin. Once we have reached that nearest legal
+            # fighting point, treat the target as joined instead of issuing the
+            # same outward command until give-up. Orbit away-and-sideways so the
+            # controller remains active and attack can continue without the final
+            # fence having to rewrite every frame.
+            boundary_standoff = (self.area.safe(px, pz)
+                                  and math.hypot(px - fight_x, pz - fight_z)
+                                  <= MEM_ARRIVE)
+        if dist <= MEM_ARRIVE or boundary_standoff:
             # Arrived: circle it rather than stand on it. Standing on the
             # monster is no attack, and a dead stick is no attack either.
             self.mode = "on it"
@@ -2986,7 +3692,7 @@ class MemoryEyes:
             rx, ry = radial
             way = self._orbit_way(now, px, pz)
             ox, oy = -ry * way, rx * way
-            pull = (-1.0 if dist < MEM_ORBIT_MIN else
+            pull = (-1.0 if boundary_standoff or dist < MEM_ORBIT_MIN else
                     1.0 if dist > MEM_ORBIT_MAX else 0.0)
             ox, oy = ox + rx * pull, oy + ry * pull
             n = math.hypot(ox, oy) or 1.0
@@ -2996,8 +3702,9 @@ class MemoryEyes:
             # Walled off with no way round: walking at it is eight seconds of
             # pressing into stone before MEM_ENGAGE_MAX_S notices. There are
             # other monsters.
-            self.ignored[hit[0]] = now + MEM_IGNORE_S
+            self._ignore_target(hit[0], now + MEM_IGNORE_S, hit_id)
             self.chasing = self.engaged_since = None
+            self.chasing_id = None
             self.mode = "walled"
             return None, None, None
         s = stick_for(self.basis, gx - px, gz - pz)
@@ -3169,6 +3876,12 @@ def targeting_mode(argv, area=None):
     return "memory"
 
 
+def should_calibrate(eyes, now, next_cal):
+    """Whether memory has enough current evidence to attempt its movement basis."""
+    return bool(eyes is not None and eyes.me is None and now >= next_cal
+                and (eyes.owner is not None or eyes.known_players()))
+
+
 def main(port=None, area=None):
     import mss
 
@@ -3182,7 +3895,7 @@ def main(port=None, area=None):
     zone = None
     if area:
         zone = Area(area).load()
-        if not zone.cells:
+        if not zone.defined:
             # Never fall back to roaming: an unconfined run started by a typo
             # is a whole session farming the wrong side of the map.
             known = ", ".join(Area.names()) or "(none recorded yet)"
@@ -3190,8 +3903,12 @@ def main(port=None, area=None):
             print(f"recorded areas: {known}")
             print(f"record one with:  python minimap_bot.py --record {area}")
             return
+        if not zone.runtime_supported:
+            print(f"area {area!r} uses unsupported {zone.axes.upper()} axes; "
+                  "SpiritVale movement is X/Z, so confinement is OFF")
+            return
         (x0, z0), (x1, z1) = zone.bounds()
-        print(f"confined to area {area!r}: {len(zone.cells)} cells,"
+        print(f"confined to area {area!r}: {zone.describe()},"
               f" x {x0:.0f}..{x1:.0f}  z {z0:.0f}..{z1:.0f}")
 
     win = find_window()
@@ -3246,7 +3963,7 @@ def main(port=None, area=None):
         try:
             while True:
                 if toggle_key_hit():
-                    paused = toggle_running(paused, pad, pet_filter)
+                    paused = toggle_running(paused, pad, pet_filter, area=zone)
                     target_lock.reset()
                     target_blacklist.reset()
                     stuck_watchdog.reset()
@@ -3293,6 +4010,8 @@ def main(port=None, area=None):
                     #     else:
                     #         print(f"camera check: {deg:+.0f} degrees, good")
                 if paused:
+                    if eyes is not None:
+                        eyes.account_pursuit_time(time.time(), "paused")
                     dashboard.update(eyes, False, "press End to start")
                     time.sleep(0.05)
                     continue
@@ -3365,6 +4084,8 @@ def main(port=None, area=None):
                             eyes, True, reconnect_state,
                             memory_driving=False,
                             status=reconnect_status, force=True)
+                        if eyes is not None:
+                            eyes.account_pursuit_time(time.time(), "reconnect")
                         continue
 
                 if not buff_queue and time.time() >= next_buff:
@@ -3376,12 +4097,13 @@ def main(port=None, area=None):
                 img = np.array(sct.grab(reg))[:, :, :3]
                 h, w = img.shape[:2]
                 now = time.time()
+                if eyes is not None:
+                    eyes.account_pursuit_time(now)
                 sx = sy = None
                 on_loot = False
                 display_distance = None
                 memory_driving = False
-                if (eyes is not None and eyes.me is None
-                        and now >= next_cal and eyes.known_players()):
+                if should_calibrate(eyes, now, next_cal):
                     # The sweep has landed, so the two calibration pushes can
                     # happen now. Two seconds, once, and only after the bot has
                     # already been fighting on pixels rather than before it.
@@ -3408,7 +4130,8 @@ def main(port=None, area=None):
                     # also when the only monster is "far": an item two steps
                     # away is worth more than a walk across the map, and the
                     # monster is still there afterwards. Never mid-fight.
-                    if LOOT_PICKUP and eyes.mode not in ("on it", "unwedge"):
+                    if (LOOT_PICKUP
+                            and eyes.mode not in ("on it", "unwedge", "going back")):
                         lsx, lsy, ldist = eyes.pick_loot(now)
                         if lsx is not None and loot_wins(eyes.mode, mdist
                                                          if msx is not None
@@ -3444,12 +4167,11 @@ def main(port=None, area=None):
                             had_unit = False
                     elif msx is None:
                         # A zero stick reads as "handled" below, so the pixel
-                        # path never runs. Right for the modes that mean stop
-                        # (a rebuilt unit has no basis) -- wrong for "no
-                        # monster", which is the unit
-                        # list saying it has nothing, not the screen. Leaving
-                        # sx None there is what walks the bot to a red dot
-                        # instead of standing still until it is restarted.
+                        # path never runs. Right for modes that genuinely mean
+                        # stop; wrong for "no monster" and "no unit", which are
+                        # temporary memory gaps. Leaving sx None for those lets
+                        # pixels drive until the scan/calibration lands. A
+                        # farming area still fails closed in area_holds() below.
                         if hold_still(eyes.mode):
                             sx = sy = 0.0
                         # Name which kind of nothing this is: "no monster" was
@@ -3484,7 +4206,23 @@ def main(port=None, area=None):
 
                 # Everything below is the pixel path, used when memory targeting
                 # is off or has gone stale. It is left exactly as it was.
-                if sx is None:
+                if sx is None and area_holds(eyes, zone):
+                    # A fence is active, so pixels must not steer: they would
+                    # chase a red dot anywhere, and a walk far enough out makes
+                    # target() abandon the area for the whole run. Hold still
+                    # until the unit list (and its confinement) has a stick.
+                    # Clear the pixel state too: coasting on a last heading is
+                    # pixels steering, and `dot` must be bound for the
+                    # pixel_evidence read below.
+                    # Pixels are evidence that a narrowed memory scan missed
+                    # targets, but never an actuator while confinement is active.
+                    (_, _), _, dot = pick_target(
+                        img, pet_filter, target_lock, target_blacklist, now)
+                    sx = sy = 0.0
+                    stuck = None
+                    last = None
+                    state = "in area"
+                elif sx is None:
                     (cx, cy), _, dot = pick_target(
                         img, pet_filter, target_lock, target_blacklist, now)
                     stuck = (dot is not None and stuck_watchdog.update(
@@ -3536,13 +4274,31 @@ def main(port=None, area=None):
                     print("\nmemory and pixels disagree -- full memory rescan "
                           "started; pixels remain temporary fallback")
 
+                boundary_blocked = False
+                if eyes is not None:
+                    # Last gate before controller output. Target, loot, routing,
+                    # orbit and unwedge all share it, so no movement path can
+                    # accidentally bypass the farming-zone safety margin.
+                    sx, sy, boundary_blocked = eyes.guard_area_step(sx, sy, now)
+
                 # Buffs need a clean cast: release L1 before the first d-pad tap,
                 # keep it released through every gap, then resume after the last.
                 atk = attack_active(
                     now, buffing=bool(buff_queue),
                     blocked=bool(eyes is not None and memory_driving
-                                 and eyes.mode == "invisible"))
+                                 and eyes.mode in ("invisible", "going back",
+                                                   "boundary", "no area"))
+                    or boundary_blocked)
                 if eyes is not None:
+                    if boundary_blocked:
+                        eyes.movement_owner = "boundary"
+                    elif on_loot and memory_driving:
+                        eyes.movement_owner = "loot"
+                    elif (memory_driving
+                          and eyes.mode in ("chasing", "far", "on it")):
+                        eyes.movement_owner = "monster"
+                    else:
+                        eyes.movement_owner = eyes.mode if memory_driving else "idle"
                     # The stick that actually goes out is the one the walk map
                     # can learn a wall from -- loot may have won the arbitration
                     # above, and target()'s own vector was never sent.
@@ -3614,8 +4370,9 @@ def demo():
         "loot": {"detected": 55, "wanted": 39,
                  "ground": ("Gold Ore x39 [WANTED]", "Solar Spear x2 [filtered]")},
         "navigation": "loot / direct", "warning": "",
-    })
-    for expected in ("SPIRITVALE BOT", "RUNNING", "mode MEMORY",
+    }, color=False)
+    for expected in ("SPIRITVALE COMBAT BOT", "RUNNING", "Primary mode",
+                     "MEMORY", "COMBAT & CONTROL", "MEMORY SCANNER",
                      "Lepica [YOU]", "Bat [YOURS]",
                      "Sun Lion x2", "Gold Ore x39 [WANTED]", "39 wanted"):
         assert expected in dashboard, (expected, dashboard)
@@ -3877,9 +4634,10 @@ def demo():
     # and never falls through to the pixel path.
     class _Fights:
         """Stands in for memscan: says which stub units are worth fighting."""
-        def __init__(self, real, standing=True, hidden=()):
+        def __init__(self, real, standing=True, hidden=(), ids=None):
             self.real, self.standing = set(real), standing
             self.hidden = set(hidden)
+            self.ids = ids or {}
 
         def worth_fighting(self, _, unit):
             if unit == 0x1000:              # 0x1000 is us; alive unless a corpse
@@ -3892,8 +4650,11 @@ def demo():
         def monster_target_state(self, mem, unit):
             return self.real_monster(mem, unit), unit in self.hidden
 
+        def network_object_id(self, mem, unit):
+            return self.ids.get(unit)
+
     class _Far(MemoryEyes):
-        def __init__(self, at, extra=(), real=(0x2000,), hidden=()):
+        def __init__(self, at, extra=(), real=(0x2000,), hidden=(), ids=None):
             self.me, self.basis = 0x1000, [[1.0, 0.0], [0.0, 1.0]]
             self.units = [("monster", 0x2000, at, 0.0, 0.0)] + list(extra)
             self.chasing = self.engaged_since = self.approach = None
@@ -3902,7 +4663,7 @@ def demo():
             self.orbit_dir, self.orbit_mark = 1, None
             self.at, self.mem = at, None
             self.seen_at, self.sweep_at, self.fight_ok = {}, 0, {}
-            self.ms = _Fights(real, hidden=hidden)
+            self.ms = _Fights(real, hidden=hidden, ids=ids)
             self.lock = threading.Lock()
 
         def _positions(self, addrs):
@@ -3981,6 +4742,20 @@ def demo():
     assert far_off.mode == "far", far_off.mode
     assert fsx is not None and (fsx or fsy), "must walk to it, not stand still"
     assert abs(fd - MEM_RANGE * 3) < 1.0, fd
+    # FishNet ObjectId survives a managed-wrapper pointer change. Reacquiring
+    # it must preserve the engagement clock rather than treating it as a switch.
+    moved_wrapper = _Far(20.0, ids={0x2000: 77})
+    moved_wrapper.chasing, moved_wrapper.chasing_id = 0xDEAD, 77
+    moved_wrapper.engaged_since = 0.25
+    moved_wrapper.target(1.0)
+    assert moved_wrapper.chasing == 0x2000
+    assert moved_wrapper.engaged_since == 0.25
+    transient_id = _Far(20.0, ids={0x2000: 88})
+    transient_id.target(1.0)
+    transient_id.ms.ids.clear()          # one unreadable ObjectId frame
+    transient_id.target(1.1)
+    assert transient_id.chasing_id == 88
+    assert transient_id.engaged_since == 1.0
     cloaked = _Far(5.0, real=(), hidden=(0x2000,))
     assert cloaked.target(1.0) == (0.0, 0.0, 5.0)
     assert cloaked.mode == "invisible", cloaked.mode
@@ -4013,6 +4788,75 @@ def demo():
     assert pd > MEM_RANGE, pd
 
     # --- confined to a recorded area ---
+    # A circular camp uses exact world-space distance, not cell approximation.
+    # The inner radius keeps the same return hysteresis as a painted mask.
+    ring_area = Area("ring", path=os.devnull, circle=(10.0, -5.0, 30.0))
+    assert ring_area.defined and ring_area.describe().startswith("circle centre")
+    assert ring_area.inside(40.0, -5.0), "the exact boundary is inside"
+    assert not ring_area.inside(40.01, -5.0), "past the exact boundary is outside"
+    assert ring_area.inside(42.0, -5.0, 2.0), "target slack extends the radius"
+    assert ring_area.deep(37.0, -5.0), "one AREA_CELL inside is safe home"
+    assert not ring_area.deep(39.0, -5.0), "the fringe is not returned yet"
+    assert ring_area.home(50.0, -5.0) == (37.0, -5.0)
+    assert ring_area.nearest(50.0, -5.0) == (40.0, -5.0)
+    assert all(ring_area.deep(*ring_area.spot(random)) for _ in range(100)), \
+        "circle wander points must stay in the safe inner disc"
+
+    # Several circles form one exact union. The second disc extends the target
+    # area, return chooses its nearest safe edge, and wander never leaves either.
+    union = Area("union", path=os.devnull,
+                 circles=[(0.0, 0.0, 20.0), (35.0, 0.0, 20.0)])
+    assert union.inside(-20.0, 0.0) and union.inside(55.0, 0.0)
+    assert not union.inside(55.01, 0.0)
+    assert union.bounds() == ((-20.0, -20.0), (55.0, 20.0))
+    assert union.home(70.0, 0.0) == (52.0, 0.0)
+    assert union.nearest(70.0, 0.0) == (55.0, 0.0)
+    assert all(union.deep(*union.spot(random)) for _ in range(100))
+    union_target = _Far(45.0)
+    union_target.area = union
+    union_target.target(1.0)
+    assert union_target.chasing == 0x2000 and union_target.mode == "chasing", \
+        "a monster in any member circle belongs to the union"
+    union_outside = _Far(60.0)
+    union_outside.area = union
+    union_outside.target(1.0)
+    assert union_outside.chasing is None and union_outside.mode == "wander"
+
+    # Drive the real target() path too: outside monsters are rejected and a
+    # character beyond the leave margin is routed back toward the inner disc.
+    ring_caged = _Far(45.0)
+    ring_caged.area = ring_area
+    rcx, rcy, _ = ring_caged.target(1.0)
+    assert ring_caged.mode == "wander" and ring_caged.chasing is None
+    assert rcx is not None and (rcx or rcy), "an empty circle camp must wander"
+    ring_lost = _Far(MEM_RANGE * 3)
+    ring_lost.area, ring_lost.spots = ring_area, {0x1000: 50.0}
+    rlx, _, _ = ring_lost.target(1.0)
+    assert ring_lost.mode == "going back" and ring_lost.returning
+    assert rlx < 0, "circle return must head toward its centre"
+
+    # Circle and legacy walked-mask entries coexist in the same areas.json.
+    area_tmp = os.path.join(os.environ.get("TEMP", "."), "areas_demo.json")
+    try:
+        os.remove(area_tmp)
+    except OSError:
+        pass
+    saved_ring = Area("ring", path=area_tmp, circle=(10.0, -5.0, 30.0))
+    assert saved_ring.save()
+    saved_union = Area("union", path=area_tmp,
+                       circles=[(0.0, 0.0, 20.0), (35.0, 0.0, 20.0)])
+    assert saved_union.save()
+    saved_mask = Area("mask", path=area_tmp)
+    saved_mask.paint(0.0, 0.0)
+    assert saved_mask.save()
+    loaded_ring, loaded_union, loaded_mask = (Area("ring", path=area_tmp).load(),
+                                              Area("union", path=area_tmp).load(),
+                                              Area("mask", path=area_tmp).load())
+    assert loaded_ring.circle == saved_ring.circle and loaded_ring.defined
+    assert loaded_union.circles == saved_union.circles
+    assert loaded_mask.cells == saved_mask.cells and loaded_mask.circle is None
+    os.remove(area_tmp)
+
     # A strip of ground along +x, the shape a walk down a road produces.
     pen = Area("pen", path=os.devnull)
     for i in range(10):
@@ -4062,35 +4906,30 @@ def demo():
     assert lost.returning and lsx < 0, (lsx, lost.returning)
     assert ld > 0, "a zero distance makes the walk-back unbeatable by loot"
 
-    # Reaching a target we are *allowed* to hit must never itself count as
-    # leaving. With one slack number it did: the bot chased a legal monster a
-    # few units past the paint, called standing there "outside", walked home,
-    # and chased it again -- `dist`, `back in`, `dist`, `back in` forever.
+    # The safety margin is inside the recorded boundary. A character already in
+    # that fringe cancels combat and returns instead of using target slack to
+    # justify another outward step.
     (_, _), (edge_x, _) = pen.bounds()
     lean = _Far(MEM_RANGE * 3)
-    lean.area, lean.spots = pen, {0x1000: edge_x + AREA_HOLD}
+    lean.area, lean.spots = pen, {0x1000: edge_x + 0.5}
     lean.target(1.0)
-    assert not lean.returning, "standing within reach of a legal target is not leaving"
-    assert lean.mode != "going back", lean.mode
+    assert lean.returning and lean.mode == "going back", lean.mode
+    assert lean.chasing is None, "returning must cancel combat"
     # Genuinely out is still out.
     gone = _Far(MEM_RANGE * 3)
-    gone.area, gone.spots = pen, {0x1000: edge_x + AREA_LEAVE * 4}
-    gone.chasing = 0x2000
+    gone.area, gone.spots = pen, {0x1000: edge_x + AREA_SAFETY * 4}
     gone.target(1.0)
     assert gone.returning and gone.mode == "going back", gone.mode
-    assert gone.ignored.get(0x2000, 0.0) > 1.0, \
-        "the target that led us out must not be resumed after walking back"
 
-    # A monster loitering on the line must not be dropped and re-taken every
-    # frame: `held` is looked up in the unfiltered list with more rope, or the
-    # area filter silently bypasses TARGET_SWITCH.
+    # A held monster that crosses the exact boundary is dropped immediately;
+    # pointer stability never grants it permission outside the zone.
     edgy = _Far(MEM_RANGE * 3, extra=[("monster", 0x5000, 0.0, 0.0, 0.0)],
                 real=(0x2000, 0x5000))
     edgy.area = pen
-    edgy.spots = {0x5000: edge_x + (AREA_SLACK + AREA_HOLD) / 2}
+    edgy.spots = {0x5000: edge_x + 0.5}
     edgy.chasing = 0x5000
     edgy.target(1.0)
-    assert edgy.chasing == 0x5000, "a held target on the line keeps being held"
+    assert edgy.chasing != 0x5000, "a held target outside must be dropped"
 
     # Crossing back over the line is not being back in. The deleted leash had
     # one threshold and bounced along it forever against a monster on the edge.
@@ -4102,36 +4941,33 @@ def demo():
     edge.target(1.0)
     assert pen.inside(fringe, 0.0) and edge.returning,         "the fringe is inside, but not yet back in"
 
-    # ...and being properly back in does release it.
+    # Safe re-entry is not enough: finish the committed walk to home_goal or the
+    # next target can reverse the stick at the line and recreate boundary flapping.
     homed = _Far(MEM_RANGE * 3)
     homed.area, homed.returning, homed.spots = pen, True, {0x1000: 10.0}
-    homed.home_goal = pen.centre(pen.at(10.0, 0.0))
+    homed.home_goal = pen.centre(pen.at(16.0, 0.0))
     homed.target(1.0)
-    assert not homed.returning, "deep inside must release the walk-back"
-    assert homed.mode != "going back", homed.mode
-
-    # Entering an arbitrary core cell is not arrival at the committed home
-    # point. Releasing here makes the next target reverse the stick immediately,
-    # which presents as `back in`, outward, `back in`, outward.
-    row = pen.at(0.0, 0.0)[1]
-    core_x = [pen.centre(c)[0] for c in pen.core_list if c[1] == row]
-    early = _Far(MEM_RANGE * 3)
-    early.area, early.returning = pen, True
-    early.spots = {0x1000: min(core_x)}
-    early.home_goal = (max(core_x), pen.centre((0, row))[1])
-    early.target(1.0)
-    assert early.returning and early.mode == "going back", \
-        "return must reach its committed safe point before releasing"
+    assert homed.returning and homed.mode == "going back", \
+        "safe re-entry must finish the committed home walk"
+    homed.spots = {0x1000: homed.home_goal[0]}
+    homed.target(1.1)
+    assert not homed.returning, "reaching home_goal must release the walk-back"
 
     # Another map is not a stray step -- nothing records which map an area
     # belongs to, so --area on the wrong one puts home thousands of units away.
-    # Switch the fence off loudly rather than lean into scenery for an hour.
+    # Hold loudly rather than either lean into scenery or release pixels.
     elsewhere = _Far(MEM_RANGE * 3)
     elsewhere.area, elsewhere.spots = pen, {0x1000: AREA_ABANDON * 3}
     esx, _, _ = elsewhere.target(1.0)
-    assert elsewhere.mode == "no area" and elsewhere.area is None
-    assert esx is None, "giving up must park the bot, not steer it"
+    assert elsewhere.mode == "no area" and elsewhere.area is pen
+    assert esx == 0.0, "wrong-map detection must park the bot, not steer it"
     assert hold_still("no area"), "and must not fall through to the pixel path"
+    # A fence still active must hold the pixel path: pixels know nothing about
+    # the area and would steer the bot anywhere, which is how it left the
+    # recorded ground and never came back.
+    assert area_holds(caged), "an active fence must hold the pixel path"
+    assert area_holds(elsewhere), "wrong-map failure must keep holding pixels"
+    assert not area_holds(None), "no eyes, no fence"
 
     # With no area recorded at all the whole feature is inert.
     free = _Far(MEM_RANGE * 3)
@@ -4281,6 +5117,7 @@ def demo():
     # every item on the map would otherwise look nearer than the monster).
     assert not loot_wins("on it", 1.0, 1.0), "never walk out of melee"
     assert not loot_wins("unwedge", 0.0, 1.0), "never interrupt an escape"
+    assert not loot_wins("going back", 20.0, 1.0), "never delay confinement"
     LOOT_FIRST_RANGE = kept_first
 
     # LOOT_MAX_S counts time spent walking to an item, not time the item spent
@@ -4293,11 +5130,11 @@ def demo():
         patient.pick_loot(2.0 + i)
         patient.loot_since = 2.0 + i
     assert patient.pick_loot(2.0 + 20) != (None, None, None), "must still be offered"
-    assert 0xA000 not in patient.loot_ignored, patient.loot_ignored
+    assert not patient.loot_ignored, patient.loot_ignored
     # And it says why when it offers nothing at all.
     assert "cache empty" in _Loot().loot_debug(1.0)
     shunned = _Loot(drops=[(0xA000, 1.0, 0.0, "Flax")])
-    shunned.loot_ignored[0xA000] = 99.0
+    shunned.loot_ignored[shunned._loot_key(0xA000, 1.0, 0.0, "Flax")] = 99.0
     assert "IGNORED" in shunned.loot_debug(1.0), shunned.loot_debug(1.0)
 
     # Out of range is left alone: crossing the map for an item is not looting.
@@ -4309,7 +5146,7 @@ def demo():
     stuck_loot.pick_loot(2.0)
     assert stuck_loot.pick_loot(2.0 + LOOT_MAX_S + 1) == (None, None, None)
     assert stuck_loot.loot_mode == "loot skip", stuck_loot.loot_mode
-    assert 0xA000 in stuck_loot.loot_ignored
+    assert any(key[0] == 0xA000 for key in stuck_loot.loot_ignored)
 
     # The user-facing loot config is one substring per line. Blank lines and
     # comments are ignored so the shipped file can explain itself.
@@ -4351,11 +5188,13 @@ def demo():
     only_pooled = _Far(MEM_RANGE * 3, real=())     # nothing real at all
     assert only_pooled.target(1.0) == (None, None, None)
     assert only_pooled.mode == "no monster", only_pooled.mode
-    # ...and an empty unit list must not park the bot. A zero stick counts as
-    # handled in main(), so "no monster" has to reach the pixel path instead:
-    # this is the branch that stood still for a whole session once.
+    # ...and a memory gap must not park the bot. A zero stick counts as handled
+    # in main(), so both an empty monster list and a pending unit scan have to
+    # reach the pixel path instead.
     assert not hold_still("no monster")
-    assert hold_still("lost") and hold_still("no unit")
+    assert not hold_still("no unit"), \
+        "while memory waits for a unit scan, pixels must temporarily drive"
+    assert hold_still("lost")
 
     # Player visibility/health is not a reliable stop signal. IsVisible can go
     # false while the character is still alive, and stopping there ends an
@@ -4409,10 +5248,10 @@ def demo():
             return {}                          # every read comes back empty
 
     blind = _Blind()
-    for i in range(MEM_LOST_FRAMES):
+    for i in range(MEM_LOST_FRAMES - 1):
         blind.target(1.0 + i)
         assert blind.me and blind.mode == "lost", (i, blind.mode)
-    blind.target(99.0)                         # one miss too many: unit is gone
+    blind.target(99.0)                         # configured run complete: unit is gone
     assert blind.me is None and blind.mode == "no unit", blind.mode
     # A relog rebuilds our unit, so the pointer read from the connection is as
     # dead as the rest. Leaving it set meant the scanner never looked it up
@@ -4707,11 +5546,9 @@ def demo():
     assert a.inside(0.0, 0.0)
     assert a.inside(AREA_BRUSH - AREA_CELL, 0.0), "the brush is wide, not a point"
     assert not a.inside(AREA_BRUSH * 3, 0.0)
-    # Slack is a test on the target, not on us: a monster a step over the line
-    # is killable from inside, and refusing it makes the boundary unfarmable.
+    # Target admission is exact: a monster one step over the line is rejected.
     out = AREA_BRUSH + AREA_CELL
     assert not a.inside(out, 0.0)
-    assert a.inside(out, 0.0, AREA_SLACK + AREA_CELL)
 
     # A walked line -- the shape the recorder actually produces.
     walked = Area("walk", path=os.devnull)
@@ -5039,6 +5876,11 @@ def record_area(name):
         print(f"recorded areas: {known}")
         return
     area = Area(name).load()
+    if area.circles:
+        print(f"area {name!r} is a circle area ({area.describe()});"
+              " choose another name or replace it with --place-circles <name>"
+              " <radius> --replace")
+        return
     if area.cells:
         # Never silently replace ten minutes of hand-walking. Adding is what
         # you want anyway: a big field takes more than one session. Printed
@@ -5093,6 +5935,44 @@ def record_area(name):
     ok = area.save()
     print(chr(10) + f"{'saved' if ok else 'COULD NOT SAVE'} {name!r}:"
           f" {len(area.cells)} cells, x {x0:.0f}..{x1:.0f}  z {z0:.0f}..{z1:.0f}")
+    print(f"  -> {AREA_FILE}")
+    print(f"run it with:  python minimap_bot.py --area {name}")
+
+
+def record_circle(name, radius, replace=False):
+    """Save an exact circular farm area centred on the character's current position."""
+    try:
+        radius = float(radius)
+    except (TypeError, ValueError):
+        radius = 0.0
+    if not name or not math.isfinite(radius) or radius <= 0.0:
+        print("usage: python minimap_bot.py --circle <name> <radius> [--replace]")
+        print("  stand at the centre; radius is in world units (try 40 to 60)")
+        return
+    old = Area(name).load()
+    if old.defined and not replace:
+        print(f"area {name!r} already exists ({old.describe()}) -- nothing changed")
+        print(f"replace it explicitly with: python minimap_bot.py --circle"
+              f" {name} {radius:g} --replace")
+        return
+
+    import memscan
+    print("finding your character -- the first heap sweep takes ~15 s,"
+          " it is not hung", flush=True)
+    mem = memscan.Mem()
+    units = memscan.world_units(mem)
+    me = memscan.local_player(mem, units[0][1]) if units else None
+    if not me:
+        print("no local player found -- is the character actually in the world?")
+        return
+    blob = mem.read(me + memscan.UNIT_POSITION, 12)
+    if not blob:
+        print("your position is unreadable -- relog or enter the world, then retry")
+        return
+    x, _, z = struct.unpack("<fff", blob)
+    area = Area(name).set_circle(x, z, radius)
+    ok = area.save()
+    print(f"{'saved' if ok else 'COULD NOT SAVE'} {name!r}: {area.describe()}")
     print(f"  -> {AREA_FILE}")
     print(f"run it with:  python minimap_bot.py --area {name}")
 
@@ -5333,10 +6213,26 @@ def stick_test(port=None, seconds=12):
 if __name__ == "__main__":
     if "--demo" in sys.argv:
         demo()
+    elif "--zone" in sys.argv:
+        from zone_recorder import main as zone_main
+        j = sys.argv.index("--zone")
+        raise SystemExit(zone_main(sys.argv[j + 1:]))
     elif "--record" in sys.argv:
-        j = sys.argv.index("--record")
+        from zone_recorder import interactive_record
+        raise SystemExit(0 if interactive_record() else 1)
+    elif "--place-circles" in sys.argv:
+        from area_editor import run_editor
+        j = sys.argv.index("--place-circles")
         rest = [a for a in sys.argv[j + 1:] if not a.startswith("--")]
-        record_area(rest[0] if rest else None)
+        run_editor(rest[0] if rest else None,
+                   rest[1] if len(rest) > 1 else 50.0,
+                   "--replace" in sys.argv)
+    elif "--circle" in sys.argv:
+        j = sys.argv.index("--circle")
+        rest = [a for a in sys.argv[j + 1:] if not a.startswith("--")]
+        record_circle(rest[0] if rest else None,
+                      rest[1] if len(rest) > 1 else None,
+                      "--replace" in sys.argv)
     elif "--snap" in sys.argv:
         snap()
     elif "--watch" in sys.argv:

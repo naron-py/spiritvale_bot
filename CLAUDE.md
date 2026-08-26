@@ -12,7 +12,18 @@ It picks targets two ways. The **memory** path reads the game's unit list and kn
 what each thing *is* — monster, player, or pet — which the screen cannot tell. The
 **pixel** path finds red dots on the minimap and is the fallback: it runs during the
 first background sweep, and whenever memory targeting is unavailable. Memory access
-is read-only (`ReadProcessMemory`); nothing is written and nothing is injected.
+Memory access is read-only (`ReadProcessMemory`); nothing is written and nothing is injected.
+
+## In-process BepInEx migration (approved 2026-08-23)
+
+The user explicitly approved migrating the bot to an in-process C# + BepInEx 6
+plugin, accepting the ToS/ban risk. This **overrides** the read-only / no-injection
+constraint above for this project: the C# bot runs inside the game process via
+BepInEx + Il2CppInterop and reads (and, where actuation needs it, drives) game
+state directly. The Python bot remains the reference behavior and the fallback
+actuator during migration. See `MIGRATION_AUDIT.md` for the full audit and the
+verified IL2CPP data model. Game: Unity 6 (6000.0.64f1), IL2CPP, FishNet, no
+client-side anti-cheat.
 
 ## Commands
 
@@ -30,7 +41,12 @@ python minimap_bot.py --test       # walk a blind circle: isolates pad vs vision
 python minimap_bot.py --buff [hold] [gap]   # fire buff sequence once
 python minimap_bot.py --probe      # press every X360 button in turn, named
 python minimap_bot.py --walklog    # what the wall sensor sees, every frame
-python minimap_bot.py --record <name>  # walk the area to farm; End saves it
+python minimap_bot.py --record         # guided polygon/circle recorder; asks name, replaces duplicates
+python minimap_bot.py --circle <name> <radius>  # exact round area centred where you stand
+python minimap_bot.py --zone polygon <name>  # memory-coordinate hotkey recorder
+python minimap_bot.py --zone circle <name> --radius 40
+python minimap_bot.py --zone clear <name>
+python minimap_bot.py --place-circles <name> [radius]  # legacy top-down planner only
 python minimap_bot.py --area <name>    # run confined to a recorded area
 python minimap_bot.py --lootlog    # why a drop was or was not walked to
 
@@ -96,11 +112,18 @@ scanning at the bottom of the file — no argparse in `minimap_bot.py`.
    steers at a waypoint; a goal with no route at all is blacklisted (`walled`).
    Both channels persist to `walkmap.json` (gitignored) from the background
    thread. `PATHFIND = False` turns all of it off; `--walklog` shows the sensor.
-5. **Farming areas** -- `Area` is a named set of cells painted by walking the
-   ground with `--record <name>`, saved to `areas.json` (gitignored). With
-   `--area <name>` the bot only targets monsters and loot inside it, walks back
-   when it ends up outside, and wanders inside it when nothing is left to kill.
-   Without `--area` the whole feature is inert and the bot roams as before.
+5. **Farming areas** -- `farming_zone.py` contains pure horizontal-world geometry;
+   `Area` adapts exact circles, polygons, circle unions, and legacy walk-painted
+   masks to the bot. `zone_recorder.py` samples the player's read-only memory
+   position under configurable global hotkeys, detects X/Z versus X/Y from the
+   sampled motion, and saves X/Z zones to `areas.json`. SpiritVale's movement
+   model is X/Z; an unexpected X/Y detection is reported and not saved, and an
+   externally supplied X/Y zone is refused rather than silently run as X/Z. The
+   detached `--place-circles` canvas is only a planner and cannot align to the 3D
+   character.
+   With `--area <name>`, only alive hostile monsters whose fresh positions remain
+   inside are targetable. A safe-interior margin, routed return, and final stick
+   guard keep the player inside. Without `--area`, all of this remains inert.
 6. **Pad backends** — `VirtualPad` (vgamepad/ViGEmBus, XInput) and `ArduinoPad`
    (serial to a Leonardo). Duck-typed, same methods: `stick(sx, sy, attack)`,
    `tap_dpad(name, hold)`, `tap_trigger(name, hold)`, `close()`. Pick a backend by adding a class with those
@@ -188,13 +211,29 @@ adjusting them over adding code paths.
   since holding the radius constant is the whole job.
 - **A far target keeps the engagement clock.** Clearing it each frame meant the
   give-up timer never fired and an unreachable monster could be walked at forever.
+- **Held target identity prefers FishNet ObjectId, not only the managed pointer.**
+  Every unit is a `NetworkBehaviour`: `unit +0x30` is its `NetworkObject`, and
+  `NetworkObject +0x44` is the signed `ObjectId`. The latter offset was verified
+  from the native getter (`mov eax,[rcx+44h]; ret`). A pointer is still required
+  as the read handle, but an unchanged ObjectId preserves the engagement clock
+  across wrapper movement and detects pooled pointer reuse. Pointer fallback
+  blacklists record the ObjectId that owned the address, so a positive different
+  ID does not inherit the old spawn's ignore interval. `MonsterId` is only a
+  species string and must never be treated as a unique entity identity.
 - **Never return a zero stick for "nothing to do".** `main()` treats a zero stick
   as handled and does not fall through to the pixel path, so the bot stands
   still. That is why no monster within `MEM_RANGE` walks to the nearest one
   anywhere (`far`) rather than returning nothing.
 - **One empty position read is not a death.** Tearing down `me`, `basis` and the
   caches on the first miss cost a whole run — the bot went silent until it was
-  restarted. `MEM_LOST_FRAMES` consecutive misses are required.
+  restarted. `MEM_LOST_FRAMES` consecutive misses are required. Historical
+  `seen_at` coordinates remain useful for staggered far-unit scheduling, but an
+  attempted read that fails is absent from the current snapshot; in particular,
+  the bot never actuates from a cached player coordinate.
+- **A horizontal world-axis coordinate of zero is valid.** Maps can cross
+  `x == 0` or `z == 0`; only a pair with both horizontal coordinates effectively
+  zero is recycled memory. Requiring both axes to be nonzero loses a live player
+  and eventually tears calibration down.
 - **Every mode assignment must be honest, including the early returns.** Leaving
   a stale `mode` made a bot with no unit at all report `chasing` while motionless,
   and sent the investigation to the wrong place.
@@ -353,39 +392,70 @@ adjusting them over adding code paths.
   `PlayerController`, `SummoningComponent` and `LootDrop`, and nothing else.
   There is no scene name, zone id or map id anywhere. So an area cannot be
   auto-selected and has to be named on the command line -- and `--area` pointed
-  at the wrong map puts "home" thousands of units away. `AREA_ABANDON` and
-  `AREA_RETURN_MAX_S` turn the fence off with a printed reason rather than let
-  the bot lean into scenery on another continent for an hour.
-- **Two thresholds, never one, and finish the committed return.** `inside()` is
-  the boundary and `deep()` (every one of the eight neighbours painted) defines
-  safe home cells. Crossing into an arbitrary deep cell does not release the
-  walk-back: it continues into the committed `home_goal` cell, or the next target
-  can reverse the stick immediately. A target that genuinely carries us beyond
-  `AREA_LEAVE` is temporarily ignored before returning, so it cannot restart the
-  same outward path as soon as home is reached. The deleted leash had a single
-  threshold and bounced along the line forever; `AREA_CELL = 3.0` is twice
-  `WALK_CELL` precisely so one cell of commit is ~4 frames of travel rather than
-  two, which is single-frame-flap territory.
+  at the wrong map puts "home" thousands of units away. Past `AREA_ABANDON` the
+  bot reports the likely wrong map and holds a zero stick with attack released;
+  it never disables confinement or hands actuation to pixels. `AREA_RETURN_MAX_S`
+  retargets an inset-safe home point while keeping the fence enabled.
+- **Target admission is the exact boundary; player motion uses a safe interior.**
+  New and held monsters are rejected the moment their freshly read position is
+  outside. `safe()` applies `AREA_SAFETY` inward for circles/polygons and uses the
+  legacy mask core. Crossing into an arbitrary safe point does not release a
+  committed walk-back: it continues to `home_goal`, preventing frame-to-frame
+  reversal. Immediately before `pad.stick()`, `guard_area_step()` projects the
+  calibrated command by `AREA_LOOKAHEAD`; the entire proposed segment is checked,
+  not just its endpoint, so it cannot cut through a concave notch, a gap between
+  circle-union members, or an unsafe legacy-mask cell. `stick_for()` normalizes, so
+  a redirected command is projected and checked again before dispatch; a nearby
+  safe point alone is not proof that the full-strength heading is safe. A character
+  already outside gets a measurable inward correction (with a lateral component
+  for unwedge) rather than a zero stick. The corrected endpoint becomes the wall
+  observer's goal even when loot originally owned the command. An unsafe step is
+  blocked or redirected inward and attack is released. Calibration has no basis
+  with which to project a direction yet, so
+  an area run skips the unfenced wake nudge and calibration pushes only while the
+  owned player has `AREA_SAFETY + AREA_LOOKAHEAD` of clearance; without a readable
+  owner it fails closed rather than run the six-leg fallback across a boundary.
+  Exception: startup/reconnect pixel fallback can already carry the player outside
+  the area before calibration. Calibration must be allowed there, or the missing
+  basis makes returning impossible and the bot remains on pixels forever; after
+  the basis lands, the normal routed area return takes control immediately. A
+  player still inside but too near the edge remains protected from probe pushes.
+  **Explicit scanner-wait exception (approved 2026-08-26):** while memory reports
+  `no unit` or `no monster`, temporary minimap targeting must still move and attack,
+  including during `--area` runs. Before calibration supplies a basis this short
+  fallback cannot enforce the world-coordinate fence; the user explicitly prefers
+  immediate pixel actuation over holding still. Genuine stop modes and total memory
+  construction failure remain neutral. Once basis and position exist, the final
+  area guard applies to pixel vectors too.
+- **A transient stable-ID miss is not a target switch.** FishNet `ObjectId` is
+  preferred over a pointer, but one unreadable ID frame preserves the last verified
+  ID and engagement clock. Only a positive different ID proves pooled-pointer reuse.
+  The same stable identity keys held-target, engagement and ignore state. One
+  hysteresis rule applies both inside and beyond `MEM_RANGE`: retain the held target
+  unless the nearest fightable candidate is clearly nearer by `TARGET_SWITCH`.
+- **Cell-size mismatch invalidates masks, never exact shapes.** Saving after a
+  top-level `cell` change drops incompatible painted masks but preserves circles,
+  circle unions, and polygons, which are already exact world coordinates.
 - **The walk-back is routed, never steered straight.** The leash aimed raw at
   its anchor with `stick_for` and so leaned on rock for minutes; `_go_home()`
   goes through `route_to()`, and sits *below* the `unwedge` override so the
-  physical escape always wins.
+  physical escape always wins. When already inside the safe geometry, Dijkstra
+  excludes out-of-area cells and boundary targets are projected to an inset-safe
+  fighting point. The geometry itself triggers routing when a direct segment
+  crosses a polygon notch, even without a learned wall, and diagonal steps cannot
+  squeeze between two blocked corner cells. Return timeout also chooses `home()`,
+  never the exact boundary. Once an exact-boundary target is reached at its nearest
+  inset-safe fighting point, it enters `on it` and orbits inward-and-sideways;
+  repeatedly issuing the blocked outward chase would release attack and deadlock.
+- **A circle narrower than `AREA_SAFETY` has one honest safe point: its centre.**
+  `home()` and wandering use a zero inner radius there rather than a half-radius
+  point which the final movement guard would reject.
 - **It returns the real distance, not zero.** `loot_wins()` compares that
   against the nearest drop, and a hard zero would make walking home unbeatable
   by an item two steps ahead of it -- the same trap `unwedge` sets.
 - **`returning` is its own flag, not `self.mode`.** The leash derived it from
   the mode string, which is also the status line and is overwritten by half a
   dozen branches, so the state evaporated mid-return.
-- **`AREA_SLACK` < `AREA_HOLD` < `AREA_LEAVE`, and they are one chain.** A new
-  target may sit `AREA_SLACK` outside the paint (a monster a step over the line
-  is killable from inside, and refusing it makes the whole boundary band
-  unfarmable); one already being fought is kept to `AREA_HOLD`; and *we* only
-  count as having left at `AREA_LEAVE = AREA_HOLD + MEM_ARRIVE`. Measured with
-  a single slack number instead: the bot chased a legal target past the paint,
-  reaching it put the character outside, that instantly triggered the walk
-  back, and the target was still legal -- so it alternated `dist` and `back in`
-  forever, which from outside is a character walking left, right, left, right.
-  Reaching anything we are allowed to hit must never itself be a violation.
 - **The area filter is applied *after* the sort, not inside it.** Filtering
   first meant `held` was looked up in the filtered list, so a monster stepping
   over the line vanished, `held` came back `None`, and the bot took a different
@@ -403,14 +473,15 @@ adjusting them over adding code paths.
   happens -- an area too small to hold a distant point cannot flap either way.
   The demo asserts the *rate of change*, not the destination, because that is
   what the symptom actually was.
-- **`spot()` picks uniformly from cells, which is uniform over area for free**
-  -- the thing the deleted `patrol_point()` needed a `sqrt()` bias to fake on a
-  circle.
+- **`spot()` samples each geometry correctly.** Masks pick uniformly from cells,
+  circles use square-root radial sampling, and polygons reject samples from their
+  bounding rectangle until one lies in the safe interior.
 - **The cell you stand in is always painted**, whatever the brush: its centre
   can be further from you than `AREA_BRUSH`, and then a whole walk records
   nothing at all.
-- **`--record` and the bot must not run at once.** Both poll End through
-  `GetAsyncKeyState`, whose low bit is consumed by whichever reads it first.
+- **A recorder and the bot must not run at once.** The legacy recorder and bot
+  both consume End; the new recorder uses independent edge-triggered configurable
+  keys, but a moving bot still corrupts deliberate point placement.
 
 ### Loot pickup
 
@@ -447,20 +518,26 @@ adjusting them over adding code paths.
   away lost every arbitration until they despawned. Inside `LOOT_FIRST_RANGE` the
   item now takes precedence outright; beyond it, nearest still wins. Set
   `LOOT_FIRST_RANGE = 0` to restore the old rule.
-- **Two modes are never interrupted, and both are load-bearing.** `on it` is a
+- **Three modes are never interrupted, and all are load-bearing.** `on it` is a
   fight already joined — walking out of one is how a bot dies, and an item at our
   feet is collected by `LOOT_BUTTON` without moving anyway (`loot_here()`, checked
   even mid-fight, because the kill drops the item where we stand). `unwedge`
   reports a distance of **0.0**, so without excluding it every drop on the map
   looks nearer than the monster and the escape push would be overridden by loot
   — leaving the bot jammed against the wall it was in the middle of escaping.
+  `going back` is committed confinement and likewise cannot lose to loot.
 - **`LOOT_MAX_S` counts time spent walking to an item, never time it spent
   losing.** `loot_since` starts when a drop becomes the *candidate*, and the
   candidate is recomputed every frame whether or not loot won -- so an item that
   kept losing to a nearer monster was blacklisted for `LOOT_IGNORE_S` having
   never been approached at all. From outside that is a bot ignoring a drop at
   its feet, which is exactly how it was reported. `main()` restarts the clock on
-  every frame the item loses.
+  every frame the item loses. Issued-owner accounting also suspends monster time
+  while loot owns the stick, and suspends both clocks during pause, return,
+  unwedge, reconnect, wandering, or a boundary redirect.
+- **Loot give-up follows one pooled-slot occupancy, not the wrapper pointer.**
+  The spawn key combines wrapper, name and position. Reuse at a new position or
+  with a new name starts a fresh clock and does not inherit the prior blacklist.
 - **Why a drop was skipped has three causes that look identical**: not in the
   sweep's cache, blacklisted, or not in `LOOT_NAMES`. `loot_debug()` names which,
   and `--lootlog` prints it. Reach for that before theorising -- the filter was
@@ -472,10 +549,13 @@ adjusting them over adding code paths.
 ### Surviving a game patch
 
 - **`LootDrop` has no `TYPE_RVA` entry and is not meant to have one.** It is
-  found by name on the background thread (`MemoryEyes._ensure_loot`) the first
-  time the bot runs and cached as an RVA like the rest. `heal()` only fires when
-  the *monster* class is missing, so loot needs its own one-shot lookup -- units
-  can be perfectly healthy while loot has never been looked up at all.
+  found by name on the background thread (`MemoryEyes._ensure_classes`) and cached
+  as an RVA like the rest. `heal()` only gates on the *monster* class, so missing
+  loot/player classes recover independently. All missing optional classes share
+  one streaming heap pass: separate player and loot passes exceeded five minutes
+  after a patch while combat memory was already usable. A failed lookup retries
+  on the throttled self-heal interval measured from scan completion; measuring
+  from scan start can make a scan longer than the interval restart immediately.
 - **`TYPE_RVA` is the only thing that breaks, and it breaks every patch.** Those
   are positions inside `GameAssembly.dll`; the 2026-08-11 update moved all three.
   The *field* offsets (position, health, visible, summoner) did not move and
@@ -491,6 +571,11 @@ adjusting them over adding code paths.
   collected that into a list and never finished. Results are written back as
   fresh RVAs (`il2cpp_rva.json`, gitignored), making it once per patch, and it
   runs on the background thread while the bot works on pixels.
+- **Scanner side effects belong to the generation that produced them.** Cache and
+  dashboard publication checks are not enough: the scanner's closure-local
+  previous-position map resets when `generation` changes, and the final generation
+  check plus `WalkMap.paint()` run under the same lock. Otherwise a relog between
+  publication and painting can turn reused object addresses into fictitious floor.
 
 ### Per-frame cost
 

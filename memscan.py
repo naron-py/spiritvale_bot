@@ -132,6 +132,9 @@ LOOT_POS_CHAIN = (0x20, 0x28, 0x60)   # native GameObject -> ... -> Vector3
 # owns, and that object lists its components. Verified live -- the unit it names
 # tracked the character at 14.3 units/s while walking and 0.00 while standing.
 UNIT_TRANSPORT = 0x28        # NetworkBehaviour.TransportManager
+UNIT_NETWORK_OBJECT = 0x30   # NetworkBehaviour._networkObjectCache
+NETWORK_OBJECT_ID = 0x44     # NetworkObject.ObjectId backing field (int)
+NETWORK_OBJECT_ID_UNSET = 65535
 TRANSPORT_NM = 0x68          # TransportManager.NetworkManager
 NM_CLIENT = 0x38             # NetworkManager.ClientManager
 CLIENT_CONN = 0x60           # ClientManager.Connection -> NetworkConnection
@@ -401,7 +404,7 @@ def looks_like_place(t):
         return False
     if any(v != v for v in t):  # NaN
         return False
-    return abs(x) > 1e-3 and abs(z) > 1e-3
+    return abs(x) > 1e-3 or abs(z) > 1e-3
 
 
 def walked_triples(before, after, base, min_move, max_move, max_dy=1.0):
@@ -586,7 +589,7 @@ def verify(mem, addrs, push, min_move=0.3, max_move=100.0, max_dy=2.0,
         out = {}
         for a in addrs:
             blob = mem.read(a, 12)
-            if blob:
+            if blob and len(blob) == 12:
                 t = struct.unpack("<fff", blob)
                 if looks_like_place(t):
                     out[a] = t
@@ -683,7 +686,7 @@ def resolve(mem, start, offsets):
     addr = start
     for off in offsets[:-1] if offsets else []:
         blob = mem.read(addr + off, 8)
-        if not blob:
+        if not blob or len(blob) != 8:
             return None
         addr = struct.unpack("<Q", blob)[0]
         if not addr:
@@ -693,7 +696,7 @@ def resolve(mem, start, offsets):
 
 def read_vec3(mem, addr):
     blob = mem.read(addr, 12)
-    return struct.unpack("<fff", blob) if blob else None
+    return struct.unpack("<fff", blob) if blob and len(blob) == 12 else None
 
 
 def player_position(mem, chain=None):
@@ -1029,7 +1032,7 @@ def object_headers(mem, addr, back=0x600):
         if q1 or not (0x10000 < q0 < 0x7FFFFFFFFFFF):
             continue
         probe = mem.read(q0, 8)
-        if not probe:
+        if not probe or len(probe) != 8:
             continue
         inner = struct.unpack("<Q", probe)[0]
         if 0x10000 < inner < 0x7FFFFFFFFFFF:
@@ -1074,7 +1077,7 @@ def entity_class(mem, pos_addr, verbose=True):
         good = 0
         for o in objs:
             blob = mem.read(o + off, 12)
-            if not blob:
+            if not blob or len(blob) != 12:
                 continue
             x, y, z = struct.unpack("<fff", blob)
             if (all(abs(v) < POS_MAX for v in (x, y, z)) and abs(y) < 3000
@@ -1098,7 +1101,7 @@ def entities(mem, class_ptr, off):
     out = []
     for o in instances_of(mem, class_ptr):
         blob = mem.read(o + off, 12)
-        if not blob:
+        if not blob or len(blob) != 12:
             continue
         x, y, z = struct.unpack("<fff", blob)
         if not all(abs(v) < POS_MAX for v in (x, y, z)):
@@ -1143,10 +1146,20 @@ ARRAY_DATA = 0x20              # IL2CPP array: first element
 
 def read_ptr(mem, addr):
     blob = mem.read(addr, 8)
-    if not blob:
+    if not blob or len(blob) != 8:
         return 0
     p = struct.unpack("<Q", blob)[0]
     return p if 0x10000 < p < 0x7FFFFFFFFFFF else 0
+
+
+def network_object_id(mem, unit):
+    """FishNet ObjectId for a unit, stable across managed pointer changes."""
+    obj = read_ptr(mem, unit + UNIT_NETWORK_OBJECT)
+    blob = mem.read(obj + NETWORK_OBJECT_ID, 4) if obj else None
+    if not blob or len(blob) != 4:
+        return None
+    value = struct.unpack("<i", blob)[0]
+    return value if value >= 0 and value != NETWORK_OBJECT_ID_UNSET else None
 
 
 def cs_string(mem, ptr, cap=128):
@@ -1154,13 +1167,14 @@ def cs_string(mem, ptr, cap=128):
     if not ptr:
         return None
     blob = mem.read(ptr + 0x10, 4)
-    if not blob:
+    if not blob or len(blob) != 4:
         return None
     n = struct.unpack("<i", blob)[0]
     if not 0 < n < cap:
         return None
     chars = mem.read(ptr + 0x14, n * 2)
-    return chars.decode("utf-16-le", "replace") if chars else None
+    return (chars.decode("utf-16-le", "replace")
+            if chars and len(chars) == n * 2 else None)
 
 
 def monster_id(mem, unit):
@@ -1182,7 +1196,7 @@ def unit_health(mem, unit):
     if not health:
         return None
     blob = mem.read(health + HEALTH_CURRENT, 4)
-    return struct.unpack("<i", blob)[0] if blob else None
+    return struct.unpack("<i", blob)[0] if blob and len(blob) == 4 else None
 
 
 def unit_invisible(mem, unit):
@@ -1190,7 +1204,8 @@ def unit_invisible(mem, unit):
     status = read_ptr(mem, unit + UNIT_STATUS)
     flags = read_ptr(mem, status + STATUS_FLAGS) if status else 0
     blob = mem.read(flags + SYNCVAR_VALUE, 4) if flags else None
-    return bool(blob and struct.unpack("<I", blob)[0] & STATUS_INVISIBLE)
+    return bool(blob and len(blob) == 4
+                and struct.unpack("<I", blob)[0] & STATUS_INVISIBLE)
 
 
 def worth_fighting(mem, unit):
@@ -1208,7 +1223,7 @@ def worth_fighting(mem, unit):
     if not health:
         return False
     blob = mem.read(health + HEALTH_CURRENT, 4)
-    return bool(blob) and struct.unpack("<i", blob)[0] > 0
+    return bool(blob and len(blob) == 4) and struct.unpack("<i", blob)[0] > 0
 
 
 def monster_target_state(mem, unit):
@@ -1264,7 +1279,7 @@ def list_items(mem, lst, cap=64):
         return []
     arr = read_ptr(mem, lst + LIST_ITEMS)
     size = mem.read(lst + LIST_SIZE, 4)
-    if not arr or not size:
+    if not arr or not size or len(size) != 4:
         return []
     n = min(struct.unpack("<i", size)[0], cap)
     out = []
@@ -1501,14 +1516,14 @@ def summoned_by_players(mem, players):
     return out
 
 
-def world_units(mem, regions=None):
+def world_units(mem, regions=None, classes=None):
     """[(kind, unit, x, y, z)] for every unit the client is tracking.
 
     kind is 'monster', 'pet' or 'player'. No heuristics: class pointers identify
     the unit type, while player ActiveSummons lists identify pets even when a
     pet's own _Summoner pointer is unexpectedly null.
     """
-    cls = type_classes(mem)
+    cls = type_classes(mem) if classes is None else classes
     if not cls.get("monster"):
         return []
     rows = []
