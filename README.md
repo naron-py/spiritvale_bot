@@ -1,5 +1,9 @@
 # spiritvale-bot
 
+> Returning to the project or recreating the bot? Start with
+> [`BOT_REFERENCE.md`](BOT_REFERENCE.md) for the current feature map, lifecycle,
+> architecture, safety invariants, troubleshooting flow, and rebuild checklist.
+
 Combat bot for SpiritVale. Walks the character to the nearest monster with the left
 stick, holds the attack button, taps a spam button on a fast timer, and recasts a
 d-pad buff sequence on a slow one. Everything runs while the chase continues — the
@@ -142,18 +146,17 @@ quietly ignoring you.
 ## Farming one area only
 
 By default the bot roams wherever the kills lead. To keep it on one patch of
-ground, walk that ground once and record it:
+ground, record an exact polygon or circle:
 
 ```
-python minimap_bot.py --record lunaris     # walk the area, press End to save
+python minimap_bot.py --record             # guided shape/name/radius workflow
 python minimap_bot.py --area lunaris       # run confined to it
 ```
 
-Recording reads only your own position -- no gamepad, no calibration. The first
-heap sweep takes about 15 seconds before it starts following you. Everything
-within about 6 units either side of your path is recorded, so one walk down the
-middle of a field covers it; recording the same name again adds to it rather
-than replacing it, so a big area can be walked over several sessions.
+The recorder first asks for polygon or circle, then the area name, then the radius
+for a circle. Polygon points and circle centers come from your read-only world
+position; the recorder does not drive the gamepad. Re-recording a name replaces it
+only after the new recording finishes successfully.
 
 With `--area` set, the bot never targets a monster or an item outside the area,
 walks back in if it ends up outside, and wanders inside it when nothing is left
@@ -161,8 +164,8 @@ to kill. Areas live in `areas.json`.
 
 One caveat worth knowing: nothing in the game tells the bot which map it is on,
 so `--area` pointed at an area recorded on a *different* map would put "home"
-thousands of units away. It notices that and turns the confinement off with a
-message rather than walking into scenery for an hour.
+thousands of units away. It detects the implausible distance and holds safely;
+it never disables confinement and starts roaming.
 
 ## Diagnostics
 
@@ -176,7 +179,7 @@ message rather than walking into scenery for an hour.
 | `--probe` | Presses every X360 button in turn, named, to find a mapping. |
 | `--press` | Fires one control at a time on the Arduino, typed in by hand. |
 | `--relogin [--dry]` | Handles the login screen showing now. `--dry` looks without clicking. |
-| `--record <name>` | Records a farming area: walk the ground, End saves it. |
+| `--record` | Guided polygon/circle recorder using read-only world position. |
 | `--targetlog` | One line each time the chased monster changes. |
 | `python memscan.py --demo` | Memory layer self-check. No game needed. |
 | `python memscan.py --units` | What the unit sweep classifies right now: monsters, players, pets. |
