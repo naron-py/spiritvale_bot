@@ -14,3 +14,7 @@ areas.json
 
 # local agent state
 .hermes/
+
+# desktop UI runtime state
+ui_bot/logs/
+ui_bot/state/

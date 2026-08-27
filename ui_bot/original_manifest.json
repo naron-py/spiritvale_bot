@@ -1,0 +1,342 @@
+{
+  "schema": 1,
+  "root": "C:\\Users\\Fade\\Desktop\\spiritvale-bot-main-memory\\spiritvale-bot",
+  "note": "Pre-UI baseline. Generated runtime state and caches excluded.",
+  "files": [
+    {
+      "path": ".gitignore",
+      "size": 202,
+      "sha256": "6438998fa529bddcd462325a918f2f3021177bb5ade96692ed27765328d63e9f"
+    },
+    {
+      "path": "area_editor.py",
+      "size": 12663,
+      "sha256": "03d8649e4d368ee9331ddfc1ded44e063d1333fc1dbbadd8b6b771b95930dcce"
+    },
+    {
+      "path": "bepinex/bin/SpiritValeBot.deps.json",
+      "size": 431,
+      "sha256": "99e1c63333f0b1c8da3b598e78c87f728b715ccbf039c6154c8869a283c9536c"
+    },
+    {
+      "path": "bepinex/bin/SpiritValeBot.dll",
+      "size": 8704,
+      "sha256": "fdaf9dde726035057286de7d06153577e67361d63b96902d8c86f1199d9c0b96"
+    },
+    {
+      "path": "bepinex/bin/SpiritValeBot.pdb",
+      "size": 11388,
+      "sha256": "5d01a73223d0bec75c47a55554cc274f223ec7b3798301ea1209170c79818f0c"
+    },
+    {
+      "path": "bepinex/obj/project.assets.json",
+      "size": 2444,
+      "sha256": "aa266d1c1e67732e357795cb0242079834367f257cfe50bfbcafc6e47060c7ba"
+    },
+    {
+      "path": "bepinex/obj/project.nuget.cache",
+      "size": 639,
+      "sha256": "944ac0842cb7f0c8c8a9460d8d8e4674b4a9efc4b3c4f33318c47e20dfefaacf"
+    },
+    {
+      "path": "bepinex/obj/Release/.NETCoreApp,Version=v6.0.AssemblyAttributes.cs",
+      "size": 198,
+      "sha256": "f55a8701535cd25190399fe9b11bdb60ecd686ece28c49157ec692fbc2a1c078"
+    },
+    {
+      "path": "bepinex/obj/Release/ref/SpiritValeBot.dll",
+      "size": 6144,
+      "sha256": "dd2f6ba2c0f8b323787b8174146cb236833c27c1a9af4b567f07168f14871a45"
+    },
+    {
+      "path": "bepinex/obj/Release/refint/SpiritValeBot.dll",
+      "size": 6144,
+      "sha256": "dd2f6ba2c0f8b323787b8174146cb236833c27c1a9af4b567f07168f14871a45"
+    },
+    {
+      "path": "bepinex/obj/Release/SpiritValeBot.AssemblyInfo.cs",
+      "size": 1015,
+      "sha256": "844cb7d02e1c8e49569ff1343380cf0d5fa9c12329f83adf53eb0ad89dcb4dd4"
+    },
+    {
+      "path": "bepinex/obj/Release/SpiritValeBot.AssemblyInfoInputs.cache",
+      "size": 66,
+      "sha256": "e9ac63748eeb01b05eff0ac480fb58fc40351f2950d85893fba20566d0a7e081"
+    },
+    {
+      "path": "bepinex/obj/Release/SpiritValeBot.assets.cache",
+      "size": 151,
+      "sha256": "a1d07e2a955440d4b649b79e0fe768bdbf6319fc9c0d0337f373c4e6b5619a8d"
+    },
+    {
+      "path": "bepinex/obj/Release/SpiritValeBot.csproj.AssemblyReference.cache",
+      "size": 16061,
+      "sha256": "93d4e695fa76821bde5fee6c2b58ba2b6f79486a4e4046e4a367ddf455a698fa"
+    },
+    {
+      "path": "bepinex/obj/Release/SpiritValeBot.csproj.CoreCompileInputs.cache",
+      "size": 66,
+      "sha256": "bfceb1e3c6e31530cd20930165e8541881914067e4917afd665b9c7393690555"
+    },
+    {
+      "path": "bepinex/obj/Release/SpiritValeBot.csproj.FileListAbsolute.txt",
+      "size": 1469,
+      "sha256": "d931a24783dd3ba7666a94ede1edc266ed1450ffb054365f2604fbe4c6ab8c6b"
+    },
+    {
+      "path": "bepinex/obj/Release/SpiritValeBot.dll",
+      "size": 8704,
+      "sha256": "fdaf9dde726035057286de7d06153577e67361d63b96902d8c86f1199d9c0b96"
+    },
+    {
+      "path": "bepinex/obj/Release/SpiritValeBot.GeneratedMSBuildEditorConfig.editorconfig",
+      "size": 716,
+      "sha256": "eece50ce84ecce95f8ee9d8a4100a6a941a7df26db687712da77a0df849fc8df"
+    },
+    {
+      "path": "bepinex/obj/Release/SpiritValeBot.pdb",
+      "size": 11388,
+      "sha256": "5d01a73223d0bec75c47a55554cc274f223ec7b3798301ea1209170c79818f0c"
+    },
+    {
+      "path": "bepinex/obj/Release/SpiritValeBot.sourcelink.json",
+      "size": 192,
+      "sha256": "870a421a39b0e31043ef2f9145e5ecb00c0ab02de90e907d46a424414aacde62"
+    },
+    {
+      "path": "bepinex/obj/SpiritValeBot.csproj.nuget.dgspec.json",
+      "size": 2640,
+      "sha256": "473e7d674058d16e13f5bc7f0eee05b9d8429bbc42ea4d3c8b6bf6d5dc2ae409"
+    },
+    {
+      "path": "bepinex/obj/SpiritValeBot.csproj.nuget.g.props",
+      "size": 1134,
+      "sha256": "d8db959e33509dd2183644e3a4e00797934aa0359a9026ddd9ca511fdc4d2961"
+    },
+    {
+      "path": "bepinex/obj/SpiritValeBot.csproj.nuget.g.targets",
+      "size": 150,
+      "sha256": "971cc9b535384849b5c661d776cd7a80833a416265e32e8968e06c367368b8b5"
+    },
+    {
+      "path": "bepinex/refs/0Harmony.dll",
+      "size": 264192,
+      "sha256": "6c898933b52149e8bcf6722305c7e4d94add47c9e53b364096f91721624c0877"
+    },
+    {
+      "path": "bepinex/refs/Assembly-CSharp.dll",
+      "size": 3228672,
+      "sha256": "e1dc757bec8640dfb69950a71fe1f99c3a9c1535c57bd32b82e18e2e39655574"
+    },
+    {
+      "path": "bepinex/refs/BepInEx.Core.dll",
+      "size": 132096,
+      "sha256": "25098c1d5d71341c0dc07184a06ce3a43f8c2398249741e31cdd7946d1ab27f2"
+    },
+    {
+      "path": "bepinex/refs/BepInEx.Unity.Common.dll",
+      "size": 12800,
+      "sha256": "84094e568d3941268bfb9538fcbcc3d053654476b706756da0b9e0f9d25a9c70"
+    },
+    {
+      "path": "bepinex/refs/BepInEx.Unity.IL2CPP.dll",
+      "size": 75776,
+      "sha256": "d77b1d354f74db1602ed4dc10b4f0ec204387e483672cd5b66a65eda223930d1"
+    },
+    {
+      "path": "bepinex/refs/FishNet.Runtime.dll",
+      "size": 949760,
+      "sha256": "237b1e5d9c0751b7d5036f706cc5d84d9af78b7ab28ede62f97e14f4f8cf4c0b"
+    },
+    {
+      "path": "bepinex/refs/Il2CppInterop.Common.dll",
+      "size": 40448,
+      "sha256": "6d8df18b3fe8181a4595865a1d85a52dd46ef7cc3f4dbc57a329f5c40a7a22a6"
+    },
+    {
+      "path": "bepinex/refs/Il2CppInterop.Runtime.dll",
+      "size": 275456,
+      "sha256": "e4badd01da4a5e6251a040f683f96eb3635e6e4783f761946436ad04471f81f0"
+    },
+    {
+      "path": "bepinex/refs/SemanticVersioning.dll",
+      "size": 34816,
+      "sha256": "a5b57607225a0ebde049e93469f49e5b2d07a7d602a03864ce3a72ccf57103a2"
+    },
+    {
+      "path": "bepinex/refs/UnityEngine.CoreModule.dll",
+      "size": 1662976,
+      "sha256": "124e1ffb32204bb7d3c20f9e988290c5f22f55ce83880b872f720b6db9d2dcea"
+    },
+    {
+      "path": "bepinex/refs/UnityEngine.dll",
+      "size": 2048,
+      "sha256": "7234c48ef78b501c5a6f933c319e53aec2138bb7250d2027abc35d45ca1fa98f"
+    },
+    {
+      "path": "bepinex/SpiritValeBot.csproj",
+      "size": 2145,
+      "sha256": "c0b919ddeb23d206cb06cc75dc7b42328c67a57e5911bcca917c2ea9ab7b61a4"
+    },
+    {
+      "path": "bepinex/SpiritValeBotPlugin.cs",
+      "size": 7702,
+      "sha256": "3bab928fe4b12e65b0db9a97c29f3fe0cdbd1a078b8a1798b21303fb5a1801f8"
+    },
+    {
+      "path": "BOT_REFERENCE.md",
+      "size": 27503,
+      "sha256": "abe73c30f5ec573ec8c93a77b8115755e722cb9f67e89eb4d20ab9f029391d4d"
+    },
+    {
+      "path": "CHANGELOG.md",
+      "size": 7554,
+      "sha256": "c334da931bac6396fb660730aac74654f60cab0095121d4362bafc64e1d49d7b"
+    },
+    {
+      "path": "CLAUDE.md",
+      "size": 50221,
+      "sha256": "3be96d26f8136dbc878c820ef50b3c4cfeaa6ce252ebfda9614b78ee204b001c"
+    },
+    {
+      "path": "farming_zone.py",
+      "size": 11785,
+      "sha256": "961f2d633e99ccb53fe722fdfd882ce65be3487cfcbe024e7a53391b95f0a38d"
+    },
+    {
+      "path": "fight.txt",
+      "size": 1021618,
+      "sha256": "af95272e1820a878de071a608fc52bc9df028cb2ac72fb298379276438253d66"
+    },
+    {
+      "path": "loot_names.txt",
+      "size": 426,
+      "sha256": "e1fdf10d3c325d5b0a57bd761c8e44cc5ce5a749fcaff72daa7c337e47bb7b0c"
+    },
+    {
+      "path": "memscan.py",
+      "size": 98967,
+      "sha256": "893a057426afa52bbf9b8705e9ec40eb9cb2377c59e29f39d51bc4fad0a5f0fa"
+    },
+    {
+      "path": "MIGRATION_AUDIT.md",
+      "size": 27973,
+      "sha256": "230df9e28a50a3fe05177365e39631424cad93e65cf95dd07dd8d8cb8a3468dd"
+    },
+    {
+      "path": "minimap_bot.py",
+      "size": 313745,
+      "sha256": "b7ba1351f0fc421083cbfa94a53ff9fa522dcc531f740e88897c8665cf62e5d0"
+    },
+    {
+      "path": "minimap_navigator.py",
+      "size": 12238,
+      "sha256": "c33b3eba2d1d00ebc26c85c208fac4339be98170f80e3a8a13f41f4bf05c866d"
+    },
+    {
+      "path": "pad_press.py",
+      "size": 1517,
+      "sha256": "3f5b6c5fcdcb85046787395dfe102c4db8da02efdf4617d1cd8673772f89dbd5"
+    },
+    {
+      "path": "place_circle_area.bat",
+      "size": 613,
+      "sha256": "0ba7f326d880192505cb59b315e936c61fba3c43630253070f0ed2af87d53d99"
+    },
+    {
+      "path": "README.md",
+      "size": 18261,
+      "sha256": "e9124c9ac998fee39992c3d52ac486940a1a08ed34dad44567e407bc7e5d286b"
+    },
+    {
+      "path": "record_farming_zone.bat",
+      "size": 86,
+      "sha256": "ae1a4136071e92a7279fab1eddb8ab66e13c6fb5c019bb5a0e331d8841a0a27c"
+    },
+    {
+      "path": "requirements.txt",
+      "size": 58,
+      "sha256": "40785ffec08288e362d1a4283b54c0cabb9cc2460d092b922f825c022f305735"
+    },
+    {
+      "path": "sea_row.png",
+      "size": 5130,
+      "sha256": "569ece66773ac4837f273adbe844915ba6d90d6de01a111d61e450d0e03f2afd"
+    },
+    {
+      "path": "tests/test_area_integration.py",
+      "size": 5447,
+      "sha256": "10f6db68d3aeda1315a509fcf3c3de35398450503a9c25696bce48ffe370523d"
+    },
+    {
+      "path": "tests/test_dashboard.py",
+      "size": 3954,
+      "sha256": "94e546f15add24d0f0b7e6b9bbab60f1890aac2f889bc4e70ee359d419063783"
+    },
+    {
+      "path": "tests/test_farming_zone.py",
+      "size": 3944,
+      "sha256": "fa26140b50eb418a46fbc116f7ba7c5fffedf1f69f6262d4ecc894130d95665c"
+    },
+    {
+      "path": "tests/test_network_identity.py",
+      "size": 1858,
+      "sha256": "0ca0c52b60f48119cac499bb320212d76a0111b4e3acb3e234dc73852326d5bb"
+    },
+    {
+      "path": "tests/test_state_conflicts.py",
+      "size": 23418,
+      "sha256": "9e61cd369c30c420171d60958b34ca38128752915b5cb8d96da9ca274aab8642"
+    },
+    {
+      "path": "tests/test_zone_recorder.py",
+      "size": 6996,
+      "sha256": "b13b1b1938f1bc5dd6da5c3237ff90751a8a4148236a9206211b5a303f70a8c8"
+    },
+    {
+      "path": "tools/background_activation_controller_test.py",
+      "size": 18378,
+      "sha256": "6bbefb864a3e56e5596bc783dd828297f5fb6137ef4aa0f33fc1d148f95724a6"
+    },
+    {
+      "path": "tools/background_controller_test.py",
+      "size": 23739,
+      "sha256": "3a65c624fd8ddcb8d706c212eefd4631f21994c1e25479d08320c3351cf47154"
+    },
+    {
+      "path": "tools/background_window_message_test.py",
+      "size": 20842,
+      "sha256": "844ea86badd4f26977ae78c3caa2674b06ec1be4ff11c7071f8c93611eda394b"
+    },
+    {
+      "path": "tools/restore_spiritvale_run_in_background.cmd",
+      "size": 489,
+      "sha256": "d7a8cd7e0875e48c9547db1e1bebb034df4ae7da229befc9fbafaa5e8686e3ae"
+    },
+    {
+      "path": "tools/spiritvale_run_in_background_patch.py",
+      "size": 8621,
+      "sha256": "faf877aa7cbc3b774f1a2d76ff37a48c692d661a65448ffa845d7dbbe2525098"
+    },
+    {
+      "path": "tools/test_spiritvale_run_in_background_patch.py",
+      "size": 1354,
+      "sha256": "5130f4d727e8a29ce393d8b3087b75c239ed2aa8ab94153b8e74557af667a447"
+    },
+    {
+      "path": "UI_bot.md",
+      "size": 7268,
+      "sha256": "12ada4e8788daa7247a3e37aa0a8a121c14c070146a2c9a4b8b9f24ce3d507c6"
+    },
+    {
+      "path": "working_record_area_code.txt",
+      "size": 224077,
+      "sha256": "2a5b85366fab221bc69accb4bcef64b6809867dbfdeab3f59e18b2662606b146"
+    },
+    {
+      "path": "zone_recorder.py",
+      "size": 13020,
+      "sha256": "ce2ffebcb4c09c1aa7b6fc634ac658e76b6ea0805e943aa749d4c73d3e134222"
+    }
+  ]
+}
