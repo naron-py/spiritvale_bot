@@ -28,9 +28,6 @@ The Python memory path opens the game with read-only process rights. It calls
 game state. Character control is external through a virtual X360 controller.
 Reconnect automation uses ordinary mouse clicks.
 
-An experimental BepInEx migration is documented separately in
-`MIGRATION_AUDIT.md`; it is not the normal Python bot described here.
-
 ## 2. Safety and control
 
 - The bot starts paused: `START_PAUSED = True`.
@@ -456,7 +453,6 @@ Use semantic rows together. For example:
 | `il2cpp_rva.json` | Recovered class RVAs; generated/gitignored |
 | `tests/` | Cross-state, dashboard, identity, recorder, and area regressions |
 | `CLAUDE.md` | Detailed invariants and evidence; authoritative engineering context |
-| `MIGRATION_AUDIT.md` | Separate experimental in-process/BepInEx investigation |
 
 ## 16. Common commands
 

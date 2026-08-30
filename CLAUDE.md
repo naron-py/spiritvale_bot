@@ -14,17 +14,6 @@ what each thing *is* — monster, player, or pet — which the screen cannot tel
 first background sweep, and whenever memory targeting is unavailable. Memory access
 Memory access is read-only (`ReadProcessMemory`); nothing is written and nothing is injected.
 
-## In-process BepInEx migration (approved 2026-08-23)
-
-The user explicitly approved migrating the bot to an in-process C# + BepInEx 6
-plugin, accepting the ToS/ban risk. This **overrides** the read-only / no-injection
-constraint above for this project: the C# bot runs inside the game process via
-BepInEx + Il2CppInterop and reads (and, where actuation needs it, drives) game
-state directly. The Python bot remains the reference behavior and the fallback
-actuator during migration. See `MIGRATION_AUDIT.md` for the full audit and the
-verified IL2CPP data model. Game: Unity 6 (6000.0.64f1), IL2CPP, FishNet, no
-client-side anti-cheat.
-
 ## Commands
 
 ```
