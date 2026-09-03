@@ -134,10 +134,10 @@ class DashboardPage(SnapshotPage):
         self.zone_name = QLineEdit()
         self.zone_name.setPlaceholderText("Zone name")
         right_layout.addWidget(self.zone_name)
-        self.record_button = QPushButton("◉  RECORD ZONE")
-        self.add_button = QPushButton("◆  ADD POSITION")
+        self.record_button = QPushButton("◉  RECORD ZONE  (F6)")
+        self.add_button = QPushButton("◆  ADD POSITION  (F7)")
         self.undo_button = QPushButton("↶  UNDO")
-        self.save_button = QPushButton("▣  FINISH & SAVE")
+        self.save_button = QPushButton("▣  FINISH & SAVE  (F8)")
         self.save_button.setObjectName("save")
         self.clear_button = QPushButton("▥  CLEAR ZONE")
         self.clear_button.setObjectName("danger")
@@ -215,7 +215,9 @@ class DashboardPage(SnapshotPage):
 
     def set_draft(self, points, recording):
         self.world_view.set_draft(points)
-        self.record_button.setText("●  RECORDING" if recording else "◉  RECORD ZONE")
+        self.record_button.setText(
+            "●  RECORDING  (F7 add, F8 save)" if recording
+            else "◉  RECORD ZONE  (F6)")
         self.record_button.setChecked(recording)
         if recording or points:
             self.zone_detail.setText(f"Draft Points: {len(points)}\nAdd current player position\nFinish requires 3+ points")
@@ -293,10 +295,10 @@ class FarmingZonePage(SnapshotPage):
         self.zone_name.setPlaceholderText("New polygon name")
         form.addWidget(QLabel("Zone name"))
         form.addWidget(self.zone_name)
-        self.record_button = QPushButton("Start New Polygon")
-        self.add_button = QPushButton("Add Current Position")
+        self.record_button = QPushButton("Start New Polygon (F6)")
+        self.add_button = QPushButton("Add Current Position (F7)")
         self.undo_button = QPushButton("Undo Last Point")
-        self.save_button = QPushButton("Finish & Save")
+        self.save_button = QPushButton("Finish & Save (F8)")
         self.save_button.setObjectName("save")
         self.clear_button = QPushButton("Clear Draft")
         self.clear_button.setObjectName("danger")
@@ -333,7 +335,7 @@ class FarmingZonePage(SnapshotPage):
         self.world_view.set_draft(points)
         self.details.setText(
             f"Recording: {'YES' if recording else 'NO'}\nPoints: {len(points)}\n"
-            "Add Position samples the latest immutable player snapshot.")
+            "F7/Add Position samples the latest immutable player snapshot.")
 
     def set_recording_availability(self, available, recording, has_points,
                                    finish_ready=False, message=""):

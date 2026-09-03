@@ -1,6 +1,7 @@
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -196,9 +197,54 @@ class MainWindowTests(unittest.TestCase):
         window.resize(1280, 760)
         window.show_page("Settings")
         window.show()
+        row = page.add_buff_slot()
         _APP.processEvents()
 
+        self.assertEqual(page.controls_scroll.horizontalScrollBarPolicy(),
+                         Qt.ScrollBarAlwaysOff)
+        self.assertNotEqual(page.controls_scroll.verticalScrollBarPolicy(),
+                            Qt.ScrollBarAlwaysOff)
         self.assertEqual(page.controls_scroll.horizontalScrollBar().maximum(), 0)
+        self.assertTrue(row.remove_button.isVisible())
+        window.close()
+
+    def test_f6_f7_f8_record_add_and_save_polygon_without_clicking_ui(self):
+        window, _runtime = self.make_window()
+        window.show_page("Farming Zone")
+        window.pages["Farming Zone"].zone_name.setText("keyboard-zone")
+        engine = DemoEngine()
+        events = []
+
+        def state(vk):
+            if events and events[0] == vk:
+                events.pop(0)
+                return 1
+            return 0
+
+        window._zone_hotkey_state = state
+        window.apply_snapshot(engine.next_snapshot(True))
+        events.append(0x75)  # F6: start recording
+        window._poll_zone_hotkeys()
+        self.assertTrue(window._recording)
+
+        for expected in range(1, 4):
+            window.apply_snapshot(engine.next_snapshot(True))
+            events.append(0x76)  # F7: add current player position
+            window._poll_zone_hotkeys()
+            self.assertEqual(len(window.draft.points), expected)
+
+        events.append(0x77)  # F8: finish and save
+        window._poll_zone_hotkeys()
+
+        self.assertFalse(window._recording)
+        saved = json.loads((window.project_root / "areas.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual(saved["selected_area"], "keyboard-zone")
+        self.assertEqual(
+            saved["areas"]["keyboard-zone"],
+            {"shape": "polygon", "axes": "xz",
+             "points": [list(point) for point in window.saved_zone.points]},
+        )
         window.close()
 
     def test_invalid_active_binding_names_conflicting_slots(self):

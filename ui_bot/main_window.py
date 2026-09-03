@@ -245,6 +245,39 @@ class MainWindow(QMainWindow):
         self.end_shortcut = QShortcut(QKeySequence("End"), self)
         self.end_shortcut.setContext(Qt.ApplicationShortcut)
         self.end_shortcut.activated.connect(self.end_hotkey)
+        self.zone_record_shortcut = self._zone_shortcut("F6", self.start_recording)
+        self.zone_add_shortcut = self._zone_shortcut("F7", self.add_position)
+        self.zone_finish_shortcut = self._zone_shortcut("F8", self.finish_zone)
+        self._zone_hotkey_state = self._make_zone_hotkey_state()
+        self.zone_hotkey_timer = QTimer(self)
+        self.zone_hotkey_timer.setInterval(50)
+        self.zone_hotkey_timer.timeout.connect(self._poll_zone_hotkeys)
+        self.zone_hotkey_timer.start()
+
+    def _zone_shortcut(self, key, handler):
+        shortcut = QShortcut(QKeySequence(key), self)
+        shortcut.setContext(Qt.ApplicationShortcut)
+        shortcut.activated.connect(handler)
+        return shortcut
+
+    @staticmethod
+    def _make_zone_hotkey_state():
+        try:
+            import ctypes
+            return ctypes.windll.user32.GetAsyncKeyState
+        except Exception:
+            return None
+
+    def _poll_zone_hotkeys(self):
+        """Global F6/F7/F8 recorder keys for hands-off point sampling."""
+        if self._zone_hotkey_state is None or self._closing:
+            return
+        active_here = QApplication.activeWindow() is not None
+        for vk, handler in ((0x75, self.start_recording),
+                            (0x76, self.add_position),
+                            (0x77, self.finish_zone)):
+            if self._zone_hotkey_state(vk) & 1 and not active_here:
+                handler()
 
     def _connect_runtime(self):
         signals = self.runtime.signals
