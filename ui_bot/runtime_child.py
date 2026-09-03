@@ -1,9 +1,8 @@
-"""Child-process bridge around the unchanged terminal bot.
+"""Child-process bridge around the terminal bot.
 
-The original module is imported, never edited. In this child only, its End-key
-edge and terminal dashboard are replaced with command-queue and JSON-snapshot
-adapters. The real main loop, target arbitration, safety gates, and pad cleanup
-remain the original implementations.
+Narrow state-request and dashboard hooks provide command-queue and JSON-snapshot
+adapters. Target arbitration, safety gates, and pad cleanup remain the terminal
+implementations.
 """
 
 from __future__ import annotations
@@ -25,6 +24,8 @@ from .readiness import evaluate_start_readiness, normalize_mode
 
 SNAPSHOT_PREFIX = "@@UI_SNAPSHOT "
 EVENT_PREFIX = "@@UI_EVENT "
+PLAYER_READ_TTL_S = 2.0
+SCAN_DELAY_TIMEOUT_S = 30.0
 
 
 class StopRequested(KeyboardInterrupt):
@@ -36,19 +37,31 @@ class StopRequested(KeyboardInterrupt):
 
 
 class CommandGate:
-    ALLOWED = frozenset(("resume", "pause", "toggle", "stop", "emergency"))
+    ALLOWED = frozenset(("resume", "pause", "toggle", "stop", "emergency",
+                         "configure", "memory_wait", "memory_recovered"))
 
-    def __init__(self, event: Callable[[str], None] | None = None):
+    def __init__(self, event: Callable[[str], None] | None = None,
+                 controller_config=None):
         self._lock = threading.Lock()
         self._desired = None
         self._observed = False
         self._stop = None
+        self._memory_wait = False
+        self._internal_pending = None
+        self._physical_toggle_version = 0
         self._can_start = False
         self._start_mode = "waiting"
         self._start_reason = "Waiting for targeting readiness."
+        self._monitor_at = time.monotonic()
+        self._last_player_read = 0.0
+        self._last_entity_scan = 0.0
+        self._scan_in_progress = False
+        self._scan_started_at = 0.0
+        self._controller_config = dict(controller_config or {})
+        self._controller_config_pending = bool(controller_config)
         self.event = event or (lambda _message: None)
 
-    def submit(self, command: str) -> bool:
+    def submit(self, command: str, config=None) -> bool:
         command = str(command).strip().lower()
         if command not in self.ALLOWED:
             self.event(f"ignored invalid command {command!r}")
@@ -56,14 +69,40 @@ class CommandGate:
         with self._lock:
             if command in ("stop", "emergency"):
                 self._stop = command
+            elif command == "configure":
+                if not isinstance(config, dict):
+                    self.event("ignored invalid controller configuration")
+                    return False
+                self._controller_config = json.loads(json.dumps(config))
+                self._controller_config_pending = True
+            elif command == "memory_wait":
+                if not self._memory_wait:
+                    self._memory_wait = True
+                    self._internal_pending = "wait"
+            elif command == "memory_recovered":
+                if self._memory_wait:
+                    self._memory_wait = False
+                    if self._desired:
+                        self._internal_pending = "running"
             elif command == "resume":
+                self._memory_wait = False
+                self._internal_pending = None
                 self._desired = True
             elif command == "pause":
+                self._memory_wait = False
+                self._internal_pending = None
                 self._desired = False
             else:
                 base = self._observed if self._desired is None else self._desired
                 self._desired = not base
         return True
+
+    def poll_controller_config(self):
+        with self._lock:
+            if not self._controller_config_pending:
+                return None
+            self._controller_config_pending = False
+            return json.loads(json.dumps(self._controller_config))
 
     def observe(self, running: bool):
         with self._lock:
@@ -73,8 +112,11 @@ class CommandGate:
 
     def poll_toggle(self) -> bool:
         with self._lock:
+            self._monitor_at = time.monotonic()
             if self._stop is not None:
                 raise StopRequested(self._stop)
+            if self._memory_wait:
+                return False
             if self._desired is None or self._desired == self._observed:
                 return False
             # Optimistic reconciliation prevents another poll from issuing the
@@ -82,25 +124,68 @@ class CommandGate:
             self._observed = self._desired
             return True
 
+    def poll_internal(self):
+        with self._lock:
+            action = self._internal_pending
+            self._internal_pending = None
+            if action == "wait":
+                self._observed = False
+            elif action == "running":
+                self._observed = True
+            return action
+
     def set_start_readiness(self, can_start, mode, reason):
         with self._lock:
             self._can_start = bool(can_start)
             self._start_mode = normalize_mode(mode)
             self._start_reason = str(reason)
 
+    def update_health(self, world):
+        with self._lock:
+            self._monitor_at = time.monotonic()
+            self._last_player_read = float(world.get("player_read_at", 0.0) or 0.0)
+            self._last_entity_scan = float(
+                world.get("last_scan_completed_at", 0.0) or 0.0)
+            self._scan_in_progress = bool(world.get("scan_in_progress", False))
+            self._scan_started_at = float(world.get("scan_started_at", 0.0) or 0.0)
+
+    def heartbeat(self):
+        with self._lock:
+            return {
+                "type": "heartbeat", "at": time.monotonic(),
+                "monitor_loop_alive": time.monotonic() - self._monitor_at < 3.0,
+                "last_player_read": self._last_player_read,
+                "last_entity_scan": self._last_entity_scan,
+                "scan_in_progress": self._scan_in_progress,
+                "scan_started_at": self._scan_started_at,
+            }
+
     def allow_hotkey_toggle(self) -> bool:
         """Use the same readiness gate as UI START; stopping is always allowed."""
         with self._lock:
             if self._observed:
+                self._desired = False
+                self._physical_toggle_version += 1
                 return True
             allowed = self._can_start
             mode = self._start_mode
-            reason = self._start_reason
+            reason = ("memory recovery is waiting for a fresh scan"
+                      if self._memory_wait else self._start_reason)
+            if allowed:
+                self._memory_wait = False
+                self._internal_pending = None
+                self._desired = True
+                self._physical_toggle_version += 1
         if allowed:
             self.event(f"End hotkey starting {mode.upper()} mode")
             return True
         self.event(f"End hotkey start blocked: {reason}")
         return False
+
+    @property
+    def physical_toggle_version(self) -> int:
+        with self._lock:
+            return self._physical_toggle_version
 
 
 def _safe_point(value):
@@ -152,7 +237,7 @@ def _read_player(eyes, owner, units):
             raw = reader([owner]).get(owner)
         except (OSError, TypeError, ValueError, struct.error) as exc:
             error = str(exc)
-    if raw is None:
+    if raw is None and not callable(reader):
         owner_row = next((row for row in units
                           if isinstance(row, (list, tuple)) and len(row) >= 5
                           and row[1] == owner), None)
@@ -296,6 +381,7 @@ class ScanEntityCache:
         self._world = None
         self._scan_at = 0.0
         self._had_player = False
+        self._player_read_version = 0
 
     def capture(self, eyes, now=None):
         now = time.time() if now is None else float(now)
@@ -309,23 +395,72 @@ class ScanEntityCache:
                      "inside_zone": 0, "valid_targets": 0,
                      "connection_state": "DISCONNECTED", "error": ""}
             return world, self._key is not None
-        with eyes.lock:
-            version = int(getattr(eyes, "scan_passes", 0))
-            units = list(getattr(eyes, "units", ()))
-            report = dict(getattr(eyes, "scan_summary", {}))
-            ignored = dict(getattr(eyes, "ignored", {}))
-            ignored_ids = dict(getattr(eyes, "ignored_ids", {}))
-            owner = getattr(eyes, "me", None) or getattr(eyes, "owner", None)
-            chasing = getattr(eyes, "chasing", None)
-            chasing_id = getattr(eyes, "chasing_id", None)
-            target_name = getattr(eyes, "target_name", "")
-            area = getattr(eyes, "area", None)
-            route_source = list(getattr(eyes, "path", ()) or ())
-            scan_error = str(getattr(eyes, "scan_error", ""))
-            fight_ok = dict(getattr(eyes, "fight_ok", {}))
+        coherent = False
+        for _attempt in range(2):
+            with eyes.lock:
+                generation = int(getattr(eyes, "generation", 0))
+                version = int(getattr(
+                    eyes, "scan_version", getattr(eyes, "scan_passes", 0)))
+                units = list(getattr(eyes, "units", ()))
+                report = dict(getattr(eyes, "scan_summary", {}))
+                ignored = dict(getattr(eyes, "ignored", {}))
+                ignored_ids = dict(getattr(eyes, "ignored_ids", {}))
+                owner = getattr(eyes, "me", None) or getattr(eyes, "owner", None)
+                chasing = getattr(eyes, "chasing", None)
+                chasing_id = getattr(eyes, "chasing_id", None)
+                target_name = getattr(eyes, "target_name", "")
+                area = getattr(eyes, "area", None)
+                route_source = list(getattr(eyes, "path", ()) or ())
+                scan_error = str(getattr(eyes, "scan_error", ""))
+                fight_ok = dict(getattr(eyes, "fight_ok", {}))
+                scan_in_progress = bool(
+                    getattr(eyes, "scan_in_progress", False))
+                scan_started_at = float(
+                    getattr(eyes, "scan_started_at", 0.0) or 0.0)
+                last_scan_completed_at = float(
+                    getattr(eyes, "last_scan_completed_at", 0.0) or 0.0)
+                scanner = getattr(eyes, "scanner", None)
+                scanner_alive = bool(
+                    scanner is not None and scanner.is_alive())
+            player_raw, player, player_valid, player_error = _read_player(
+                eyes, owner, units)
+            self._player_read_version += 1
+            with eyes.lock:
+                current_version = int(getattr(
+                    eyes, "scan_version", getattr(eyes, "scan_passes", 0)))
+                current_owner = (getattr(eyes, "me", None)
+                                 or getattr(eyes, "owner", None))
+                coherent = bool(
+                    generation == int(getattr(eyes, "generation", 0))
+                    and version == current_version
+                    and owner == current_owner)
+            if coherent:
+                break
+        if not coherent:
+            player_raw = player = None
+            player_valid = False
+            player_error = "memory generation changed during player read"
         key = (id(eyes), version, owner, chasing, chasing_id)
         if key == self._key and self._world is not None:
-            return self._world, False
+            world = dict(self._world)
+            target = None if world["target"] is None else dict(world["target"])
+            if target is not None:
+                target["distance"] = (None if player is None else math.hypot(
+                    float(target["x"]) - player[0],
+                    float(target["z"]) - player[1]))
+            world.update(
+                player=player, player_raw=player_raw,
+                player_valid=player_valid, player_error=player_error,
+                player_read_at=now,
+                player_read_version=self._player_read_version,
+                scan_in_progress=scan_in_progress,
+                scan_started_at=scan_started_at,
+                scanner_alive=scanner_alive,
+                last_scan_completed_at=last_scan_completed_at,
+                target=target,
+            )
+            self._world = world
+            return world, False
         if self._key is not None and self._key[0] != id(eyes):
             self._had_player = False
         if (self._key is None or self._key[0] != id(eyes)
@@ -344,8 +479,6 @@ class ScanEntityCache:
                     selected[-1] = current_row
             rows = selected
         raw_entities = []
-        player_raw, player, player_valid, player_error = _read_player(
-            eyes, owner, units)
         hostile = sum(1 for row in units
                       if isinstance(row, (list, tuple)) and row
                       and row[0] == "monster")
@@ -433,6 +566,12 @@ class ScanEntityCache:
             "version": version, "captured_at": self._scan_at, "player": player,
             "player_raw": player_raw, "player_valid": player_valid,
             "player_error": player_error,
+            "player_read_at": now,
+            "player_read_version": self._player_read_version,
+            "scan_in_progress": scan_in_progress,
+            "scan_started_at": scan_started_at,
+            "scanner_alive": scanner_alive,
+            "last_scan_completed_at": last_scan_completed_at,
             "entities": entities, "target": target, "zone": zone,
             "route": tuple(point for item in route_source
                            if (point := _safe_point(item)) is not None),
@@ -451,8 +590,8 @@ def build_snapshot(info: dict[str, Any], eyes, sequence: int,
                    max_entities: int = 250, scan_cache=None,
                    scan_world=None, scan_is_new=None, process_id=None,
                    session_id="", preferred_mode="memory",
-                   pixel_ready=False, pixel_error="") -> dict[str, Any]:
-    now = time.time()
+                   pixel_ready=False, pixel_error="", now=None) -> dict[str, Any]:
+    now = time.time() if now is None else float(now)
     if scan_world is None:
         cache = scan_cache or ScanEntityCache(max_entities)
         scan_world, captured_new = cache.capture(eyes, now)
@@ -469,9 +608,22 @@ def build_snapshot(info: dict[str, Any], eyes, sequence: int,
         int(process_id or 0) > 0 and str(session_id)) if has_session_metadata else True
     fresh_player = bool(scan_world.get("player_valid", player is not None)
                         and player is not None
-                        and now - scan_world["captured_at"] <= 5.0)
+                        and now - float(scan_world.get("player_read_at", 0.0))
+                        <= PLAYER_READ_TTL_S)
+    scanner_alive = bool(scan_world.get("scanner_alive", False))
+    scan_in_progress = bool(scan_world.get("scan_in_progress", False))
+    last_scan_completed_at = float(
+        scan_world.get("last_scan_completed_at", 0.0) or 0.0)
+    scan_delay_started_at = (float(
+        scan_world.get("scan_started_at", 0.0) or 0.0)
+        or last_scan_completed_at)
+    scan_timed_out = bool(
+        (scan_world["version"] > 0 and not scanner_alive)
+        or (scan_in_progress and scan_delay_started_at > 0.0
+            and now - scan_delay_started_at > SCAN_DELAY_TIMEOUT_S))
     memory_ready = bool(scan_world["version"] > 0 and memory_session_valid
-                        and fresh_player and not scan_world["error"])
+                        and fresh_player and not scan_world["error"]
+                        and not scan_timed_out)
     readiness = evaluate_start_readiness(
         memory_session_valid, memory_ready, pixel_ready, preferred_mode,
         str(scan_world.get("player_error") or scan_world.get("error")
@@ -531,6 +683,13 @@ def build_snapshot(info: dict[str, Any], eyes, sequence: int,
         "process_id": process_id,
         "session_id": str(session_id),
         "scan_version": int(scan_world["version"]),
+        "player_read_version": int(scan_world.get("player_read_version", 0)),
+        "player_read_at": float(scan_world.get("player_read_at", 0.0) or 0.0),
+        "scan_in_progress": scan_in_progress,
+        "scan_started_at": float(scan_world.get("scan_started_at", 0.0) or 0.0),
+        "scanner_alive": scanner_alive,
+        "scan_timed_out": scan_timed_out,
+        "last_scan_completed_at": last_scan_completed_at,
         "target": target, "entities": entities, "zone": zone,
         "path": route, "trail": [[float(x), float(z)] for x, z in trail],
         "log": [debug] if scan_is_new else [],
@@ -592,6 +751,8 @@ class JsonDashboard:
             eyes, running, state, sx, sy, attack, action, on_loot, distance,
             memory_driving, status, self.bot_mode)
         scan_world, scan_is_new = self.scan_cache.capture(scan_eyes, time.time())
+        if self.gate is not None:
+            self.gate.update_health(scan_world)
         player = scan_world["player"]
         if player is not None and (not self.trail or tuple(player) != self.trail[-1]):
             self.trail.append(tuple(player))
@@ -603,11 +764,9 @@ class JsonDashboard:
             preferred_mode=self.preferred_mode,
             pixel_ready=self.pixel_ready, pixel_error=self.pixel_error)
         if self.gate is not None:
+            raw["physical_toggle_version"] = self.gate.physical_toggle_version
             self.gate.set_start_readiness(
                 raw["can_start"], raw["start_mode"], raw["start_reason"])
-        if (running and normalize_mode(info.get("source")) == "memory"
-                and not raw["memory_ready"] and self.gate is not None):
-            self.gate.submit("pause")
         if scan_is_new:
             raw_value = scan_world.get("player_raw")
             parsed = scan_world.get("player")
@@ -637,7 +796,11 @@ def _stdin_reader(gate: CommandGate):
     for line in sys.stdin:
         try:
             payload = json.loads(line)
-            gate.submit(payload.get("command", ""))
+            command = payload.get("command", "")
+            if command == "ping":
+                print(EVENT_PREFIX + json.dumps(gate.heartbeat()), flush=True)
+            else:
+                gate.submit(command, payload.get("config"))
         except Exception as exc:
             print(EVENT_PREFIX + json.dumps({"level": "ERROR",
                   "message": f"invalid parent command: {exc}"}), flush=True)
@@ -663,12 +826,18 @@ def child_main(argv=None) -> int:
     parser.add_argument("--expected-pid", type=int, default=0)
     parser.add_argument("--session-id", default="")
     parser.add_argument("--no-reconnect", action="store_true")
+    parser.add_argument("--control-config", default="{}")
     options = parser.parse_args(argv)
 
     import minimap_bot as bot
 
+    try:
+        initial_control_config = json.loads(options.control_config)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid controller configuration: {exc}")
     gate = CommandGate(lambda message: print(EVENT_PREFIX + json.dumps(
-        {"level": "WARNING", "message": message}), flush=True))
+        {"level": "WARNING", "message": message}), flush=True),
+        initial_control_config)
     pixel_ready, pixel_error = pixel_capture_readiness(bot)
     monitor_eyes = None
     if options.mode == "minimap" and getattr(bot, "MEMORY_TARGETING", False):
@@ -690,6 +859,8 @@ def child_main(argv=None) -> int:
         return bool(original_key() and gate.allow_hotkey_toggle())
 
     bot.toggle_key_hit = ui_key
+    bot.automation_state_request = gate.poll_internal
+    bot.controller_config_request = gate.poll_controller_config
     bot.TerminalDashboard = lambda bot_mode=None: JsonDashboard(
         bot, bot_mode, max_entities=max(10, min(2000, options.max_entities)),
         trail_length=max(0, min(5000, options.trail_length)), gate=gate,

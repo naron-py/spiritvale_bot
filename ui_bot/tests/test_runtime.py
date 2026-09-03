@@ -8,6 +8,9 @@ from ui_bot.runtime_child import EVENT_PREFIX, SNAPSHOT_PREFIX
 class RuntimeProtocolTests(unittest.TestCase):
     def test_command_encoding_is_newline_delimited_json(self):
         self.assertEqual(encode_command("pause"), b'{"command":"pause"}\n')
+        self.assertEqual(
+            encode_command("configure", {"buff_slots": [], "attack_slots": []}),
+            b'{"command":"configure","config":{"buff_slots":[],"attack_slots":[]}}\n')
         with self.assertRaises(ValueError):
             encode_command("arbitrary")
 

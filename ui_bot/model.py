@@ -386,6 +386,14 @@ class BotSnapshot:
     status: str = ""
     error: str = ""
     scan_version: int = 0
+    player_read_version: int = 0
+    scan_in_progress: bool = False
+    scan_started_at: float = 0.0
+    scanner_alive: bool = False
+    scan_timed_out: bool = False
+    physical_toggle_version: int = 0
+    last_scan_completed_at: float = 0.0
+    player_read_at: float = 0.0
     player_fresh: bool = False
     process_id: int | None = None
     session_id: str = ""
@@ -564,6 +572,18 @@ class BotSnapshot:
             status=str(raw.get("status", "")),
             error=str(raw.get("error", "")),
             scan_version=int(raw.get("scan_version", sequence)),
+            player_read_version=int(raw.get("player_read_version", sequence)),
+            scan_in_progress=bool(raw.get("scan_in_progress", False)),
+            scan_started_at=_number(raw.get("scan_started_at", 0.0),
+                                    "scan start timestamp"),
+            scanner_alive=bool(raw.get("scanner_alive", False)),
+            scan_timed_out=bool(raw.get("scan_timed_out", False)),
+            physical_toggle_version=int(raw.get("physical_toggle_version", 0)),
+            last_scan_completed_at=_number(
+                raw.get("last_scan_completed_at", 0.0),
+                "last scan completion timestamp"),
+            player_read_at=_number(raw.get("player_read_at", 0.0),
+                                   "player read timestamp"),
             player_fresh=player_fresh,
             process_id=process_id,
             session_id=session_id,
@@ -608,6 +628,13 @@ class BotSnapshot:
             "session_id": self.session_id,
             "memory_session_valid": self.memory_session_valid,
             "scan_version": self.scan_version,
+            "player_read_version": self.player_read_version,
+            "scan_in_progress": self.scan_in_progress,
+            "scan_started_at": self.scan_started_at,
+            "scanner_alive": self.scanner_alive,
+            "scan_timed_out": self.scan_timed_out,
+            "last_scan_completed_at": self.last_scan_completed_at,
+            "player_read_at": self.player_read_at,
             "zone": zone.to_mapping(),
             "zone_display_state": display_state.value,
             "entities": [{

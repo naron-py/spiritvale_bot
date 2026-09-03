@@ -21,6 +21,12 @@ class FakeRuntime:
     def pause(self):
         self.calls.append(("pause",))
 
+    def wait_for_memory(self):
+        self.calls.append(("memory_wait",))
+
+    def memory_recovered(self):
+        self.calls.append(("memory_recovered",))
+
     def stop(self):
         self.calls.append(("stop",))
         self.running = False
@@ -31,6 +37,9 @@ class FakeRuntime:
 
     def reset_emergency(self):
         self.calls.append(("reset_emergency",))
+
+    def update_controller_config(self, config):
+        self.calls.append(("configure", dict(config)))
 
     def restart_current(self, reason):
         self.calls.append(("restart_current", reason))
@@ -49,6 +58,15 @@ class AppControllerTests(unittest.TestCase):
         self.assertEqual(self.runtime.calls,
                          [("start", {"mode": "memory"})])
         self.assertEqual(self.controller.state, BotState.STARTING)
+
+    def test_runtime_controller_update_does_not_restart_worker(self):
+        self.controller.start({"mode": "memory"})
+        config = {"buff_slots": [{"id": "one"}], "attack_slots": []}
+
+        self.assertTrue(self.controller.update_controller_config(config))
+
+        self.assertEqual([call[0] for call in self.runtime.calls],
+                         ["start", "configure"])
 
     def test_pause_and_stop_are_idempotent_and_release_once(self):
         self.controller.start({})
@@ -235,6 +253,10 @@ class AppControllerTests(unittest.TestCase):
         self.assertEqual(controller.state, BotState.RECOVERING)
         self.assertEqual(self.runtime.calls.count(("pause",)), 1)
         self.assertIn("target/navigation", controller.recovery_reason)
+        now[0] += 21.0
+        controller.tick_recovery()
+        self.assertFalse(any(call[0] == "restart_current"
+                             for call in self.runtime.calls))
 
     def test_progress_watchdog_resets_after_player_moves(self):
         now = [200.0]
@@ -261,7 +283,30 @@ class AppControllerTests(unittest.TestCase):
         self.assertNotEqual(controller.state, BotState.RECOVERING)
         self.assertEqual(self.runtime.calls.count(("pause",)), 0)
 
-    def test_persistent_recovery_restarts_then_abandons_with_diagnostics(self):
+    def test_progress_watchdog_ignores_no_destination_with_empty_entities(self):
+        now = [250.0]
+        controller = AppController(
+            self.runtime, progress_timeout_s=10.0, clock=lambda: now[0])
+        controller.start({"mode": "memory"})
+        raw = {
+            "sequence": 1, "state": "RUNNING", "automation_state": "RUNNING",
+            "connection_state": "CONNECTED", "connected": True,
+            "memory_session_valid": True, "memory_active": True,
+            "memory_ready": True, "player": {"x": 1.0, "z": 2.0},
+            "player_valid": True, "player_fresh": True,
+            "active_mode": "memory", "source": "memory",
+            "entities": [], "path": [], "target": None,
+            "control": {"stick": [0.0, 0.0]},
+        }
+        controller.accept_snapshot(raw)
+        now[0] += 60.0
+        raw["sequence"] = 2
+        controller.accept_snapshot(raw)
+
+        self.assertEqual(controller.state, BotState.RUNNING)
+        self.assertEqual(self.runtime.calls.count(("pause",)), 0)
+
+    def test_player_read_recovery_waits_then_abandons_without_worker_restart(self):
         now = [300.0]
         controller = AppController(
             self.runtime, self.events.append, recovery_valid_snapshots=2,
@@ -275,25 +320,25 @@ class AppControllerTests(unittest.TestCase):
             "memory_session_valid": True, "memory_active": True,
             "memory_ready": True, "player": {"x": 10.0, "z": 20.0},
             "player_valid": True, "player_fresh": True,
+            "player_read_version": 1,
             "active_mode": "memory", "source": "memory",
             "zone": {"name": "depth2", "valid": True},
         }
         controller.accept_snapshot(valid)
-        invalid = dict(valid)
-        invalid.update({"sequence": 2, "memory_ready": False, "player": None,
-                        "player_valid": False, "player_fresh": False,
-                        "player_error": "temporary read miss"})
-        controller.accept_snapshot(invalid)
+        for sequence in (2, 3, 4):
+            invalid = dict(valid)
+            invalid.update({
+                "sequence": sequence, "player_read_version": sequence,
+                "memory_ready": False, "player": None,
+                "player_valid": False, "player_fresh": False,
+                "player_error": "temporary read miss"})
+            controller.accept_snapshot(invalid)
 
         now[0] += 11.0
         controller.tick_recovery()
-        self.assertTrue(any(call[0] == "restart_current"
-                            for call in self.runtime.calls))
+        self.assertFalse(any(call[0] == "restart_current"
+                             for call in self.runtime.calls))
         self.assertFalse(controller.emergency_latched)
-        controller.worker_finished(WorkerExit(
-            WorkerPurpose.MONITOR, WorkerLifetime.PERSISTENT,
-            stop_requested=True, exit_code=0, exit_status="NormalExit",
-            recovery_restart=True))
 
         now[0] += 20.0
         controller.tick_recovery()
@@ -370,6 +415,8 @@ class AppControllerTests(unittest.TestCase):
                          AutomationState.RUNNING)
         self.assertEqual(self.controller.state, BotState.RUNNING)
         self.assertNotIn(("pause",), self.runtime.calls)
+        self.assertTrue(any("action=continue" in event for event in self.events))
+        self.assertFalse(any("action=fallback" in event for event in self.events))
 
     def test_emergency_stop_latches_until_explicit_reset(self):
         self.controller.start({})
@@ -384,19 +431,19 @@ class AppControllerTests(unittest.TestCase):
         self.assertEqual([call[0] for call in self.runtime.calls],
                          ["start", "emergency_stop", "reset_emergency", "start"])
 
-    def test_transient_controller_failure_enters_recovery_without_latching(self):
+    def test_controller_failure_safe_stops_and_latches(self):
         self.controller.start({})
 
         self.controller.fail(FailureCode.CONTROLLER_COMMAND,
                              RuntimeError("send failed"))
 
-        self.assertEqual(self.controller.state, BotState.RECOVERING)
-        self.assertFalse(self.controller.emergency_latched)
-        self.assertTrue(self.controller.desired_running)
+        self.assertEqual(self.controller.state, BotState.SAFE_STOP)
+        self.assertTrue(self.controller.emergency_latched)
+        self.assertFalse(self.controller.desired_running)
         self.assertIn("controller", self.controller.last_error.lower())
         self.assertTrue(any("send failed" in event for event in self.events))
 
-    def test_resume_failure_keeps_recovery_intent(self):
+    def test_resume_transport_failure_safe_stops(self):
         self.controller.start({})
         self.controller.accept_snapshot(BotSnapshot.safe(BotState.RUNNING))
         self.controller.pause()
@@ -407,8 +454,8 @@ class AppControllerTests(unittest.TestCase):
         self.runtime.resume = fail_resume
         self.assertFalse(self.controller.start({}))
         self.assertEqual(self.controller.automation_state,
-                         AutomationState.RECOVERING)
-        self.assertFalse(self.controller.emergency_latched)
+                         AutomationState.SAFE_STOP)
+        self.assertTrue(self.controller.emergency_latched)
 
     def test_pause_uses_running_automation_state_even_if_status_paused(self):
         self.controller.start({})
@@ -425,7 +472,6 @@ class AppControllerTests(unittest.TestCase):
 
     def test_every_failure_category_uses_recovery_or_latched_policy(self):
         transient = {
-            FailureCode.CONTROLLER_COMMAND,
             FailureCode.WORKER_STOPPED,
             FailureCode.MALFORMED_SNAPSHOT,
         }

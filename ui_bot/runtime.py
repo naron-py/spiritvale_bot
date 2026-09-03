@@ -21,7 +21,8 @@ from .process_discovery import find_spiritvale_pids
 from .runtime_child import EVENT_PREFIX, SNAPSHOT_PREFIX
 
 
-COMMANDS = frozenset(("resume", "pause", "stop", "emergency"))
+COMMANDS = frozenset(("resume", "pause", "stop", "emergency", "configure",
+                      "memory_wait", "memory_recovered", "ping"))
 
 
 class ZoneRejectionLogLimiter:
@@ -111,10 +112,15 @@ class ReconnectBackoff:
         self._next = self.initial_ms
 
 
-def encode_command(command: str) -> bytes:
+def encode_command(command: str, config=None) -> bytes:
     if command not in COMMANDS:
         raise ValueError(f"invalid runtime command {command!r}")
-    return (json.dumps({"command": command}, separators=(",", ":")) + "\n").encode()
+    payload = {"command": command}
+    if command == "configure":
+        if not isinstance(config, dict):
+            raise ValueError("configure requires a controller configuration")
+        payload["config"] = config
+    return (json.dumps(payload, separators=(",", ":")) + "\n").encode()
 
 
 def parse_protocol_line(line: str):
@@ -151,7 +157,8 @@ class ProcessRuntime(QObject):
     def __init__(self, project_root: str | Path, parent=None,
                  child_module="ui_bot.runtime_child", process_finder=None,
                  retry_min_ms=1000, retry_max_ms=10_000,
-                 snapshot_stale_ms=8000, watchdog_check_ms=1000):
+                 snapshot_stale_ms=8000, watchdog_check_ms=1000,
+                 heartbeat_timeout_ms=2000):
         super().__init__(parent)
         self.project_root = Path(project_root)
         self.child_module = str(child_module)
@@ -171,8 +178,23 @@ class ProcessRuntime(QObject):
         self.last_exit_status: object | None = None
         self.last_valid_snapshot_time: float | None = None
         self.last_snapshot_time: float | None = None
+        self.last_heartbeat_time: float | None = None
+        self.child_alive = False
+        self.pipe_alive = False
+        self.monitor_loop_alive = False
+        self.last_player_read_time: float | None = None
+        self.last_entity_scan_time: float | None = None
+        self.scan_in_progress = False
+        self.scan_started_at = 0.0
+        self._last_player_read_version = 0
+        self._last_scan_version = 0
+        self._heartbeat_pending_at: float | None = None
+        self._heartbeat_snapshot_time: float | None = None
+        self._last_heartbeat_probe = 0.0
+        self._heartbeat_monitor_alive = True
         self.zone_log_limiter = ZoneRejectionLogLimiter()
         self.snapshot_stale_ms = max(100, int(snapshot_stale_ms))
+        self.heartbeat_timeout_ms = max(20, int(heartbeat_timeout_ms))
         self.current_pid: int | None = None
         self.session_id = ""
         self._session_generation = 0
@@ -289,6 +311,17 @@ class ProcessRuntime(QObject):
         self.session_id = f"{self.current_pid}:{self._session_generation}"
         self.last_valid_snapshot_time = None
         self.last_snapshot_time = time.monotonic()
+        self.last_heartbeat_time = None
+        self.last_player_read_time = None
+        self.last_entity_scan_time = None
+        self.scan_in_progress = False
+        self.scan_started_at = 0.0
+        self._last_player_read_version = 0
+        self._last_scan_version = 0
+        self._heartbeat_pending_at = None
+        self._heartbeat_snapshot_time = None
+        self._last_heartbeat_probe = 0.0
+        self._heartbeat_monitor_alive = True
         self.zone_log_limiter = ZoneRejectionLogLimiter()
         options = self._options
         args = ["-u", "-m", self.child_module,
@@ -303,6 +336,10 @@ class ProcessRuntime(QObject):
             args += ["--area", area]
         if not options.get("auto_reconnect", True):
             args.append("--no-reconnect")
+        control_config = options.get("control_config")
+        if isinstance(control_config, dict):
+            args += ["--control-config", json.dumps(
+                control_config, separators=(",", ":"))]
         process.setArguments(args)
         process.setWorkingDirectory(str(self.project_root))
         environment = QProcessEnvironment.systemEnvironment()
@@ -340,6 +377,7 @@ class ProcessRuntime(QObject):
             return
         self._switching_mode = False
         self._intentional_stop = False
+        self.child_alive = True
         self.signals.event.emit("[Runtime] Bot worker process started.")
         self.last_snapshot_time = time.monotonic()
         if self._auto_resume:
@@ -384,6 +422,22 @@ class ProcessRuntime(QObject):
         self._auto_resume = False
         self._send("pause")
 
+    def wait_for_memory(self):
+        self._send("memory_wait")
+
+    def memory_recovered(self):
+        self._send("memory_recovered")
+
+    def update_controller_config(self, config):
+        config = dict(config)
+        self._options["control_config"] = config
+        if self._pending_switch_options is not None:
+            pending = dict(self._pending_switch_options)
+            pending["control_config"] = config
+            self._pending_switch_options = pending
+        if self.process is not None and not self._switching_mode:
+            self._send("configure", config)
+
     def stop(self):
         if self.process is None:
             return
@@ -425,11 +479,11 @@ class ProcessRuntime(QObject):
     def reset_emergency(self):
         self._emergency = False
 
-    def _send(self, command: str):
+    def _send(self, command: str, config=None):
         process = self.process
         if process is None or process.state() == QProcess.NotRunning:
             raise RuntimeError("bot worker is not running")
-        written = process.write(encode_command(command))
+        written = process.write(encode_command(command, config))
         if written < 0:
             raise RuntimeError(f"could not send {command} to bot worker")
 
@@ -462,13 +516,47 @@ class ProcessRuntime(QObject):
                         self.signals.event.emit(
                             "[Runtime] Discarded snapshot from an old process session.")
                         continue
-                    self.last_snapshot_time = time.monotonic()
+                    received_at = time.monotonic()
+                    self.last_snapshot_time = received_at
+                    self.child_alive = True
+                    self.pipe_alive = True
+                    self.monitor_loop_alive = True
+                    self._heartbeat_pending_at = None
+                    self._heartbeat_snapshot_time = None
+                    self.scan_in_progress = payload.scan_in_progress
+                    self.scan_started_at = payload.scan_started_at
+                    if payload.player_read_version > self._last_player_read_version:
+                        self._last_player_read_version = payload.player_read_version
+                        self.last_player_read_time = (
+                            payload.player_read_at or time.time())
+                    if payload.scan_version > self._last_scan_version:
+                        self._last_scan_version = payload.scan_version
+                        self.last_entity_scan_time = (
+                            payload.last_scan_completed_at or time.time())
                     if (payload.connection_state == ConnectionState.CONNECTED
                             and payload.player_fresh and payload.player is not None):
                         self.last_valid_snapshot_time = time.monotonic()
                         self.backoff.reset()
                     self.signals.snapshot.emit(payload)
                 elif kind == "event":
+                    if payload.get("type") == "heartbeat":
+                        self.last_heartbeat_time = time.monotonic()
+                        self.child_alive = True
+                        self.pipe_alive = True
+                        self._heartbeat_monitor_alive = bool(
+                            payload.get("monitor_loop_alive", True))
+                        self.monitor_loop_alive = self._heartbeat_monitor_alive
+                        self.scan_in_progress = bool(
+                            payload.get("scan_in_progress", self.scan_in_progress))
+                        self.scan_started_at = float(
+                            payload.get("scan_started_at", self.scan_started_at) or 0.0)
+                        player_at = float(payload.get("last_player_read", 0.0) or 0.0)
+                        scan_at = float(payload.get("last_entity_scan", 0.0) or 0.0)
+                        if player_at:
+                            self.last_player_read_time = player_at
+                        if scan_at:
+                            self.last_entity_scan_time = scan_at
+                        continue
                     message = str(payload.get("message", "runtime event"))
                     self.signals.event.emit(f"[{payload.get('level', 'INFO')}] {message}")
                 else:
@@ -482,12 +570,69 @@ class ProcessRuntime(QObject):
                 or self._requested_stop or self._intentional_stop
                 or self._switching_mode or self.last_snapshot_time is None):
             return
-        stale_ms = (time.monotonic() - self.last_snapshot_time) * 1000.0
-        if stale_ms < self.snapshot_stale_ms:
+        self.child_alive = process.state() != QProcess.NotRunning
+        if not self.child_alive:
             return
-        self.last_snapshot_time = time.monotonic()
-        self.restart_current(
-            f"snapshot heartbeat stale for {stale_ms / 1000.0:.1f}s")
+        now = time.monotonic()
+        stale_ms = (now - self.last_snapshot_time) * 1000.0
+        if stale_ms < self.snapshot_stale_ms:
+            self._heartbeat_pending_at = None
+            self._heartbeat_snapshot_time = None
+            return
+        if self._heartbeat_pending_at is None:
+            if (now - self._last_heartbeat_probe) * 1000.0 < self.snapshot_stale_ms:
+                return
+            self._heartbeat_pending_at = now
+            self._heartbeat_snapshot_time = self.last_snapshot_time
+            self._last_heartbeat_probe = now
+            try:
+                self._send("ping")
+            except RuntimeError:
+                if self.last_snapshot_time != self._heartbeat_snapshot_time:
+                    self._heartbeat_pending_at = None
+                    self._heartbeat_snapshot_time = None
+                    return
+                self.restart_current("worker pipe unavailable during heartbeat probe")
+            else:
+                self.signals.event.emit(
+                    f"[Decision] condition=stale_dashboard action=wait "
+                    f"reason=heartbeat probe sent after {stale_ms / 1000.0:.1f}s")
+            return
+        if self.last_snapshot_time != self._heartbeat_snapshot_time:
+            self._heartbeat_pending_at = None
+            self._heartbeat_snapshot_time = None
+            self.signals.event.emit(
+                "[Decision] condition=stale_dashboard action=continue "
+                "reason=fresh snapshot arrived during heartbeat check")
+            return
+        heartbeat_replied = bool(
+            self.last_heartbeat_time is not None
+            and self.last_heartbeat_time >= self._heartbeat_pending_at)
+        if heartbeat_replied and self._heartbeat_monitor_alive:
+            self._heartbeat_pending_at = None
+            self._heartbeat_snapshot_time = None
+            action = "wait" if self.scan_in_progress else "continue"
+            reason = ("entity scan still in progress" if self.scan_in_progress
+                      else "child process, pipe, and monitor heartbeat are alive")
+            self.signals.event.emit(
+                f"[Decision] condition=stale_dashboard action={action} reason={reason}")
+            return
+        if (now - self._heartbeat_pending_at) * 1000.0 < self.heartbeat_timeout_ms:
+            return
+        # Re-check the snapshot marker immediately before retiring this exact
+        # generation; readyRead can race the watchdog timer callback.
+        if self.last_snapshot_time != self._heartbeat_snapshot_time:
+            self._heartbeat_pending_at = None
+            self._heartbeat_snapshot_time = None
+            return
+        reason = ("monitor loop heartbeat confirms a hang"
+                  if heartbeat_replied else "worker pipe did not answer heartbeat")
+        if not heartbeat_replied:
+            self.pipe_alive = False
+        self.monitor_loop_alive = False
+        self.signals.event.emit(
+            f"[Decision] condition=stale_dashboard action=stop reason={reason}")
+        self.restart_current(reason)
 
     def restart_current(self, reason: str) -> None:
         """Retire exactly the owned worker and reconnect after its finished signal."""
@@ -528,6 +673,9 @@ class ProcessRuntime(QObject):
         failed_to_start = error == QProcess.ProcessError.FailedToStart
         if failed_to_start:
             self.process = None
+            self.child_alive = False
+            self.pipe_alive = False
+            self.monitor_loop_alive = False
             self._buffer = b""
             if process is not None:
                 process.deleteLater()
@@ -588,6 +736,9 @@ class ProcessRuntime(QObject):
         # The exact process that emitted finished is fully detached before a
         # replacement is assigned to self.process.
         self.process = None
+        self.child_alive = False
+        self.pipe_alive = False
+        self.monitor_loop_alive = False
         self._buffer = b""
         self.session_id = ""
         self._restart_after_stop = False
@@ -753,6 +904,7 @@ class DemoRuntime(QObject):
         self.timer.timeout.connect(self._tick)
         self.running = False
         self.started = False
+        self.control_config = {}
 
     @property
     def monitoring(self):
@@ -765,6 +917,7 @@ class DemoRuntime(QObject):
                                  str(options.get("mode", "memory")))
         self.started = True
         self.running = False
+        self.control_config = dict(options.get("control_config") or {})
         self.timer.start()
         self.signals.event.emit("[Demo] Read-only demo monitor attached.")
         self._tick()
@@ -787,6 +940,9 @@ class DemoRuntime(QObject):
             "pixel" if str(options.get("mode", "memory")).lower()
             in ("pixel", "minimap") else "memory")
         return False
+
+    def update_controller_config(self, config):
+        self.control_config = dict(config)
 
     def pause(self):
         if not self.started:

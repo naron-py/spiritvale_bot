@@ -33,6 +33,78 @@ class CommandGateTests(unittest.TestCase):
         gate.submit("pause")
         self.assertTrue(gate.poll_toggle())
 
+    def test_automatic_memory_wait_does_not_emit_end_toggle(self):
+        gate = CommandGate()
+        gate.submit("resume")
+        self.assertTrue(gate.poll_toggle())
+        gate.observe(True)
+
+        gate.submit("memory_wait")
+        self.assertFalse(gate.poll_toggle())
+        self.assertEqual(gate.poll_internal(), "wait")
+        self.assertFalse(gate.poll_toggle())
+
+        gate.submit("memory_recovered")
+        self.assertEqual(gate.poll_internal(), "running")
+        self.assertFalse(gate.poll_toggle())
+
+    def test_monitor_heartbeat_tracks_loop_poll_not_dashboard_publication(self):
+        gate = CommandGate()
+        gate._monitor_at = time.monotonic() - 10.0
+
+        gate.poll_toggle()
+
+        self.assertTrue(gate.heartbeat()["monitor_loop_alive"])
+
+    def test_explicit_pause_then_resume_cancels_internal_memory_wait(self):
+        gate = CommandGate()
+        gate.submit("resume")
+        self.assertTrue(gate.poll_toggle())
+        gate.observe(True)
+        gate.submit("memory_wait")
+        self.assertEqual(gate.poll_internal(), "wait")
+
+        gate.submit("pause")
+        gate.submit("resume")
+
+        self.assertTrue(gate.poll_toggle())
+        gate.observe(True)
+        self.assertFalse(gate.poll_toggle())
+
+    def test_physical_end_can_explicitly_override_wait_when_readiness_recovers(self):
+        gate = CommandGate()
+        gate.submit("resume")
+        self.assertTrue(gate.poll_toggle())
+        gate.observe(True)
+        gate.submit("memory_wait")
+        self.assertEqual(gate.poll_internal(), "wait")
+        gate.set_start_readiness(True, "memory", "fresh player read")
+
+        self.assertTrue(gate.allow_hotkey_toggle())
+        self.assertIsNone(gate.poll_internal())
+        gate.observe(True)
+        self.assertFalse(gate.poll_toggle())
+
+    def test_one_physical_end_edge_produces_exactly_one_user_toggle(self):
+        gate = CommandGate()
+        gate.observe(False)
+        gate.set_start_readiness(True, "memory", "ready")
+        physical_edges = iter((True, False, True, False))
+
+        def ui_key():
+            if gate.poll_toggle():
+                return True
+            return bool(next(physical_edges) and gate.allow_hotkey_toggle())
+
+        self.assertTrue(ui_key())
+        self.assertEqual(gate.physical_toggle_version, 1)
+        gate.observe(True)
+        self.assertFalse(ui_key())
+        self.assertTrue(ui_key())
+        self.assertEqual(gate.physical_toggle_version, 2)
+        gate.observe(False)
+        self.assertFalse(ui_key())
+
     def test_stop_and_emergency_raise_at_loop_boundary(self):
         for command in ("stop", "emergency"):
             gate = CommandGate()
@@ -46,6 +118,17 @@ class CommandGateTests(unittest.TestCase):
         gate.submit("launch_missiles")
         self.assertFalse(gate.poll_toggle())
         self.assertIn("ignored", events[0])
+
+    def test_controller_configuration_is_replaced_atomically(self):
+        gate = CommandGate()
+        first = {"buff_slots": [{"id": "one"}], "attack_slots": []}
+        second = {"buff_slots": [{"id": "two"}], "attack_slots": []}
+
+        gate.submit("configure", first)
+        gate.submit("configure", second)
+
+        self.assertEqual(gate.poll_controller_config(), second)
+        self.assertIsNone(gate.poll_controller_config())
 
 
 class FakeScanner:

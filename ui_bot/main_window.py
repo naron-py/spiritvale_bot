@@ -359,7 +359,8 @@ class MainWindow(QMainWindow):
                 "area_revision": self._zone_revision if area else 0,
                 "auto_reconnect": settings.auto_reconnect,
                 "trail_length": settings.trail_length,
-                "max_entities": settings.max_entities}
+                "max_entities": settings.max_entities,
+                "control_config": settings.control_config()}
 
     def _attach_monitor(self):
         options = self._runtime_options()
@@ -584,9 +585,15 @@ class MainWindow(QMainWindow):
     def save_settings(self):
         try:
             settings = self.pages["Settings"].settings(self.demo_mode)
+        except ConfigError as exc:
+            self.append_log(f"[Config] Save rejected: {exc}")
+            self._refresh_controls()
+            return
+        try:
             self.zone_store.select(settings.selected_area)
             self.config_store.save(settings)
             self.settings_value = settings
+            self.controller.update_controller_config(settings.control_config())
             self.saved_zone = self.zone_store.load_selected(
                 settings.selected_area)
             self.zone_load_error = ""

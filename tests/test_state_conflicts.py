@@ -1,10 +1,13 @@
+import math
 import threading
 import unittest
 from unittest.mock import patch
 
 import memscan
-from minimap_bot import (LOOT_MAX_S, MEM_LOST_FRAMES, Area, MemoryEyes, WalkMap,
-                         area_holds, loot_wins, should_calibrate, stale_target)
+from minimap_bot import (AREA_LOOKAHEAD, LOOT_MAX_S, MEM_ARRIVE,
+                         MEM_LOST_FRAMES, Area, MemoryEyes, WalkMap,
+                         area_holds, attack_active, loot_wins, min_distance,
+                         resume_distance, should_calibrate, stale_target)
 
 
 class _FightState:
@@ -32,6 +35,7 @@ class _TargetEyes(MemoryEyes):
         self.misses = 0
         self.hot = self.hot_at = self.hot_loot = self.hot_loot_at = None
         self.orbit_dir, self.orbit_mark = 1, None
+        self.spacing_state = None
         self.mem = None
         self.seen_at, self.sweep_at, self.fight_ok = {}, 0, {}
         self.ms = _FightState()
@@ -178,6 +182,92 @@ class TargetOwnershipTests(unittest.TestCase):
 
 
 class MovementOwnershipTests(unittest.TestCase):
+    def test_combat_spacing_keeps_attack_independent(self):
+        far = _TargetEyes({0x20000: (MEM_ARRIVE + 2.0, 0.0, 0.0)})
+        fsx, fsy, _ = far.target(1.0)
+        self.assertEqual(far.spacing_state, "APPROACH")
+        self.assertTrue(fsx or fsy)
+        self.assertTrue(attack_active(1.0))
+
+        normal = _TargetEyes({0x20000: (
+            (min_distance + resume_distance) / 2, 0.0, 0.0)})
+        nsx, nsy, _ = normal.target(1.0)
+        self.assertEqual(normal.spacing_state, "ATTACK")
+        self.assertGreater(abs(nsx) + abs(nsy), 0.1)
+        self.assertTrue(attack_active(1.0))
+
+        close = _TargetEyes({0x20000: (min_distance / 2, 0.0, 0.0)})
+        close.positions[close.me] = (0.0, 0.0, 0.0)
+        close.spacing_state = "APPROACH"
+        with patch("builtins.print") as printed:
+            csx, csy, _ = close.target(1.0)
+        self.assertEqual(close.spacing_state, "RETREAT")
+        self.assertLess(csx * (min_distance / 2) + csy * -1.0, 0.0)
+        self.assertTrue(attack_active(1.0))
+        printed.assert_called_once()
+        self.assertIn("[Spacing] APPROACH -> RETREAT", printed.call_args[0][0])
+
+        close.positions[0x20000] = (resume_distance, 0.0, 0.0)
+        with patch("builtins.print") as printed:
+            sx, sy, _ = close.target(1.1)
+        self.assertEqual(close.spacing_state, "ATTACK")
+        self.assertGreater(abs(sx) + abs(sy), 0.1)
+        self.assertTrue(attack_active(1.1))
+        printed.assert_called_once()
+        self.assertIn("[Spacing] RETREAT -> ATTACK", printed.call_args[0][0])
+
+    def test_retreat_spacing_still_uses_final_area_guard(self):
+        eyes = _TargetEyes({0x20000: (16.0, 0.0, 0.0)})
+        eyes.positions[eyes.me] = (16.5, 0.0, 0.0)
+        eyes.area = Area("yard", polygon=[(0.0, -10.0), (20.0, -10.0),
+                                           (20.0, 10.0), (0.0, 10.0)], axes="xz")
+        eyes.boundary_log_at = 100.0
+
+        with patch("builtins.print") as printed:
+            sx, sy, dist = eyes.target(1.0)
+        self.assertEqual(eyes.spacing_state, "RETREAT")
+        self.assertGreater(abs(sx) + abs(sy), 0.1)
+        self.assertGreater(math.hypot(16.5 + sx * AREA_LOOKAHEAD - 16.0,
+                                      sy * AREA_LOOKAHEAD) - dist, 0.0)
+        self.assertFalse(printed.call_args_list)
+
+        gsx, gsy, _ = eyes.guard_area_step(sx, sy, now=1.0)
+        self.assertTrue(eyes.area.guard_step(
+            eyes.last_pos, (16.5 + gsx * 3.0, gsy * 3.0))[0])
+        self.assertTrue(attack_active(1.0))
+
+    def test_hit_and_run_center_retreats_directly_while_attacking(self):
+        eyes = _TargetEyes({0x20000: (8.5, 0.0, 0.0)})
+        eyes.positions[eyes.me] = (10.0, 0.0, 0.0)
+        eyes.area = Area("yard", polygon=[(0.0, -10.0), (20.0, -10.0),
+                                           (20.0, 10.0), (0.0, 10.0)], axes="xz")
+
+        with patch("builtins.print") as printed:
+            sx, sy, dist = eyes.target(1.0)
+
+        self.assertEqual(eyes.spacing_state, "RETREAT")
+        self.assertGreater(sx, 0.9)
+        self.assertAlmostEqual(sy, 0.0, places=6)
+        self.assertGreater(math.hypot(10.0 + sx * AREA_LOOKAHEAD - 8.5,
+                                      sy * AREA_LOOKAHEAD) - dist, 0.0)
+        self.assertTrue(attack_active(1.0))
+        self.assertFalse(printed.call_args_list)
+
+    def test_boundary_retreat_continues_until_stop_distance(self):
+        eyes = _TargetEyes({0x20000: (16.0, 0.0, 0.0)})
+        eyes.positions[eyes.me] = (16.5, 0.0, 0.0)
+        eyes.area = Area("yard", polygon=[(0.0, -10.0), (20.0, -10.0),
+                                           (20.0, 10.0), (0.0, 10.0)], axes="xz")
+
+        with patch("builtins.print"):
+            first = eyes.target(1.0)
+            second = eyes.target(1.1)
+        self.assertEqual(eyes.spacing_state, "RETREAT")
+        self.assertGreater(abs(first[0]) + abs(first[1]), 0.1)
+        self.assertGreater(abs(second[0]) + abs(second[1]), 0.1)
+        self.assertTrue(attack_active(1.0))
+        self.assertTrue(attack_active(1.1))
+
     def test_guard_output_is_safe_after_direction_normalization(self):
         eyes = MemoryEyes.__new__(MemoryEyes)
         eyes.area = Area("ring", circle=(0.0, 0.0, 10.0))
@@ -231,7 +321,7 @@ class MovementOwnershipTests(unittest.TestCase):
 
         self.assertEqual(eyes.walk.goal, eyes.guard_goal)
 
-    def test_exact_boundary_target_engages_without_outward_motion(self):
+    def test_exact_boundary_target_engages_with_safe_attack_strafe(self):
         eyes = _TargetEyes({0x20000: (10.0, 0.0, 0.0)})
         eyes.positions[eyes.me] = (7.0, 0.0, 0.0)
         eyes.last_pos = (7.0, 0.0)
@@ -245,6 +335,7 @@ class MovementOwnershipTests(unittest.TestCase):
         self.assertGreater(abs(gsx) + abs(gsy), 0.1)
         self.assertTrue(eyes.area.guard_step(
             eyes.last_pos, (7.0 + gsx * 3.0, gsy * 3.0))[0])
+        self.assertTrue(attack_active(1.0))
 
     def test_boundary_redirect_preserves_return_semantic_mode(self):
         eyes = MemoryEyes.__new__(MemoryEyes)

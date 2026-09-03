@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from uuid import uuid4
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
                                QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-                               QLineEdit, QPushButton, QSizePolicy, QSpinBox,
+                               QLineEdit, QPushButton, QScrollArea, QSizePolicy, QSpinBox,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
-from .config import UiSettings
+from .config import (BUTTON_LABELS, CONTROLLER_BUTTONS, AttackSlot, BuffSlot,
+                     UiSettings, default_attack_slots, default_buff_slots)
 from .model import (BotSnapshot, FailureCode, FAILURE_POLICIES,
                     ZoneDisplayState)
 from .widgets.world_view import WorldView
@@ -375,13 +377,84 @@ class CombatPage(SnapshotPage):
         self.action.value.setText(str(dashboard.get("action") or "NONE").upper())
 
 
+class ControllerButtonCombo(QComboBox):
+    def setCurrentData(self, value):
+        index = self.findData(value)
+        if index >= 0:
+            self.setCurrentIndex(index)
+
+
+def _button_combo(button):
+    combo = ControllerButtonCombo()
+    for value in CONTROLLER_BUTTONS:
+        combo.addItem(BUTTON_LABELS[value], value)
+    combo.setCurrentData(button)
+    return combo
+
+
+class BuffSlotRow(QWidget):
+    def __init__(self, slot, changed, remove, parent=None):
+        super().__init__(parent)
+        self.slot_id = slot.id
+        self.slot_name = slot.name
+        self.user_created = slot.user_created
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 1, 0, 1)
+        self.enabled = QCheckBox()
+        self.enabled.setChecked(slot.enabled)
+        self.name = QLabel(slot.name)
+        self.name.setMinimumWidth(82)
+        self.button = _button_combo(slot.button)
+        self.remove_button = QPushButton("Remove")
+        self.remove_button.setObjectName("danger")
+        self.remove_button.setVisible(slot.user_created)
+        self.enabled.toggled.connect(changed)
+        self.button.currentIndexChanged.connect(changed)
+        self.remove_button.clicked.connect(lambda: remove(self.slot_id))
+        layout.addWidget(self.enabled)
+        layout.addWidget(self.name)
+        layout.addWidget(self.button, 1)
+        layout.addWidget(self.remove_button)
+
+    def value(self, order):
+        return BuffSlot(self.slot_id, self.slot_name, self.enabled.isChecked(),
+                        self.button.currentData(), order, self.user_created)
+
+
+class AttackSlotRow(QWidget):
+    def __init__(self, slot, changed, parent=None):
+        super().__init__(parent)
+        self.slot_id = slot.id
+        self.slot_name = slot.name
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 1, 0, 1)
+        self.enabled = QCheckBox()
+        self.enabled.setChecked(slot.enabled)
+        self.name = QLabel(slot.name)
+        self.name.setMinimumWidth(96)
+        self.button = _button_combo(slot.button)
+        self.enabled.toggled.connect(changed)
+        self.button.currentIndexChanged.connect(changed)
+        layout.addWidget(self.enabled)
+        layout.addWidget(self.name)
+        layout.addWidget(self.button, 1)
+
+    def value(self, order):
+        return AttackSlot(self.slot_id, self.slot_name, self.enabled.isChecked(),
+                          self.button.currentData(), order)
+
+
 class SettingsPage(SnapshotPage):
     save_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QHBoxLayout(self)
+        self.buff_rows = []
+        self.attack_rows = []
+
         settings_box = panel()
+        settings_box.setMaximumWidth(430)
         form_wrap = QVBoxLayout(settings_box)
         form_wrap.addWidget(section("UI & RUNTIME SETTINGS"))
         form = QFormLayout()
@@ -405,16 +478,60 @@ class SettingsPage(SnapshotPage):
         form.addRow("Entity cap", self.entities)
         form.addRow("Log level", self.log_level)
         form_wrap.addLayout(form)
-        save = QPushButton("Save UI Settings")
+        save = QPushButton("Save Configuration")
         save.setObjectName("save")
         save.clicked.connect(self.save_requested)
         form_wrap.addWidget(save)
-        self.notice = QLabel("Changes apply on the next worker start. Existing terminal bot files are never rewritten.")
+        self.validation = QLabel("")
+        self.validation.setObjectName("red")
+        self.validation.setWordWrap(True)
+        form_wrap.addWidget(self.validation)
+        self.notice = QLabel(
+            "Buff and attack changes apply safely while running after Save. "
+            "Other runtime changes apply on the next worker start.")
         self.notice.setWordWrap(True)
         self.notice.setObjectName("muted")
         form_wrap.addWidget(self.notice)
         form_wrap.addStretch(1)
         layout.addWidget(settings_box, 1)
+
+        self.controls_scroll = QScrollArea()
+        self.controls_scroll.setWidgetResizable(True)
+        self.controls_scroll.setFrameShape(QFrame.NoFrame)
+        self.controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        controls_host = QWidget()
+        controls_layout = QVBoxLayout(controls_host)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+
+        attack_box = panel()
+        attack_layout = QVBoxLayout(attack_box)
+        attack_layout.addWidget(section("ATTACK SKILLS"))
+        self.attack_rows_layout = QVBoxLayout()
+        attack_layout.addLayout(self.attack_rows_layout)
+        controls_layout.addWidget(attack_box)
+
+        buff_box = panel()
+        buff_layout = QVBoxLayout(buff_box)
+        buff_layout.addWidget(section("BUFF SLOTS"))
+        self.buff_rows_layout = QVBoxLayout()
+        buff_layout.addLayout(self.buff_rows_layout)
+        buttons = QHBoxLayout()
+        self.add_buff_button = QPushButton("+ ADD NEW BUFF SLOT")
+        self.reset_button = QPushButton("Reset Default")
+        self.add_buff_button.clicked.connect(self.add_buff_slot)
+        self.reset_button.clicked.connect(self.reset_controller_defaults)
+        buttons.addWidget(self.add_buff_button)
+        buttons.addWidget(self.reset_button)
+        buff_layout.addLayout(buttons)
+        controls_layout.addWidget(buff_box)
+
+        preview_box = QGroupBox("EXECUTION PREVIEW")
+        preview_layout = QVBoxLayout(preview_box)
+        self.preview = QLabel()
+        self.preview.setWordWrap(True)
+        self.preview.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        preview_layout.addWidget(self.preview)
+        controls_layout.addWidget(preview_box)
 
         policy_box = panel()
         policy_layout = QVBoxLayout(policy_box)
@@ -429,11 +546,81 @@ class SettingsPage(SnapshotPage):
             policy = FAILURE_POLICIES[code]
             row = self.policy_table.rowCount()
             self.policy_table.insertRow(row)
-            self.policy_table.setItem(row, 0, QTableWidgetItem(code.value.replace("_", " ")))
-            self.policy_table.setItem(row, 1, QTableWidgetItem(policy.safe_state.value))
+            self.policy_table.setItem(
+                row, 0, QTableWidgetItem(code.value.replace("_", " ")))
+            self.policy_table.setItem(
+                row, 1, QTableWidgetItem(policy.safe_state.value))
         self.policy_table.resizeColumnsToContents()
         policy_layout.addWidget(self.policy_table)
-        layout.addWidget(policy_box, 1)
+        controls_layout.addWidget(policy_box)
+        controls_layout.addStretch(1)
+        self.controls_scroll.setWidget(controls_host)
+        layout.addWidget(self.controls_scroll, 2)
+
+    @staticmethod
+    def _clear_rows(rows, layout):
+        while rows:
+            row = rows.pop()
+            layout.removeWidget(row)
+            row.deleteLater()
+
+    def _load_controller_rows(self, buffs, attacks):
+        self._clear_rows(self.buff_rows, self.buff_rows_layout)
+        self._clear_rows(self.attack_rows, self.attack_rows_layout)
+        for slot in sorted(buffs, key=lambda item: item.order):
+            row = BuffSlotRow(slot, self.update_preview, self.remove_buff_slot)
+            self.buff_rows.append(row)
+            self.buff_rows_layout.addWidget(row)
+        for slot in sorted(attacks, key=lambda item: item.order):
+            row = AttackSlotRow(slot, self.update_preview)
+            self.attack_rows.append(row)
+            self.attack_rows_layout.addWidget(row)
+        self.update_preview()
+
+    def add_buff_slot(self):
+        used_names = {row.slot_name for row in self.buff_rows}
+        number = 1
+        while f"Buff Slot {number}" in used_names:
+            number += 1
+        slot = BuffSlot(f"buff-user-{uuid4().hex}", f"Buff Slot {number}",
+                        False, "a", number - 1, True)
+        row = BuffSlotRow(slot, self.update_preview, self.remove_buff_slot)
+        self.buff_rows.append(row)
+        self.buff_rows_layout.addWidget(row)
+        self.update_preview()
+        return row
+
+    def remove_buff_slot(self, slot_id):
+        row = next((item for item in self.buff_rows
+                    if item.slot_id == slot_id and item.user_created), None)
+        if row is None:
+            return False
+        self.buff_rows.remove(row)
+        self.buff_rows_layout.removeWidget(row)
+        row.deleteLater()
+        self.update_preview()
+        return True
+
+    def reset_controller_defaults(self):
+        self._load_controller_rows(default_buff_slots(), default_attack_slots())
+        self.validation.clear()
+
+    def update_preview(self, *_args):
+        active = [BUTTON_LABELS[row.button.currentData()]
+                  for row in self.buff_rows if row.enabled.isChecked()]
+        skipped = [BUTTON_LABELS[row.button.currentData()]
+                   for row in self.buff_rows if not row.enabled.isChecked()]
+        attacks = [BUTTON_LABELS[row.button.currentData()]
+                   for row in self.attack_rows if row.enabled.isChecked()]
+        rotation = " → ".join(f"[{button}]" for button in active) or "(none)"
+        skipped_text = (", ".join(f"[{button}] — disabled" for button in skipped)
+                        or "(none)")
+        attack_text = " + ".join(f"[{button}]" for button in attacks) or "(none enabled)"
+        if attacks:
+            attack_text += " — continuous"
+        self.preview.setText(
+            f"Active buff rotation:\n{rotation}\n\nSkipped:\n{skipped_text}"
+            f"\n\nAttack:\n{attack_text}")
 
     def load_settings(self, settings: UiSettings, areas=()):
         self.mode.setCurrentText(settings.mode)
@@ -446,19 +633,31 @@ class SettingsPage(SnapshotPage):
         self.trail.setValue(settings.trail_length)
         self.entities.setValue(settings.max_entities)
         self.log_level.setCurrentText(settings.log_level)
+        self._load_controller_rows(settings.buff_slots, settings.attack_slots)
 
     def settings(self, demo_mode=False):
-        return UiSettings(mode=self.mode.currentText(),
-                          selected_area=self.area.currentText().strip(),
-                          auto_reconnect=self.reconnect.isChecked(),
-                          follow_player=self.follow.isChecked(),
-                          trail_length=self.trail.value(),
-                          max_entities=self.entities.value(),
-                          log_level=self.log_level.currentText(),
-                          demo_mode=demo_mode).validated()
+        buffs = tuple(row.value(index)
+                      for index, row in enumerate(self.buff_rows))
+        attacks = tuple(row.value(index)
+                        for index, row in enumerate(self.attack_rows))
+        try:
+            settings = UiSettings(
+                mode=self.mode.currentText(),
+                selected_area=self.area.currentText().strip(),
+                auto_reconnect=self.reconnect.isChecked(),
+                follow_player=self.follow.isChecked(),
+                trail_length=self.trail.value(),
+                max_entities=self.entities.value(),
+                log_level=self.log_level.currentText(), demo_mode=demo_mode,
+                buff_slots=buffs, attack_slots=attacks).validated()
+        except Exception as exc:
+            self.validation.setText(str(exc))
+            raise
+        self.validation.clear()
+        return settings
 
     def apply_snapshot(self, snapshot):
         super().apply_snapshot(snapshot)
         self.notice.setText(
             f"Worker: {snapshot.state.value} | Source: {snapshot.source.upper()} | "
-            "Setting changes apply on next start.")
+            "saved input changes apply live.")

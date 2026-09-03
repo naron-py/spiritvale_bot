@@ -9,6 +9,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
+from ui_bot.config import ConfigError
 from ui_bot.main_window import MainWindow
 from ui_bot.runtime import DemoEngine, DemoRuntime
 from ui_bot.widgets.world_view import WorldView
@@ -140,6 +141,103 @@ class MainWindowTests(unittest.TestCase):
         for index in range(1500):
             window.append_log(f"line {index}")
         self.assertLessEqual(window.activity_log.document().blockCount(), 1000)
+        window.close()
+
+    def test_buff_slots_add_remove_and_reset_without_restarting_runtime(self):
+        window, runtime = self.make_window()
+        page = window.pages["Settings"]
+        original_ids = [row.slot_id for row in page.buff_rows]
+        engine = runtime.engine
+
+        row = page.add_buff_slot()
+        self.assertFalse(row.enabled.isChecked())
+        self.assertNotIn(row.slot_id, original_ids)
+        self.assertEqual(len(page.buff_rows), 7)
+        self.assertIs(runtime.engine, engine)
+        self.assertFalse(runtime.running)
+
+        second = page.add_buff_slot()
+        page.remove_buff_slot(row.slot_id)
+        replacement = page.add_buff_slot()
+        self.assertNotEqual(replacement.slot_name, second.slot_name)
+        page.remove_buff_slot(second.slot_id)
+        page.remove_buff_slot(replacement.slot_id)
+        self.assertEqual([item.slot_id for item in page.buff_rows], original_ids)
+        page.buff_rows[0].enabled.setChecked(False)
+        page.add_buff_slot()
+        page.reset_controller_defaults()
+
+        self.assertEqual([item.slot_id for item in page.buff_rows], original_ids)
+        self.assertTrue(all(item.enabled.isChecked() for item in page.buff_rows))
+        self.assertIs(runtime.engine, engine)
+        self.assertFalse(runtime.running)
+        window.close()
+
+    def test_execution_preview_updates_from_current_slot_values(self):
+        window, _ = self.make_window()
+        page = window.pages["Settings"]
+
+        page.buff_rows[2].enabled.setChecked(False)
+        page.buff_rows[3].button.setCurrentData("y")
+        page.attack_rows[1].enabled.setChecked(False)
+        _APP.processEvents()
+
+        preview = page.preview.text()
+        self.assertIn("[D-Pad Up]", preview)
+        self.assertIn("[Y]", preview)
+        self.assertIn("[D-Pad Left] — disabled", preview)
+        self.assertIn("[LB] — continuous", preview)
+        self.assertNotIn("[RB] +", preview)
+        window.close()
+
+    def test_settings_controller_panel_does_not_need_horizontal_scrolling(self):
+        window, _runtime = self.make_window()
+        page = window.pages["Settings"]
+        window.resize(1280, 760)
+        window.show_page("Settings")
+        window.show()
+        _APP.processEvents()
+
+        self.assertEqual(page.controls_scroll.horizontalScrollBar().maximum(), 0)
+        window.close()
+
+    def test_invalid_active_binding_names_conflicting_slots(self):
+        window, _ = self.make_window()
+        page = window.pages["Settings"]
+        page.buff_rows[0].button.setCurrentData("lb")
+
+        with self.assertRaisesRegex(ConfigError, "Buff Slot 1.*Attack Skill 1"):
+            page.settings()
+
+        window.close()
+
+    def test_save_applies_controller_slots_without_restarting_running_worker(self):
+        window, runtime = self.make_window()
+        page = window.pages["Settings"]
+        QTest.mouseClick(window.start_button, Qt.LeftButton)
+        engine = runtime.engine
+        page.buff_rows[2].enabled.setChecked(False)
+
+        window.save_settings()
+
+        self.assertIs(runtime.engine, engine)
+        self.assertTrue(runtime.running)
+        self.assertFalse(runtime.control_config["buff_slots"][2]["enabled"])
+        window.emergency_stop("test complete")
+        window.close()
+
+    def test_invalid_save_keeps_last_file_and_does_not_emergency_stop(self):
+        window, _ = self.make_window()
+        window.save_settings()
+        original = window.config_store.path.read_bytes()
+        page = window.pages["Settings"]
+        page.buff_rows[0].button.setCurrentData("lb")
+
+        window.save_settings()
+
+        self.assertEqual(window.config_store.path.read_bytes(), original)
+        self.assertFalse(window.controller.emergency_latched)
+        self.assertIn("Buff Slot 1", page.validation.text())
         window.close()
 
 

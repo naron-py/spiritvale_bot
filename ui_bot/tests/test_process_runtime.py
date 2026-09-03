@@ -29,7 +29,7 @@ class ProcessRuntimeIntegrationTests(unittest.TestCase):
             child_module="ui_bot.tests.fake_runtime_child",
             process_finder=finder, retry_min_ms=20, retry_max_ms=40)
 
-    def test_snapshot_heartbeat_restarts_silent_worker_generation(self):
+    def test_stale_snapshot_with_live_heartbeat_does_not_restart_worker(self):
         runtime = ProcessRuntime(
             Path(__file__).resolve().parents[2],
             child_module="ui_bot.tests.fake_runtime_child",
@@ -41,13 +41,55 @@ class ProcessRuntimeIntegrationTests(unittest.TestCase):
         try:
             self.assertTrue(snapshots.wait(3000))
             first_generation = runtime.active_generation
+            QTest.qWait(350)
+            self.assertEqual(runtime.active_generation, first_generation)
+            self.assertIsNotNone(runtime.last_heartbeat_time)
+            self.assertTrue(runtime.child_alive)
+            self.assertTrue(runtime.pipe_alive)
+            self.assertTrue(runtime.monitor_loop_alive)
+            self.assertEqual(runtime.last_player_read_time, 1.0)
+            self.assertEqual(runtime.last_entity_scan_time, 1.0)
+            self.assertFalse(runtime.scan_in_progress)
+            self.assertEqual(runtime.scan_started_at, 0.0)
+            self.assertTrue(any("action=continue" in str(events.at(index)[0])
+                                for index in range(events.count())))
+        finally:
+            runtime.shutdown()
+
+    def test_unresponsive_pipe_restarts_silent_worker_generation(self):
+        runtime = ProcessRuntime(
+            Path(__file__).resolve().parents[2],
+            child_module="ui_bot.tests.fake_runtime_child",
+            process_finder=self.Finder(120), retry_min_ms=20, retry_max_ms=40,
+            snapshot_stale_ms=80, watchdog_check_ms=20,
+            heartbeat_timeout_ms=80)
+        snapshots = QSignalSpy(runtime.signals.snapshot)
+        runtime.attach({"mode": "memory"})
+        try:
+            self.assertTrue(snapshots.wait(3000))
+            generation = runtime.active_generation
+            runtime.process.write(b'{"command":"ignore-ping"}\n')
+            runtime.process.waitForBytesWritten(500)
             elapsed = 0
-            while elapsed < 3000 and runtime.active_generation == first_generation:
+            while elapsed < 3000 and runtime.active_generation == generation:
                 QTest.qWait(25)
                 elapsed += 25
-            self.assertGreater(runtime.active_generation, first_generation)
-            self.assertTrue(any("heartbeat" in str(events.at(index)[0]).lower()
-                                for index in range(events.count())))
+            self.assertGreater(runtime.active_generation, generation)
+        finally:
+            runtime.shutdown()
+
+    def test_memory_wait_and_recovery_commands_use_same_worker(self):
+        runtime = self.runtime(self.Finder(118))
+        snapshots = QSignalSpy(runtime.signals.snapshot)
+        runtime.attach({"mode": "memory"})
+        try:
+            self.assertTrue(snapshots.wait(3000))
+            generation = runtime.active_generation
+            runtime.wait_for_memory()
+            self.assertTrue(self._wait_for_latest_state(snapshots, BotState.PAUSED))
+            runtime.memory_recovered()
+            self.assertTrue(self._wait_for_latest_state(snapshots, BotState.RUNNING))
+            self.assertEqual(runtime.active_generation, generation)
         finally:
             runtime.shutdown()
 
@@ -79,6 +121,36 @@ class ProcessRuntimeIntegrationTests(unittest.TestCase):
             self.assertTrue(exits.wait(3000))
             self.assertTrue(exits.at(exits.count() - 1)[0])
             self.assertIsNone(runtime.process)
+        finally:
+            runtime.shutdown()
+
+    def test_live_controller_configuration_reaches_same_worker_generation(self):
+        runtime = self.runtime(self.Finder(117))
+        snapshots = QSignalSpy(runtime.signals.snapshot)
+        events = QSignalSpy(runtime.signals.event)
+        runtime.attach({"mode": "memory"})
+        try:
+            self.assertTrue(snapshots.wait(3000))
+            generation = runtime.active_generation
+            runtime.update_controller_config({
+                "buff_slots": [{"id": "buff-1", "name": "Buff Slot 1",
+                                "enabled": False, "button": "dpad_up", "order": 0}],
+                "attack_slots": [
+                    {"id": "attack-1", "name": "Attack Skill 1",
+                     "enabled": True, "button": "x", "order": 0},
+                    {"id": "attack-2", "name": "Attack Skill 2",
+                     "enabled": False, "button": "rb", "order": 1},
+                ],
+            })
+            elapsed = 0
+            while elapsed < 1000 and not any(
+                    "fake configured x" in str(events.at(index)[0])
+                    for index in range(events.count())):
+                QTest.qWait(20)
+                elapsed += 20
+            self.assertTrue(any("fake configured x" in str(events.at(index)[0])
+                                for index in range(events.count())))
+            self.assertEqual(runtime.active_generation, generation)
         finally:
             runtime.shutdown()
 
@@ -121,6 +193,31 @@ class ProcessRuntimeIntegrationTests(unittest.TestCase):
             self.assertIn("minimap", runtime.process.arguments())
             self.assertGreaterEqual(finished.count(), 1)
             self.assertTrue(finished.at(0)[0].stop_requested)
+        finally:
+            runtime.shutdown()
+
+    def test_live_controller_update_is_carried_into_pending_mode_switch(self):
+        runtime = self.runtime(self.Finder(134))
+        snapshots = QSignalSpy(runtime.signals.snapshot)
+        runtime.attach({"mode": "memory", "control_config": {"old": True}})
+        try:
+            self.assertTrue(snapshots.wait(3000))
+            self.assertTrue(runtime.select_mode({
+                "mode": "minimap", "control_config": {"old": True}}))
+            config = {
+                "buff_slots": [],
+                "attack_slots": [
+                    {"id": "attack-1", "name": "Attack Skill 1",
+                     "enabled": True, "button": "lb", "order": 0},
+                    {"id": "attack-2", "name": "Attack Skill 2",
+                     "enabled": True, "button": "rb", "order": 1},
+                ],
+            }
+
+            runtime.update_controller_config(config)
+
+            self.assertEqual(
+                runtime._pending_switch_options["control_config"], config)
         finally:
             runtime.shutdown()
 

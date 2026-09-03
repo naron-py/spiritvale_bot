@@ -50,7 +50,13 @@ ATTACK_MASH = False      # False = hold L1 down; True = tap it on the cycle belo
 ATTACK_PERIOD_S = 0.40   # mash cycle, ignored while ATTACK_MASH is False
 ATTACK_HOLD_S = 0.15     # how long L1 stays down each mash cycle
 BUFF_PERIOD_S = 60.0     # recast the buff sequence this often
-BUFF_SEQUENCE = ("up", "left", "down", "right")
+BUFF_SEQUENCE = ("up", "down", "left", "right", "x", "a")
+BUFF_EARLY_REFRESH_S = 5.0  # renew before the configured duration expires
+BUFF_ATTACK_INTERVAL_S = 0.80  # normal attacking required between buff taps
+BUFF_INITIAL_STAGGER_S = BUFF_ATTACK_INTERVAL_S
+BUFF_COMBAT_DEFER_S = 2.0  # one brief deferral when a due buff meets close combat
+BUFF_REPEAT_GAP_S = 0.15  # a second bounded tap confirms each cast under game lag
+BUFF_TAPS = 2
 SPAM_BUTTON = "y"       # button tapped on its own timer while running; None = off
 SPAM_PERIOD_S = 2
 SPAM_HOLD_S = 0.05
@@ -152,25 +158,22 @@ TARGET_SWITCH = 0.7      # only swap targets for one this much nearer
 # median of 0.4 world units, which is the bot wiggling left and right on the
 # spot. Inside this, stop steering and just hit it.
 MEM_ARRIVE = 2.5         # world units
-# Arriving used to mean a stick of exactly zero, and the damage stopped a couple
-# of seconds later with the target still standing: measured 46474 -> 37502 and
-# then frozen for dozens of frames at an unchanging 2.02 units, attack still
-# held. The game sits in keyboard mode until it sees stick motion, and with a
-# dead stick it goes back there, so the held attack stops landing. So the stick
-# has to keep moving on a target -- but the push that replaced the zero only
-# cancelled itself out frame to frame, which left the character pressed against
-# the monster, and that close the game gives no attack at all: it needs room to
-# swing. Circle the target instead. One motion pays for both lessons.
-# ponytail: MIN/MAX are the calibration knob -- the range the game actually
+# Memory hit-and-run is movement-only. Attack stays on while a valid target
+# exists; this band only decides whether the left stick approaches, stops, or
+# backs out.
+# ponytail: these two are the calibration knobs -- the range the game actually
 # swings at is unmeasured, and --fightlog is what measures it.
-MEM_ORBIT_MIN = 1.8       # closer than this, push away from the target
-MEM_ORBIT_MAX = 2.5       # further than this, push back in
-MEM_ORBIT_SPEED = 0.7     # stick magnitude while circling
-# A wall or a corner stops the circle dead, and the radius cannot say so -- the
-# radius is the thing the orbit holds constant. Our own position not changing
-# is the honest test: when it does not, go round the other way.
+min_distance = 1.8            # closer than this, move directly away
+resume_distance = 2.5         # keep backing out until this much space exists
+assert resume_distance > min_distance
+# Backward-compatible names for older tests/probes that tune the same band.
+too_close_distance = min_distance
+retreat_stop_distance = resume_distance
+MEM_ORBIT_MIN = too_close_distance
+MEM_ORBIT_MAX = retreat_stop_distance
+MEM_ORBIT_SPEED = 1.0
 MEM_ORBIT_FLIP_S = 1.5
-MEM_ORBIT_MIN_MOVE = 0.6  # world units of our own travel that counts as progress
+MEM_ORBIT_MIN_MOVE = 0.6
 # --fightlog: print distance against the target's health every frame we are on
 # one. Which distances actually take health off is the only way to set the two
 # constants above, and guessing them is what this exists to stop.
@@ -446,6 +449,16 @@ def toggle_key_hit(get_state=None):
     return bool(get_state(TOGGLE_VK) & 1)
 
 
+def automation_state_request():
+    """UI-only recovery hook; standalone runs never synthesize an End press."""
+    return None
+
+
+def controller_config_request():
+    """UI-only live input configuration hook; standalone uses safe defaults."""
+    return None
+
+
 def hold_still(mode):
     """True when memory targeting means "stop", not merely "nothing here".
 
@@ -475,10 +488,235 @@ def area_holds(eyes, requested=None):
 
 
 def attack_active(now, buffing=False, blocked=False):
-    """Whether L1 should be down; buffs and unattackable targets release it."""
-    if buffing or blocked:
+    """Whether the attack buttons should be down."""
+    # `buffing` is retained for compatibility with old probes. Routine buffs no
+    # longer own or reset attack; only an honest combat/safety block releases it.
+    if blocked:
         return False
     return (now % ATTACK_PERIOD_S) < ATTACK_HOLD_S if ATTACK_MASH else True
+
+
+def tap_buff(pad, key, hold):
+    """Tap one ordered buff control through the active pad backend."""
+    if key in ("x", "a"):
+        pad.tap_button(key, hold)
+    else:
+        pad.tap_dpad(key, hold)
+
+
+class BuffScheduler:
+    """Per-buff, tick-driven press/release scheduler independent of attack."""
+
+    def __init__(self, now=0.0, slots=None):
+        self.buffs = {}
+        self.order = []
+        self.active = None
+        self.phase = None
+        self.taps = 0
+        self.release_at = 0.0
+        self.next_cast_at = 0.0
+        self.deferred = set()
+        self.last_released = False
+        self.configure(slots or [
+            {"id": f"buff-{index}", "name": f"Buff Slot {index}",
+             "enabled": True,
+             "button": (f"dpad_{key}" if key in ("up", "down", "left", "right")
+                        else key), "order": index - 1}
+            for index, key in enumerate(BUFF_SEQUENCE, 1)
+        ], now)
+        self.reset(now)
+
+    def configure(self, slots, now, pad=None):
+        """Atomically replace slot bindings while preserving matching clocks."""
+        parsed = []
+        for index, raw in enumerate(slots):
+            slot_id = str(raw["id"])
+            button = str(raw["button"]).lower()
+            if not slot_id or button not in (
+                    "dpad_up", "dpad_down", "dpad_left", "dpad_right",
+                    "a", "b", "x", "y", "lb", "rb", "lt", "rt"):
+                raise ValueError(f"invalid buff slot {slot_id!r}")
+            parsed.append({
+                "id": slot_id, "name": str(raw.get("name") or slot_id),
+                "enabled": bool(raw.get("enabled", False)), "button": button,
+                "order": int(raw.get("order", index)),
+            })
+        if len({slot["id"] for slot in parsed}) != len(parsed):
+            raise ValueError("buff slot IDs must be unique")
+        old = self.buffs
+        parsed_by_id = {slot["id"]: slot for slot in parsed}
+        active_slot = parsed_by_id.get(self.active)
+        keep_active = bool(
+            active_slot is not None and active_slot["enabled"]
+            and active_slot["button"] == old[self.active]["button"])
+        if self.active is not None and not keep_active and pad is not None:
+            pad.release_buff(old[self.active]["button"])
+        enabled_index = 0
+        rebuilt = {}
+        for slot in sorted(parsed, key=lambda item: item["order"]):
+            previous = old.get(slot["id"])
+            if previous is None:
+                last_cast = None
+                next_due = now + enabled_index * BUFF_INITIAL_STAGGER_S
+            else:
+                last_cast = previous["last_cast"]
+                next_due = previous["next_due"]
+            if slot["enabled"]:
+                enabled_index += 1
+            rebuilt[slot["id"]] = {
+                **slot, "last_cast": last_cast, "next_due": next_due}
+        self.buffs = rebuilt
+        self.order = list(rebuilt)
+        if not keep_active:
+            self.active = self.phase = None
+            self.taps = 0
+            self.release_at = 0.0
+        self.deferred.intersection_update(rebuilt)
+
+    def reset(self, now):
+        enabled_index = 0
+        for slot_id in self.order:
+            state = self.buffs[slot_id]
+            state["last_cast"] = None
+            state["next_due"] = now + enabled_index * BUFF_INITIAL_STAGGER_S
+            if state["enabled"]:
+                enabled_index += 1
+        self.active = self.phase = None
+        self.taps = 0
+        self.release_at = 0.0
+        self.next_cast_at = now
+        self.deferred.clear()
+        self.last_released = False
+
+    def release_due(self, now, pad):
+        """Advance one bounded double-tap without sleeping or global reset."""
+        self.last_released = False
+        if self.active is None or now < self.release_at:
+            return None
+        slot_id = self.active
+        state = self.buffs[slot_id]
+        button = state["button"]
+        if self.phase == "gap":
+            try:
+                pad.press_buff(button)
+            except Exception:
+                try:
+                    pad.release_buff(button)
+                finally:
+                    self.active = self.phase = None
+                    self.taps = 0
+                raise
+            self.phase = "pressed"
+            self.taps += 1
+            self.release_at = now + BUFF_HOLD_S
+            return None
+        pad.release_buff(button)
+        self.last_released = True
+        if self.taps < BUFF_TAPS:
+            self.phase = "gap"
+            self.release_at = now + BUFF_REPEAT_GAP_S
+            return None
+        state["last_cast"] = now
+        state["next_due"] = now + BUFF_PERIOD_S - BUFF_EARLY_REFRESH_S
+        self.active = self.phase = None
+        self.taps = 0
+        self.release_at = 0.0
+        self.next_cast_at = now + BUFF_ATTACK_INTERVAL_S
+        self.deferred.discard(slot_id)
+        label = button.removeprefix("dpad_").upper()
+        print(f"\n[Buff] {label} complete; "
+              f"next_due={state['next_due']:.1f}")
+        return slot_id
+
+    def cast_due(self, now, pad, attack_active, combat_priority):
+        """Start at most one due tap without sleeping or changing attack state."""
+        if (not attack_active or self.active is not None
+                or now < self.next_cast_at):
+            return None
+        due = [slot_id for slot_id in self.order
+               if self.buffs[slot_id]["enabled"]
+               and self.buffs[slot_id]["next_due"] <= now]
+        if not due:
+            return None
+        slot_id = min(due, key=lambda item: (
+            self.buffs[item]["next_due"], self.buffs[item]["order"]))
+        state = self.buffs[slot_id]
+        button = state["button"]
+        label = button.removeprefix("dpad_").upper()
+        if combat_priority and slot_id not in self.deferred:
+            self.deferred.add(slot_id)
+            self.next_cast_at = now + BUFF_COMBAT_DEFER_S
+            print(f"\n[Buff] {label} deferred; combat priority")
+            return None
+        print(f"\n[Buff] {label} due; casting one buff while "
+              f"attack_active={attack_active}")
+        self.active = slot_id
+        self.phase = "pressed"
+        self.taps = 1
+        self.release_at = now + BUFF_HOLD_S
+        try:
+            pad.press_buff(button)
+        except Exception:
+            try:
+                pad.release_buff(button)
+            finally:
+                self.active = self.phase = None
+                self.taps = 0
+                self.release_at = 0.0
+            raise
+        return slot_id
+
+
+def complete_buff_tick(buffs, pad, now, attack):
+    """Finish one bounded tap and immediately reassert normal attack input."""
+    key = buffs.release_due(now, pad)
+    if buffs.last_released and attack:
+        pad.reassert_attack()
+    return key
+
+
+def apply_controller_config(buffs, pad, config, now):
+    """Validate then hand live buff/attack bindings to the controller loop."""
+    if not isinstance(config, dict):
+        raise ValueError("controller configuration must be an object")
+    buff_slots = config.get("buff_slots")
+    attack_slots = config.get("attack_slots")
+    if not isinstance(buff_slots, list) or not isinstance(attack_slots, list):
+        raise ValueError("controller configuration slots must be lists")
+    if len(attack_slots) != 2:
+        raise ValueError("controller configuration must contain exactly two attack slots")
+    allowed = {"dpad_up", "dpad_down", "dpad_left", "dpad_right",
+               "a", "b", "x", "y", "lb", "rb", "lt", "rt"}
+    active = []
+    attack_keys = []
+    slot_ids = set()
+    for raw in buff_slots + attack_slots:
+        if not isinstance(raw, dict) or raw.get("button") not in allowed:
+            raise ValueError("controller configuration contains an invalid slot")
+        slot_id, name, order = raw.get("id"), raw.get("name"), raw.get("order")
+        if not isinstance(slot_id, str) or not slot_id or slot_id in slot_ids:
+            raise ValueError("controller configuration slot IDs must be unique")
+        if not isinstance(name, str) or not name:
+            raise ValueError("controller configuration slot name is invalid")
+        if type(raw.get("enabled")) is not bool:
+            raise ValueError(f"{name} enabled state is invalid")
+        if type(order) is not int or order < 0:
+            raise ValueError(f"{name} order is invalid")
+        slot_ids.add(slot_id)
+        if raw.get("enabled"):
+            active.append((name, raw["button"]))
+    owners = {}
+    for name, button in active:
+        if button in owners:
+            raise ValueError(f"controller button conflict: {owners[button]} and {name}")
+        owners[button] = name
+    for raw in attack_slots:
+        if raw.get("enabled"):
+            attack_keys.append(raw["button"])
+    if not attack_keys:
+        raise ValueError("at least one enabled attack skill is required")
+    buffs.configure(buff_slots, now, pad)
+    pad.configure_attack(attack_keys)
 
 
 def dashboard_text(info, color=True):
@@ -2242,6 +2480,7 @@ class MemoryEyes:
         self.approach = None      # last heading that closed on a target
         self.orbit_dir = 1        # which way round a target we circle
         self.orbit_mark = None    # (time, x, z) the orbit last made progress at
+        self.spacing_state = None # APPROACH, ATTACK, RETREAT
         self.engaged_since = None # when we started on the current target
         self.ignored = {}         # unit -> time it becomes fair game again
         self.ignored_ptr_ids = {} # unit -> ObjectId when that pointer was ignored
@@ -2293,6 +2532,10 @@ class MemoryEyes:
         self.scanner = None
         self.stop = None
         self.scan_passes = 0     # scanner stays alive; >0 means first pass landed
+        self.scan_version = 0    # monotonic publication identity across relogs
+        self.scan_in_progress = False
+        self.scan_started_at = 0.0
+        self.last_scan_completed_at = 0.0
         self.generation = 0       # invalidates a sweep crossing a relog boundary
         self.lock = threading.Lock()
 
@@ -2379,6 +2622,9 @@ class MemoryEyes:
             self.scan_error = ""
             self.recovery = ""
             self.scan_passes = 0
+            self.scan_in_progress = False
+            self.scan_started_at = 0.0
+            self.last_scan_completed_at = 0.0
             self.fallback_since = None
             self.next_full_rescan = 0.0
             self.ignored, self.ignored_ptr_ids, self.ignored_ids = {}, {}, {}
@@ -2390,6 +2636,7 @@ class MemoryEyes:
             self.path_at = self.escape_until = 0.0
             self.escape = self.orbit_mark = None
             self.escapes, self.orbit_dir = 0, 1
+            self.spacing_state = None
             self.wedge_anchor = None
             # The recorded area describes the world and survives. Its active
             # walk-back/wander decision belongs to the character that did not.
@@ -2886,8 +3133,17 @@ class MemoryEyes:
                         # from the cached list while the full pass runs.
                         if hot is not None and time.time() - self.hot_full_at >= HOT_SELF_HEAL_S:
                             hot = None
-                    found = self.ms.world_units(mem, regions=hot,
-                                                classes=self.classes)
+                    with self.lock:
+                        if generation == self.generation:
+                            self.scan_in_progress = True
+                            self.scan_started_at = time.time()
+                    try:
+                        found = self.ms.world_units(mem, regions=hot,
+                                                    classes=self.classes)
+                    finally:
+                        with self.lock:
+                            if generation == self.generation:
+                                self.scan_in_progress = False
                     if hot is None:
                         with self.lock:
                             self.hot_full_at = time.time()
@@ -2899,6 +3155,8 @@ class MemoryEyes:
                             continue
                         self.units = found
                         self.scan_passes += 1
+                        self.scan_version = getattr(self, "scan_version", 0) + 1
+                        self.last_scan_completed_at = time.time()
                     if self.owner is None and found:
                         # Who we are, read instead of walked for: any unit
                         # carries the managers, so this is a pointer walk with
@@ -3343,6 +3601,134 @@ class MemoryEyes:
             self.orbit_mark = (now, px, pz)
         return self.orbit_dir
 
+    def _set_spacing_state(self, state, dist):
+        prev = getattr(self, "spacing_state", None)
+        if prev != state:
+            if prev == "APPROACH" and state == "RETREAT":
+                print(f"\n[Spacing] APPROACH -> RETREAT distance={dist:.2f}")
+            elif prev == "RETREAT" and state == "ATTACK":
+                print(f"\n[Spacing] RETREAT -> ATTACK distance={dist:.2f}")
+            self.spacing_state = state
+
+    def _area_clearance(self, x, z):
+        """Approximate space left before the active area's movement boundary."""
+        area = getattr(self, "area", None)
+        if area is None:
+            return AREA_LOOKAHEAD
+        if getattr(area, "polygon", None):
+            best = None
+            points = area.polygon
+            for a, b in zip(points, points[1:] + points[:1]):
+                ax, az = a
+                bx, bz = b
+                dx, dz = bx - ax, bz - az
+                size = dx * dx + dz * dz
+                if size <= 1e-9:
+                    distance = math.hypot(x - ax, z - az)
+                else:
+                    t = max(0.0, min(1.0, ((x - ax) * dx + (z - az) * dz) / size))
+                    hx, hz = ax + dx * t, az + dz * t
+                    distance = math.hypot(x - hx, z - hz)
+                best = distance if best is None else min(best, distance)
+            return best or 0.0
+        if getattr(area, "circles", None):
+            return max((radius - math.hypot(x - cx, z - cz)
+                        for cx, cz, radius in area.circles), default=0.0)
+        return AREA_LOOKAHEAD if area.safe(x, z) else 0.0
+
+    def _retreat_spacing(self, px, pz, tx, tz, dist):
+        """Pick a non-idle retreat heading that stays inside the active area."""
+        ax, az = px - tx, pz - tz
+        length = math.hypot(ax, az)
+        if length < 1e-9:
+            return None
+        direct = stick_for(self.basis, ax, az)
+        if not self.area:
+            return direct
+        ux, uz = ax / length, az / length
+        best = None
+        for degrees in (0, -30, 30, -60, 60, -90, 90):
+            angle = math.radians(degrees)
+            wx = ux * math.cos(angle) - uz * math.sin(angle)
+            wz = ux * math.sin(angle) + uz * math.cos(angle)
+            candidate = stick_for(self.basis, wx, wz)
+            if not candidate:
+                continue
+            cdx, cdz = world_for(self.basis, *candidate)
+            clen = math.hypot(cdx, cdz)
+            if clen < 1e-9:
+                continue
+            endpoint = (px + cdx / clen * AREA_LOOKAHEAD,
+                        pz + cdz / clen * AREA_LOOKAHEAD)
+            if not self.area.guard_step((px, pz), endpoint)[0]:
+                continue
+            gain = math.hypot(endpoint[0] - tx, endpoint[1] - tz) - dist
+            if gain <= 1e-6:
+                continue
+            clearance = self._area_clearance(*endpoint)
+            score = gain * 20.0 + clearance * 0.5 - abs(degrees) * 0.02
+            if best is None or score > best[0]:
+                best = (score, candidate, endpoint)
+        if best is None:
+            hx, hz = self.area.home(px, pz)
+            candidate = stick_for(self.basis, hx - px, hz - pz)
+            if candidate:
+                cdx, cdz = world_for(self.basis, *candidate)
+                clen = math.hypot(cdx, cdz)
+                if clen >= 1e-9:
+                    endpoint = (px + cdx / clen * AREA_LOOKAHEAD,
+                                pz + cdz / clen * AREA_LOOKAHEAD)
+                    gain = math.hypot(endpoint[0] - tx, endpoint[1] - tz) - dist
+                    if gain > 1e-6 and self.area.guard_step((px, pz), endpoint)[0]:
+                        best = (gain * 20.0 + self._area_clearance(*endpoint) * 0.5,
+                                candidate, endpoint)
+        if best is None:
+            return None
+        _, selected, endpoint = best
+        self.goal = endpoint
+        return selected
+
+    def _attack_spacing(self, now, px, pz, tx, tz, dist):
+        """Keep moving around the target while attacks stay held."""
+        ax, az = px - tx, pz - tz
+        length = math.hypot(ax, az)
+        if length < 1e-9:
+            return None
+        ux, uz = ax / length, az / length
+        side = self._orbit_way(now, px, pz)
+        tangent = (-uz * side, ux * side)
+        # A small outward component turns a pure circle into kiting: the bot
+        # keeps a useful gap if the monster follows instead of standing still at
+        # the first attack distance.
+        ways = ((tangent[0] + ux * 0.35, tangent[1] + uz * 0.35),
+                (-tangent[0] + ux * 0.35, -tangent[1] + uz * 0.35),
+                (ux, uz), tangent, (-tangent[0], -tangent[1]))
+        best = None
+        for order, (wx, wz) in enumerate(ways):
+            candidate = stick_for(self.basis, wx, wz)
+            if not candidate:
+                continue
+            cdx, cdz = world_for(self.basis, *candidate)
+            clen = math.hypot(cdx, cdz)
+            if clen < 1e-9:
+                continue
+            endpoint = (px + cdx / clen * AREA_LOOKAHEAD,
+                        pz + cdz / clen * AREA_LOOKAHEAD)
+            if self.area and not self.area.guard_step((px, pz), endpoint)[0]:
+                continue
+            end_dist = math.hypot(endpoint[0] - tx, endpoint[1] - tz)
+            if end_dist < min_distance:
+                continue
+            clearance = self._area_clearance(*endpoint) if self.area else AREA_LOOKAHEAD
+            score = -abs(end_dist - resume_distance) * 2.0 + clearance * 0.5 - order * 0.1
+            if best is None or score > best[0]:
+                best = (score, candidate, endpoint)
+        if best is None:
+            return self._retreat_spacing(px, pz, tx, tz, dist)
+        _, selected, endpoint = best
+        self.goal = endpoint
+        return selected
+
     def known_players(self):
         with self.lock:
             return [u for k, u, *_ in self.units if k == "player"]
@@ -3444,6 +3830,7 @@ class MemoryEyes:
             # ones were.
             self.me = self.basis = self.approach = None
             self.orbit_mark = None
+            self.spacing_state = None
             # The owner is a pointer to the object that was just rebuilt, so it
             # is as dead as the rest. It is also what the scanner checks before
             # looking us up again, so leaving it set meant we never recovered.
@@ -3519,6 +3906,7 @@ class MemoryEyes:
                 self.home_goal = self.area.home(px, pz)
                 self.chasing = self.engaged_since = None
                 self.chasing_id = None
+                self.spacing_state = None
                 self.target_name = ""
                 print(f"\nzone: player outside safe interior; returning to "
                       f"{self.area.name!r}")
@@ -3593,6 +3981,7 @@ class MemoryEyes:
         if not hit:
             self.chasing = self.engaged_since = None
             self.chasing_id = None
+            self.spacing_state = None
             cloaked = next((e for e in allowed
                             if e[0] <= MEM_RANGE and self._known_invisible(e[1])),
                            None)
@@ -3650,6 +4039,7 @@ class MemoryEyes:
                     self._ignore_target(u, now + MEM_IGNORE_S)
             self.chasing = self.engaged_since = None
             self.chasing_id = None
+            self.spacing_state = None
             self.escapes, self.wedge_anchor, self.mode = 0, None, "walled"
             return None, None, None
         elif stale_target(now, self.engaged_since):
@@ -3659,6 +4049,7 @@ class MemoryEyes:
             self._ignore_target(hit[0], now + MEM_IGNORE_S, hit_id)
             self.chasing = self.engaged_since = None
             self.chasing_id = None
+            self.spacing_state = None
             self.mode = "gave up"
             return None, None, None
         if FIGHT_LOG and self.mem and dist <= MEM_RANGE:
@@ -3666,6 +4057,8 @@ class MemoryEyes:
             # is what the distance says anyway.
             hp = self.ms.unit_health(self.mem, hit[0])
             print(f"\nfightlog {hit[0]:012X} dist {dist:5.2f} hp {hp}")
+        if dist > MEM_ARRIVE:
+            self._set_spacing_state("APPROACH", dist)
         boundary_standoff = False
         if (self.area is not None and self.area.inside(hit[1], hit[3])
                 and not self.area.safe(hit[1], hit[3])):
@@ -3680,23 +4073,23 @@ class MemoryEyes:
                                   and math.hypot(px - fight_x, pz - fight_z)
                                   <= MEM_ARRIVE)
         if dist <= MEM_ARRIVE or boundary_standoff:
-            # Arrived: circle it rather than stand on it. Standing on the
-            # monster is no attack, and a dead stick is no attack either.
+            # Arrived: hit-and-run owns only the left stick. Attack stays held by
+            # the independent combat path while we stop or back straight out.
             self.mode = "on it"
-            radial = (stick_for(self.basis, hit[1] - px, hit[3] - pz)
-                      if dist >= MEM_ORBIT_MIN else self.approach)
-            # Point blank the direction to the target flips every frame,
-            # measured at 0.4 units, so the last good heading stands in.
-            if not radial:
+            retreating = getattr(self, "spacing_state", None) == "RETREAT"
+            if retreating:
+                state = "RETREAT" if dist < resume_distance else "ATTACK"
+            else:
+                state = "RETREAT" if dist < min_distance else "ATTACK"
+            self._set_spacing_state(state, dist)
+            move = (self._attack_spacing(now, px, pz, hit[1], hit[3], dist)
+                    if state == "ATTACK"
+                    else self._retreat_spacing(px, pz, hit[1], hit[3], dist))
+            if not move:
                 return 0.0, 0.0, dist
-            rx, ry = radial
-            way = self._orbit_way(now, px, pz)
-            ox, oy = -ry * way, rx * way
-            pull = (-1.0 if boundary_standoff or dist < MEM_ORBIT_MIN else
-                    1.0 if dist > MEM_ORBIT_MAX else 0.0)
-            ox, oy = ox + rx * pull, oy + ry * pull
-            n = math.hypot(ox, oy) or 1.0
-            return ox / n * MEM_ORBIT_SPEED, oy / n * MEM_ORBIT_SPEED, dist
+            if self.goal is None:
+                self.goal = (px + (px - hit[1]), pz + (pz - hit[3]))
+            return move[0], move[1], dist
         gx, gz = self.route_to(now, px, pz, hit[1], hit[3])
         if self.sealed:
             # Walled off with no way round: walking at it is eight seconds of
@@ -3705,6 +4098,7 @@ class MemoryEyes:
             self._ignore_target(hit[0], now + MEM_IGNORE_S, hit_id)
             self.chasing = self.engaged_since = None
             self.chasing_id = None
+            self.spacing_state = None
             self.mode = "walled"
             return None, None, None
         s = stick_for(self.basis, gx - px, gz - pz)
@@ -3725,7 +4119,6 @@ class VirtualPad:
     def __init__(self):
         import vgamepad as vg
         self.pad = vg.VX360Gamepad()
-        self.attack_btn = vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_SHOULDER  # L1 / LB
         self.dpad = {"up": vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_UP,
                      "down": vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_DOWN,
                      "left": vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_LEFT,
@@ -3734,25 +4127,108 @@ class VirtualPad:
                      "b": vg.XUSB_BUTTON.XUSB_GAMEPAD_B,
                      "x": vg.XUSB_BUTTON.XUSB_GAMEPAD_X,
                      "y": vg.XUSB_BUTTON.XUSB_GAMEPAD_Y}
+        self.buttons = {
+            **{f"dpad_{key}": value for key, value in self.dpad.items()},
+            **self.face,
+            "lb": vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_SHOULDER,
+            "rb": vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_SHOULDER,
+        }
+        self.attack_keys = ("lb", "rb")
+        self.attack_btn = tuple(self.buttons[key] for key in self.attack_keys)
+        self.attack_held = False
+        self.held_triggers = set()
 
     def _tap(self, btn, hold):
         # The stick keeps its last value across this: left_joystick_float persists
         # between updates, so a tap never interrupts the chase.
-        self.pad.press_button(btn)
-        self.pad.update()
-        time.sleep(hold)
-        self.pad.release_button(btn)
-        self.pad.update()
+        try:
+            self.pad.press_button(btn)
+            self.pad.update()
+            time.sleep(hold)
+        finally:
+            self.pad.release_button(btn)
+            self.pad.update()
 
     def tap_dpad(self, name, hold):
+        if (getattr(self, "attack_held", False)
+                and f"dpad_{name}" in self._attack_controls()):
+            return
         self._tap(self.dpad[name], hold)
 
     def tap_button(self, name, hold=SPAM_HOLD_S):
+        if (getattr(self, "attack_held", False)
+                and name in self._attack_controls()):
+            return
         self._tap(self.face[name], hold)
+
+    def _button(self, key):
+        if hasattr(self, "buttons"):
+            return self.buttons.get(key)
+        if isinstance(key, str) and key.startswith("dpad_"):
+            return self.dpad[key.removeprefix("dpad_")]
+        if isinstance(key, str) and key in self.face:
+            return self.face[key]
+        return key
+
+    def _press_control(self, key):
+        if key in ("lt", "rt"):
+            trigger = self.pad.left_trigger if key == "lt" else self.pad.right_trigger
+            trigger(value=255)
+            self.held_triggers.add(key)
+        else:
+            self.pad.press_button(self._button(key))
+
+    def _release_control(self, key):
+        if key in ("lt", "rt"):
+            trigger = self.pad.left_trigger if key == "lt" else self.pad.right_trigger
+            trigger(value=0)
+            self.held_triggers.discard(key)
+        else:
+            self.pad.release_button(self._button(key))
+
+    def _attack_controls(self):
+        return tuple(getattr(self, "attack_keys", getattr(self, "attack_btn", ())))
+
+    def press_buff(self, key):
+        self._press_control(key)
+        self.pad.update()
+
+    def release_buff(self, key):
+        self._release_control(key)
+        self.pad.update()
+
+    def reassert_attack(self):
+        for key in self._attack_controls():
+            self._press_control(key)
+        self.attack_held = True
+        self.pad.update()
+
+    def configure_attack(self, keys):
+        keys = tuple(keys)
+        was_held = bool(getattr(self, "attack_held", False))
+        old_keys = self._attack_controls()
+        for key in old_keys:
+            if key in keys:
+                continue
+            self._release_control(key)
+        self.attack_keys = keys
+        if hasattr(self, "buttons"):
+            self.attack_btn = tuple(self.buttons[key] for key in keys
+                                    if key in self.buttons)
+        if was_held:
+            for key in keys:
+                if key in old_keys:
+                    continue
+                self._press_control(key)
+        self.attack_held = was_held
+        self.pad.update()
 
     def tap_trigger(self, name, hold):
         # A trigger is an axis, not a button, so it cannot go through _tap. The
         # stick keeps its value across this the same way.
+        if (getattr(self, "attack_held", False)
+                and name in self._attack_controls()):
+            return
         press = (self.pad.left_trigger if name == "lt"
                  else self.pad.right_trigger)
         press(value=255)
@@ -3762,15 +4238,28 @@ class VirtualPad:
         self.pad.update()
 
     def stick(self, sx, sy, attack=False):
+        if sx == 0.0 and sy == 0.0 and not attack:
+            self.release_all()
+            return
         self.pad.left_joystick_float(sx, sy)
         if attack:
-            self.pad.press_button(self.attack_btn)
+            for key in self._attack_controls():
+                self._press_control(key)
         else:
-            self.pad.release_button(self.attack_btn)
+            for key in self._attack_controls():
+                self._release_control(key)
+        self.attack_held = bool(attack)
         self.pad.update()  # one report per frame
 
+    def release_all(self):
+        self.pad.reset()
+        self.pad.update()
+        self.attack_held = False
+        if hasattr(self, "held_triggers"):
+            self.held_triggers.clear()
+
     def close(self):
-        self.stick(0.0, 0.0, False)
+        self.release_all()
 
 
 class ArduinoPad:
@@ -3814,27 +4303,102 @@ class ArduinoPad:
         self.ser.reset_input_buffer()  # drop READY/PONG backlog before commands
         self.ser.timeout = 2
         self.last = None
+        self.attack_keys = ("lb", "rb")
+        self.attack_held = False
+        self.held_triggers = set()
 
-    ATTACK_BTN = 4  # LB in the usual XInput button order
+    ATTACK_BTNS = (4, 5)  # LB and RB in the usual XInput button order
     HAT = {"up": 0, "right": 2, "down": 4, "left": 6}  # sketch: 0..7 clockwise from N
     FACE = {"a": 0, "b": 1, "x": 2, "y": 3}  # usual XInput button order
+    BUTTONS = {**FACE, "lb": 4, "rb": 5}
 
     def tap_dpad(self, name, hold):
-        self._cmd(f"V{self.HAT[name]}")
-        time.sleep(hold)
-        self._cmd("V-1")  # -1 centres the hat
+        if (getattr(self, "attack_held", False)
+                and f"dpad_{name}" in getattr(self, "attack_keys", ())):
+            return
+        try:
+            self._cmd(f"V{self.HAT[name]}")
+            time.sleep(hold)
+        finally:
+            self._cmd("V-1")  # -1 centres the hat
 
     def tap_button(self, n, hold=None):
-        # hold is ignored: the sketch's own B command is press, 50ms, release.
-        self._cmd(f"B{self.FACE.get(n, n)}")
+        if (isinstance(n, str) and getattr(self, "attack_held", False)
+                and n in getattr(self, "attack_keys", ())):
+            return
+        button = self.FACE.get(n, n)
+        if hold is None:
+            self._cmd(f"B{button}")
+            return
+        try:
+            self._cmd(f"D{button}")
+            time.sleep(hold)
+        finally:
+            self._cmd(f"U{button}")
+
+    def press_buff(self, key):
+        self._press_control(key)
+
+    def release_buff(self, key):
+        self._release_control(key)
+
+    def _send_triggers(self):
+        held = getattr(self, "held_triggers", set())
+        self._cmd(f"T{255 if 'lt' in held else 0},{255 if 'rt' in held else 0}")
+
+    def _press_control(self, key):
+        if key.startswith("dpad_"):
+            self._cmd(f"V{self.HAT[key.removeprefix('dpad_')]}")
+        elif key in ("lt", "rt"):
+            self.held_triggers.add(key)
+            self._send_triggers()
+        else:
+            self._cmd(f"D{self.BUTTONS[key]}")
+
+    def _release_control(self, key):
+        if key.startswith("dpad_"):
+            self._cmd("V-1")
+        elif key in ("lt", "rt"):
+            self.held_triggers.discard(key)
+            self._send_triggers()
+        else:
+            self._cmd(f"U{self.BUTTONS[key]}")
+
+    def reassert_attack(self):
+        for key in getattr(self, "attack_keys", ("lb", "rb")):
+            self._press_control(key)
+
+    def configure_attack(self, keys):
+        keys = tuple(keys)
+        was_held = bool(getattr(self, "attack_held", False))
+        old_keys = tuple(getattr(self, "attack_keys", ("lb", "rb")))
+        released_hat = False
+        for key in old_keys:
+            if key in keys:
+                continue
+            self._release_control(key)
+            released_hat = released_hat or key.startswith("dpad_")
+        self.attack_keys = keys
+        if was_held:
+            for key in keys:
+                if (key not in old_keys
+                        or (released_hat and key.startswith("dpad_"))):
+                    self._press_control(key)
+        self.attack_held = was_held
 
     def tap_trigger(self, name, hold):
         # 'T<left>,<right>', the sketch's trigger axes. ponytail: untested on
         # the board -- the game only reads XInput, so vgamepad is the live path.
-        lo, hi = (255, 0) if name == "lt" else (0, 255)
-        self._cmd(f"T{lo},{hi}")
-        time.sleep(hold)
-        self._cmd("T0,0")
+        if (getattr(self, "attack_held", False)
+                and name in getattr(self, "attack_keys", ())):
+            return
+        try:
+            self.held_triggers.add(name)
+            self._send_triggers()
+            time.sleep(hold)
+        finally:
+            self.held_triggers.discard(name)
+            self._send_triggers()
 
     def _cmd(self, line):
         self.ser.write(f"{line}\n".encode())
@@ -3845,18 +4409,32 @@ class ArduinoPad:
     def stick(self, sx, sy, attack=False):
         # HID Y axis is down-positive, our sy is up-positive.
         x, y = int(sx * 32767), int(-sy * 32767)
+        if (x, y, attack) == (0, 0, False):
+            if self.last != (0, 0, False):
+                self.release_all()
+            return
         if (x, y, attack) == self.last:
             return  # ponytail: sketch is synchronous, skip no-op round trips
         if self.last is None or (x, y) != self.last[:2]:
             self._cmd(f"L{x},{y}")
         if self.last is None or attack != self.last[2]:
-            self._cmd(f"{'D' if attack else 'U'}{self.ATTACK_BTN}")
+            for key in getattr(self, "attack_keys", ("lb", "rb")):
+                (self._press_control if attack else self._release_control)(key)
+        self.attack_held = bool(attack)
         self.last = (x, y, attack)
 
+    def release_all(self):
+        self._cmd("Z")
+        self.last = (0, 0, False)
+        self.attack_held = False
+        if hasattr(self, "held_triggers"):
+            self.held_triggers.clear()
+
     def close(self):
-        self.ser.write(b"Z\n")
-        self.ser.readline()
-        self.ser.close()
+        try:
+            self.release_all()
+        finally:
+            self.ser.close()
 
 
 def targeting_mode(argv, area=None):
@@ -3945,9 +4523,7 @@ def main(port=None, area=None):
     target_blacklist = TargetBlacklist()
     stuck_watchdog = StuckWatchdog()
     paused = START_PAUSED
-    next_buff = 0.0   # 0 = cast once at startup, then every BUFF_PERIOD_S
-    buff_queue = []   # d-pad presses left in the current cast
-    next_press = 0.0  # earliest time for the next one
+    buffs = BuffScheduler()
     next_spam = 0.0   # SPAM_BUTTON goes out on its own timer
     next_loot = 0.0   # LOOT_BUTTON while standing on a drop
     next_login_check = 0.0  # a whole-window grab, so kept to RECONNECT_POLL_S
@@ -3962,14 +4538,35 @@ def main(port=None, area=None):
     with mss.mss() as sct:
         try:
             while True:
+                control_config = controller_config_request()
+                if control_config is not None:
+                    try:
+                        apply_controller_config(
+                            buffs, pad, control_config, time.time())
+                        print("\n[Config] live buff and attack settings applied")
+                    except ValueError as exc:
+                        print(f"\n[Config] input settings rejected: {exc}")
+                request = automation_state_request()
+                if request == "wait" and not paused:
+                    pad.stick(0.0, 0.0, False)
+                    buffs.reset(time.time())
+                    paused = True
+                    print("\nWAITING: memory scan delayed")
+                elif request == "running" and paused:
+                    pad.stick(0.0, 0.0, False)
+                    if zone is None:
+                        wake_controller(pad)
+                    buffs.reset(time.time())
+                    paused = False
+                    print("\nRUNNING: fresh player read received")
                 if toggle_key_hit():
                     paused = toggle_running(paused, pad, pet_filter, area=zone)
                     target_lock.reset()
                     target_blacklist.reset()
                     stuck_watchdog.reset()
                     last = None
-                    buff_queue = []
-                    next_buff = next_press = next_spam = next_loot = 0.0
+                    buffs.reset(time.time())
+                    next_spam = next_loot = 0.0
                     if eyes is not None:
                         # Same reason the pixel helpers reset here: a drop held
                         # from before the pause is stale by the time we resume.
@@ -4069,8 +4666,8 @@ def main(port=None, area=None):
                         stuck_watchdog.reset()
                         pet_filter.reset()
                         last = None
-                        buff_queue = []
-                        next_buff = next_press = next_spam = next_loot = 0.0
+                        buffs.reset(time.time())
+                        next_spam = next_loot = 0.0
                         if reconnecting:
                             reconnect_state = (f"handling {did} screen "
                                                f"({same_screen[1]}/"
@@ -4087,11 +4684,6 @@ def main(port=None, area=None):
                         if eyes is not None:
                             eyes.account_pursuit_time(time.time(), "reconnect")
                         continue
-
-                if not buff_queue and time.time() >= next_buff:
-                    buff_queue = list(BUFF_SEQUENCE)
-                    next_buff = time.time() + BUFF_PERIOD_S
-                    print(f"\nbuffing: {' '.join(BUFF_SEQUENCE)}")
 
                 reg = minimap_region(win)
                 img = np.array(sct.grab(reg))[:, :, :3]
@@ -4281,14 +4873,13 @@ def main(port=None, area=None):
                     # accidentally bypass the farming-zone safety margin.
                     sx, sy, boundary_blocked = eyes.guard_area_step(sx, sy, now)
 
-                # Buffs need a clean cast: release L1 before the first d-pad tap,
-                # keep it released through every gap, then resume after the last.
                 atk = attack_active(
-                    now, buffing=bool(buff_queue),
-                    blocked=bool(eyes is not None and memory_driving
+                    now, blocked=bool(eyes is not None and memory_driving
                                  and eyes.mode in ("invisible", "going back",
                                                    "boundary", "no area"))
-                    or boundary_blocked)
+                    or (boundary_blocked
+                        and not (eyes is not None and memory_driving
+                                 and eyes.spacing_state in ("ATTACK", "RETREAT"))))
                 if eyes is not None:
                     if boundary_blocked:
                         eyes.movement_owner = "boundary"
@@ -4303,17 +4894,24 @@ def main(port=None, area=None):
                     # can learn a wall from -- loot may have won the arbitration
                     # above, and target()'s own vector was never sent.
                     eyes.observe_move(now, sx, sy, on_loot)
+                # End a bounded press immediately before the normal controller
+                # report, so attack is reasserted in this same tick if the cast
+                # animation interrupted it.
+                complete_buff_tick(buffs, pad, time.time(), atk)
                 pad.stick(sx, sy, atk)
 
-                # One d-pad press per pass, spaced by BUFF_GAP_S. The stick keeps
-                # its last value across a tap, while attack stays released for
-                # the complete sequence.
                 key = ""
-                if buff_queue and now >= next_press:
-                    key = buff_queue.pop(0)
-                    pad.tap_dpad(key, BUFF_HOLD_S)
-                    next_press = now + BUFF_GAP_S
+                danger_close = bool(atk and (
+                    (eyes is not None and memory_driving and eyes.mode == "on it")
+                    or (not memory_driving and
+                        (state in ("concealed", "centered")
+                         or (display_distance is not None
+                             and display_distance <= STUCK_MIN_DIST_PX)))))
+                cast = buffs.cast_due(now, pad, atk, danger_close)
+                if cast:
+                    key = cast
                 elif (eyes is not None and now >= next_loot
+                        and buffs.active is None
                         and (eyes.loot_mode == "loot get"
                              or eyes.loot_here())):
                     # Something is under us: LOOT_BUTTON collects it. Checked
@@ -4325,7 +4923,8 @@ def main(port=None, area=None):
                     pad.tap_trigger(LOOT_BUTTON, LOOT_HOLD_S)
                     key = LOOT_BUTTON
                     next_loot = now + LOOT_TAP_GAP_S
-                elif SPAM_BUTTON and now >= next_spam:
+                elif (SPAM_BUTTON and now >= next_spam
+                      and buffs.active is None):
                     # Never in the same pass as a buff press: two taps back to back
                     # land inside one another's animation and the game drops one.
                     pad.tap_button(SPAM_BUTTON, SPAM_HOLD_S)
@@ -4588,7 +5187,8 @@ def demo():
                             now=TARGET_IGNORE_S + 0.01) == [moved_blocked, other]
 
     assert TOGGLE_VK == 0x23 and START_PAUSED
-    assert not attack_active(0.0, buffing=True), "buff sequence must release attack"
+    assert BUFF_SEQUENCE == ("up", "down", "left", "right", "x", "a")
+    assert attack_active(0.0, buffing=True), "routine buffs must not release attack"
     assert not attack_active(0.0, blocked=True), "do not swing at a cloaked target"
     assert attack_active(0.0, buffing=False), "attack resumes after the last buff"
 
@@ -4661,6 +5261,7 @@ def demo():
             self.ignored = {}
             self.mode, self.misses, self.hot = "chasing", 0, None
             self.orbit_dir, self.orbit_mark = 1, None
+            self.spacing_state = None
             self.at, self.mem = at, None
             self.seen_at, self.sweep_at, self.fight_ok = {}, 0, {}
             self.ms = _Fights(real, hidden=hidden, ids=ids)
@@ -4975,46 +5576,35 @@ def demo():
     free.target(1.0)
     assert free.mode == "far", free.mode
 
-    # In melee the bot circles the target instead of standing on it: standing
-    # on a monster is a character with no room to swing, and the game gives no
-    # attack for it. The stick must also never go still (see MEM_ORBIT_MIN).
-    band = (MEM_ORBIT_MIN + MEM_ORBIT_MAX) / 2
-    ring = _Far(band)
-    rsx, rsy, rd = ring.target(1.0)
-    assert ring.mode == "on it", ring.mode
-    assert abs(rd - band) < 1e-6, rd
-    assert abs(math.hypot(rsx, rsy) - MEM_ORBIT_SPEED) < 1e-6, (rsx, rsy)
-    # Target sits on +x from us, so in the band the push is pure tangent.
-    assert abs(rsx) < 1e-6 and abs(rsy) > 0, (rsx, rsy)
+    assert resume_distance > min_distance
+    # Hit-and-run owns only movement. Attack remains a separate held state.
+    normal = _Far((min_distance + resume_distance) / 2)
+    nsx, nsy, nd = normal.target(1.0)
+    assert normal.mode == "on it" and normal.spacing_state == "ATTACK"
+    assert abs(nd - (min_distance + resume_distance) / 2) < 1e-6
+    assert abs(nsx) + abs(nsy) > 0.1, (nsx, nsy)
+    assert attack_active(1.0), "attack strafe must not release LB/RB"
 
-    # Too close: the push has to carry us away from it, or we stay jammed in.
-    close = _Far(MEM_ORBIT_MIN / 2)
-    close.approach = (1.0, 0.0)          # last heading that closed on it
-    csx, _, _ = close.target(1.0)
-    assert csx < 0, f"must back off when inside MEM_ORBIT_MIN, got {csx}"
+    close = _Far(min_distance / 2)
+    close.spacing_state = "APPROACH"
+    csx, csy, _ = close.target(1.0)
+    assert close.spacing_state == "RETREAT"
+    assert csx < 0 and abs(csy) < 1e-6, (csx, csy)
+    assert attack_active(1.0), "retreat must not release LB/RB"
 
-    # Drifted out but still in melee: pull back in rather than let it slide.
-    # Defaults put MEM_ORBIT_MAX at MEM_ARRIVE, leaving no room to drift, so
-    # this narrows the band the way tuning it down would.
-    kept_max = MEM_ORBIT_MAX
-    try:
-        globals()["MEM_ORBIT_MAX"] = MEM_ARRIVE / 2
-        wide = _Far(MEM_ARRIVE * 0.75)
-        wsx, _, _ = wide.target(1.0)
-        assert wsx > 0, f"must close back to the band, got {wsx}"
-    finally:
-        globals()["MEM_ORBIT_MAX"] = kept_max
+    still_close = _Far((min_distance + resume_distance) / 2)
+    still_close.spacing_state = "RETREAT"
+    ssx, _, _ = still_close.target(1.0)
+    assert still_close.spacing_state == "RETREAT" and ssx < 0
+    spaced = _Far(resume_distance)
+    spaced.spacing_state = "RETREAT"
+    sx0, sy0, _ = spaced.target(1.0)
+    assert spaced.spacing_state == "ATTACK" and abs(sx0) + abs(sy0) > 0.1
 
-    # Blocked: our own position is what says the circle is getting nowhere --
-    # the radius cannot, it is the thing being held constant. _Far parks us at
-    # the origin, which is exactly a bot pressed against a wall.
-    stuck = _Far(band)
-    stuck.target(1.0)
-    assert stuck.orbit_dir == 1, stuck.orbit_dir
-    stuck.target(1.0 + MEM_ORBIT_FLIP_S / 2)
-    assert stuck.orbit_dir == 1, "must not reverse before MEM_ORBIT_FLIP_S"
-    stuck.target(1.0 + MEM_ORBIT_FLIP_S + 0.1)
-    assert stuck.orbit_dir == -1, "blocked circle must turn round"
+    far_fight = _Far(MEM_ARRIVE + 1.0)
+    fsx, fsy, _ = far_fight.target(1.0)
+    assert far_fight.spacing_state == "APPROACH" and (fsx or fsy)
+    assert attack_active(1.0), "approach must not release LB/RB"
     # Loot. The rule under test is the one the pooling forces: a slot holding a
     # position is not a drop, a slot that has been seen to *change* is.
     class _Loot(MemoryEyes):
@@ -5215,21 +5805,15 @@ def demo():
     assert near.mode == "chasing", near.mode
     assert near.approach, "the chase heading is what the back-off reverses"
 
-    # On a target the stick must never be exactly zero: the game falls back to
-    # keyboard mode and the held attack quietly stops landing, measured as a
-    # target frozen at 37502 hp for dozens of frames while the bot reported
-    # "on it". The orbit is what keeps it alive, so it must not cancel itself
-    # out either -- that was the old holding push, and it is how the character
-    # ended up jammed against the monster with no room to swing.
+    # On a target the attack buttons are independent from spacing: the stick can
+    # approach, stop, or back off without changing the held LB/RB state.
     onto = _Far(MEM_ARRIVE / 2)
-    onto.approach = (0.6, -0.8)
+    onto.spacing_state = "RETREAT"
     one = onto.target(1.0)
     two = onto.target(1.0)
     assert onto.mode == "on it", onto.mode
-    assert one[0] or one[1], "a dead stick loses the attack"
-    assert abs(one[0] + two[0]) > 1e-9 or abs(one[1] + two[1]) > 1e-9, (one, two)
-    # Inside MEM_ORBIT_MIN it has to open the distance, not hold it.
-    assert one[0] * 0.6 + one[1] * -0.8 < 0, one
+    assert one[0] < 0 and two[0] < 0, (one, two)
+    assert attack_active(1.0), "spacing must not release LB/RB"
 
     # A blank position read must not throw the calibration away: the bot goes
     # silent until someone notices and restarts it. Coast, then give up.
@@ -5347,6 +5931,81 @@ def demo():
     finally:
         time.sleep = old_sleep
     assert all(c[2] is True for c in warp_pad.calls), "wake dropped attack"
+
+    class FakeVirtualGamepad:
+        def __init__(self):
+            self.calls = []
+            self.held = set()
+
+        def left_joystick_float(self, x, y):
+            self.calls.append(("left", x, y))
+
+        def press_button(self, button):
+            self.held.add(button)
+            self.calls.append(("down", button))
+
+        def release_button(self, button):
+            self.held.discard(button)
+            self.calls.append(("up", button))
+
+        def reset(self):
+            self.held.clear()
+            self.calls.append(("reset",))
+
+        def update(self):
+            self.calls.append(("update",))
+
+    virtual = VirtualPad.__new__(VirtualPad)
+    virtual.pad = FakeVirtualGamepad()
+    virtual.attack_btn = ("lb", "rb")
+    virtual.dpad = {key: key for key in ("up", "down", "left", "right")}
+    virtual.face = {key: key for key in ("x", "a")}
+    virtual.stick(0.5, -0.5, True)
+    assert virtual.pad.calls == [("left", 0.5, -0.5),
+                                 ("down", "lb"), ("down", "rb"),
+                                 ("update",)], virtual.pad.calls
+    virtual.pad.calls.clear()
+    virtual.stick(0.5, -0.5, False)
+    assert virtual.pad.calls == [("left", 0.5, -0.5),
+                                 ("up", "lb"), ("up", "rb"),
+                                 ("update",)], virtual.pad.calls
+    virtual.pad.calls.clear()
+    virtual.stick(0.0, 0.0, True)
+    assert virtual.pad.calls == [("left", 0.0, 0.0),
+                                 ("down", "lb"), ("down", "rb"),
+                                 ("update",)], virtual.pad.calls
+    virtual.pad.calls.clear()
+    virtual.stick(0.0, 0.0, False)
+    assert virtual.pad.calls == [("reset",), ("update",)], virtual.pad.calls
+
+    virtual.pad.calls.clear()
+    old_sleep, time.sleep = time.sleep, lambda seconds: virtual.pad.calls.append(
+        ("sleep", seconds))
+    try:
+        for key in BUFF_SEQUENCE:
+            tap_buff(virtual, key, BUFF_HOLD_S)
+            assert not virtual.pad.held, "buff buttons must never overlap"
+    finally:
+        time.sleep = old_sleep
+    downs = [call[1] for call in virtual.pad.calls if call[0] == "down"]
+    ups = [call[1] for call in virtual.pad.calls if call[0] == "up"]
+    sleeps = [call[1] for call in virtual.pad.calls if call[0] == "sleep"]
+    assert downs == list(BUFF_SEQUENCE) and ups == list(BUFF_SEQUENCE)
+    assert sleeps == [BUFF_HOLD_S] * len(BUFF_SEQUENCE)
+
+    virtual.pad.calls.clear()
+    time.sleep = lambda _seconds: (_ for _ in ()).throw(RuntimeError("buff failed"))
+    try:
+        try:
+            tap_buff(virtual, "x", BUFF_HOLD_S)
+        except RuntimeError:
+            pass
+        virtual.close()
+    finally:
+        time.sleep = old_sleep
+    assert not virtual.pad.held and ("up", "x") in virtual.pad.calls
+    assert ("reset",) in virtual.pad.calls, virtual.pad.calls
+
     img = np.zeros((200, 200, 3), np.uint8)
     cv2.circle(img, (150, 60), 4, (0, 0, 255), -1)   # far, up-right
     cv2.circle(img, (120, 100), 4, (0, 0, 255), -1)  # near, right
@@ -5501,17 +6160,20 @@ def demo():
     pad.last = None
     pad.stick(0.0, 1.0)             # stick up -> HID Y negative
     pad.stick(0.0, 1.0)             # repeat must not re-send
-    pad.stick(-1.0, 0.0, True)      # move + attack down
-    pad.stick(-1.0, 0.0, False)     # stick unchanged -> only the release
-    assert sent == [b"L0,-32767\n", b"U4\n",
-                    b"L-32767,0\n", b"D4\n",
-                    b"U4\n"], sent
+    pad.stick(-1.0, 0.0, True)      # move + both attack buttons down
+    pad.stick(-1.0, 0.0, False)     # stick unchanged -> only both releases
+    pad.stick(0.0, 0.0, False)      # target loss -> reset every control
+    pad.stick(0.0, 0.0, False)      # repeated release is safe and deduplicated
+    assert sent == [b"L0,-32767\n", b"U4\n", b"U5\n",
+                    b"L-32767,0\n", b"D4\n", b"D5\n",
+                    b"U4\n", b"U5\n", b"Z\n"], sent
 
     sent.clear()
     for key in BUFF_SEQUENCE:
-        pad.tap_dpad(key, 0)
-    assert sent == [b"V0\n", b"V-1\n", b"V6\n", b"V-1\n",
-                    b"V4\n", b"V-1\n", b"V2\n", b"V-1\n"], sent
+        tap_buff(pad, key, 0)
+    assert sent == [b"V0\n", b"V-1\n", b"V4\n", b"V-1\n",
+                    b"V6\n", b"V-1\n", b"V2\n", b"V-1\n",
+                    b"D2\n", b"U2\n", b"D0\n", b"U0\n"], sent
 
     sent.clear()
     pad.tap_button("y")           # by name
@@ -6129,7 +6791,7 @@ def buff_test(port=None, hold=BUFF_HOLD_S, gap=BUFF_GAP_S):
         wake_controller(pad)
         for key in BUFF_SEQUENCE:
             print(f"  {key}")
-            pad.tap_dpad(key, hold)
+            tap_buff(pad, key, hold)
             time.sleep(gap)
     finally:
         pad.close()

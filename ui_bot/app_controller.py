@@ -23,9 +23,12 @@ class RuntimePort(Protocol):
     def start(self, options: Mapping[str, object]) -> None: ...
     def resume(self) -> None: ...
     def pause(self) -> None: ...
+    def wait_for_memory(self) -> None: ...
+    def memory_recovered(self) -> None: ...
     def stop(self) -> None: ...
     def emergency_stop(self) -> None: ...
     def reset_emergency(self) -> None: ...
+    def update_controller_config(self, config: Mapping[str, object]) -> None: ...
     def restart_current(self, reason: str) -> None: ...
 
 
@@ -58,21 +61,29 @@ class AppController:
         self._recovery_resume_requested = False
         self._recovery_start_sequence = 0
         self._recovery_resume_sequence = 0
+        self._recovery_start_scan_version = 0
+        self._recovery_start_player_read_version = 0
+        self._recovery_internal_memory = False
+        self._recovery_waits_for_scan = False
         self._last_accepted_sequence = 0
-        self._recovery_restart_s = max(1.0, float(recovery_restart_s))
-        self._recovery_max_s = max(
-            self._recovery_restart_s + 1.0, float(recovery_max_s))
-        self._recovery_next_restart_at = 0.0
+        # Kept in the signature for compatibility; data freshness no longer
+        # authorizes worker restarts.
+        _ = recovery_restart_s
+        self._recovery_max_s = max(1.0, float(recovery_max_s))
         self._recovery_actions: list[str] = []
         self._recovery_valid_snapshots = max(1, int(recovery_valid_snapshots))
         self._last_valid_sequence = 0
         self._last_valid_player = None
+        self._last_player_read_version = 0
+        self._player_read_misses = 0
+        self._last_physical_toggle_version = 0
         self._clock = clock or time.monotonic
         self._progress_timeout_s = max(5.0, float(progress_timeout_s))
         self._progress_at = self._clock()
         self._progress_player = None
         self._progress_target_id = None
         self._progress_target_distance = None
+        self._last_decision = None
 
     @property
     def emergency_latched(self) -> bool:
@@ -156,6 +167,20 @@ class AppController:
         self.last_error = ""
         self._clear_recovery()
         self.log("[Bot] Start requested.")
+        return True
+
+    def update_controller_config(self, config: Mapping[str, object]) -> bool:
+        payload = dict(config)
+        self._last_options["control_config"] = payload
+        if not self._worker_started:
+            return True
+        try:
+            self.runtime.update_controller_config(payload)
+        except Exception as exc:
+            self.log(f"[Config] Live input update failed; saved settings apply "
+                     f"to the next worker: {exc}")
+            return False
+        self.log("[Config] Live buff and attack settings applied.")
         return True
 
     def pause(self) -> bool:
@@ -255,6 +280,9 @@ class AppController:
                 self._session_id = snapshot.session_id
                 self._process_id = snapshot.process_id
                 self._last_accepted_sequence = 0
+                self._last_player_read_version = 0
+                self._player_read_misses = 0
+                self._last_physical_toggle_version = 0
         if (snapshot.sequence > 0
                 and snapshot.sequence <= self._last_accepted_sequence):
             self.log(
@@ -263,32 +291,88 @@ class AppController:
             return False
         if snapshot.sequence > 0:
             self._last_accepted_sequence = snapshot.sequence
-        if snapshot.player_valid and snapshot.player_fresh and snapshot.player is not None:
+        if snapshot.physical_toggle_version > self._last_physical_toggle_version:
+            self._last_physical_toggle_version = snapshot.physical_toggle_version
+            self._desired_running = (
+                snapshot.automation_state == AutomationState.RUNNING)
+            if not self._desired_running:
+                self._clear_recovery()
+        fresh_player = bool(
+            snapshot.player_valid and snapshot.player_fresh
+            and snapshot.player is not None)
+        new_player_read = snapshot.player_read_version > self._last_player_read_version
+        if new_player_read:
+            self._last_player_read_version = snapshot.player_read_version
+            if fresh_player:
+                self._player_read_misses = 0
+            else:
+                self._player_read_misses += 1
+        if fresh_player:
             self._last_valid_sequence = snapshot.sequence
             self._last_valid_player = snapshot.player
         active_mode = normalize_mode(snapshot.active_mode)
         if active_mode == "waiting":
             active_mode = normalize_mode(
                 self._last_options.get("mode", snapshot.source))
-        lost_player_while_running = bool(
+        requested_mode = normalize_mode(
+            self._last_options.get("mode", active_mode))
+        memory_source_running = bool(
             self._desired_running
             and self.automation_state in (
                 AutomationState.RUNNING, AutomationState.RECOVERING)
             and snapshot.memory_session_valid
-            and active_mode != "pixel"
-            and (not snapshot.player_valid or not snapshot.player_fresh
-                 or snapshot.player is None))
-        if lost_player_while_running:
+            and requested_mode != "pixel"
+            and not (active_mode == "pixel" and snapshot.pixel_ready))
+        scanner_dead = bool(
+            "scanner_alive" in snapshot.raw and not snapshot.scanner_alive)
+        scanner_problem = bool(snapshot.scan_timed_out or scanner_dead)
+        player_wait_required = bool(
+            not fresh_player and self._player_read_misses >= 3)
+        memory_wait_required = bool(
+            memory_source_running and (scanner_problem or player_wait_required))
+        transient_player_miss = bool(
+            memory_source_running and not fresh_player
+            and not memory_wait_required)
+        if (self._desired_running and active_mode == "pixel"
+                and snapshot.pixel_ready and not fresh_player):
+            self._decision(
+                "memory_unavailable",
+                "continue" if requested_mode == "pixel" else "fallback",
+                "explicit Pixel Mode does not require a memory player position"
+                if requested_mode == "pixel" else
+                "Pixel Mode is ready and does not require a memory player position")
+        elif new_player_read and not fresh_player:
+            self._decision(
+                "player_read_failed",
+                "wait" if memory_wait_required else "continue",
+                f"genuine_misses={self._player_read_misses}")
+        elif snapshot.scan_in_progress and not snapshot.scan_timed_out:
+            self._decision(
+                "entity_scan_running", "continue",
+                "player freshness is independent of entity scan completion")
+        elif fresh_player and not snapshot.entities:
+            self._decision("entities=0", "continue", "empty scans are valid")
+        elif fresh_player and snapshot.target is None and not snapshot.path:
+            self._decision("no_target", "continue", "no movement destination")
+        if memory_wait_required:
             if not self._recovering:
                 try:
-                    self.runtime.pause()
+                    self.runtime.wait_for_memory()
                 except Exception as exc:
                     self.fail(FailureCode.CONTROLLER_COMMAND, exc)
                     return False
                 self._begin_recovery(
+                    "memory scan delayed" if scanner_problem else
                     snapshot.player_error or "player position unavailable",
-                    snapshot)
+                    snapshot, wait_for_scan=scanner_problem,
+                    internal_memory=True)
             else:
+                if self._recovery_resume_requested:
+                    try:
+                        self.runtime.wait_for_memory()
+                    except Exception as exc:
+                        self.fail(FailureCode.CONTROLLER_COMMAND, exc)
+                        return False
                 self._recovery_valid_streak = 0
                 self._recovery_resume_requested = False
         elif not self._recovering and not self._observe_progress(snapshot):
@@ -306,7 +390,29 @@ class AppController:
             self._recovering and self._desired_running
             and snapshot.sequence > self._recovery_start_sequence
             and recovery_source_ready)
-        if valid_recovery_snapshot:
+        if valid_recovery_snapshot and self._recovery_internal_memory:
+            genuinely_fresh = bool(
+                snapshot.player_read_version
+                > self._recovery_start_player_read_version)
+            scan_recovered = bool(
+                not self._recovery_waits_for_scan
+                or snapshot.scan_version > self._recovery_start_scan_version)
+            if (genuinely_fresh and scan_recovered
+                    and not self._recovery_resume_requested):
+                try:
+                    self.runtime.memory_recovered()
+                except Exception as exc:
+                    self._recovery_attempts += 1
+                    self.log(f"[Recovery] Resume attempt failed: {exc}; "
+                             "fresh memory reads continue.")
+                else:
+                    self._recovery_attempts += 1
+                    self._recovery_resume_requested = True
+                    self._recovery_resume_sequence = snapshot.sequence
+                    self._recovery_actions.append(
+                        f"memory recovery requested after scan {snapshot.scan_version}")
+                    self.log("RUNNING: fresh player read received")
+        elif valid_recovery_snapshot:
             self._recovery_valid_streak += 1
             if (self._recovery_valid_streak >= self._recovery_valid_snapshots
                     and not self._recovery_resume_requested):
@@ -326,7 +432,7 @@ class AppController:
                     self.log(
                         f"[Recovery] {self._recovery_valid_streak} consecutive valid "
                         "snapshots; resuming previous automation automatically.")
-        if (not lost_player_while_running and self._desired_running
+        if (not memory_wait_required and self._desired_running
                 and snapshot.automation_state == AutomationState.RUNNING):
             # The terminal End hotkey can start automation without a button
             # command, so accepted worker state is authoritative here too.
@@ -339,7 +445,7 @@ class AppController:
                 elapsed = max(0.0, self._clock() - self._recovery_started_at)
                 self.log(f"[Recovery] RUNNING confirmed after {elapsed:.1f}s and "
                          f"{self._recovery_attempts} resume attempt(s).")
-                self._clear_recovery()
+                self._clear_recovery("fresh player read received")
         elif (snapshot.automation_state == AutomationState.RUNNING
               and not self._desired_running):
             try:
@@ -352,12 +458,14 @@ class AppController:
             self.log("[Safety] Late RUNNING snapshot suppressed after user stop/pause.")
         elif (self.automation_state == AutomationState.RUNNING
               and snapshot.automation_state == AutomationState.PAUSED):
-            self.automation_state = AutomationState.PAUSED
+            if not transient_player_miss:
+                self.automation_state = AutomationState.PAUSED
         if self._recovering:
             self.automation_state = AutomationState.RECOVERING
             self.state = BotState.RECOVERING
         elif self.automation_state == AutomationState.RUNNING:
-            self.state = snapshot.state
+            self.state = (BotState.RUNNING if transient_player_miss
+                          else snapshot.state)
         elif self.automation_state == AutomationState.PAUSED:
             self.state = BotState.PAUSED
         else:
@@ -371,27 +479,35 @@ class AppController:
         return True
 
     def _begin_recovery(self, reason: str,
-                        snapshot: BotSnapshot | None = None) -> None:
+                        snapshot: BotSnapshot | None = None,
+                        wait_for_scan: bool = False,
+                        internal_memory: bool = False) -> None:
         first_attempt = not self._recovering
         self._recovering = True
         self._recovery_reason = str(reason)
         if first_attempt:
             self._recovery_started_at = self._clock()
-            self._recovery_next_restart_at = (
-                self._recovery_started_at + self._recovery_restart_s)
             self._recovery_actions = [
                 "inputs released and fresh snapshots continued"]
             self._recovery_attempts = 0
+            self.log(f"[Downtime] start reason={self._recovery_reason}")
+            self._decision("recovery", "wait", self._recovery_reason)
         else:
             self._recovery_actions.append(
                 f"recovery continued: {self._recovery_reason}")
         self._recovery_valid_streak = 0
         self._recovery_resume_requested = False
         self._recovery_resume_sequence = 0
+        self._recovery_internal_memory = bool(internal_memory)
+        self._recovery_waits_for_scan = bool(wait_for_scan)
         self.automation_state = AutomationState.RECOVERING
         self.state = BotState.RECOVERING
         current = snapshot or self.last_snapshot
         self._recovery_start_sequence = current.sequence
+        self._recovery_start_scan_version = current.scan_version
+        self._recovery_start_player_read_version = current.player_read_version
+        if wait_for_scan:
+            self.log("WAITING: memory scan delayed")
         self.log(
             f"[Recovery] inputs released; reason={self._recovery_reason}; "
             f"state_before=RUNNING last_valid_seq={self._last_valid_sequence} "
@@ -421,6 +537,23 @@ class AppController:
             distance = None if distance is None else float(distance)
         except (TypeError, ValueError):
             distance = None
+        control = snapshot.raw.get("control", {})
+        stick = control.get("stick", ()) if isinstance(control, Mapping) else ()
+        try:
+            moving_command = bool(
+                isinstance(stick, (list, tuple)) and len(stick) >= 2
+                and (abs(float(stick[0])) > 0.05
+                     or abs(float(stick[1])) > 0.05))
+        except (TypeError, ValueError) as exc:
+            self.fail(FailureCode.MALFORMED_SNAPSHOT,
+                      SnapshotError(f"invalid control.stick: {exc}"))
+            return False
+        if target_id is None and not snapshot.path and not moving_command:
+            self._progress_at = now
+            self._progress_player = player
+            self._progress_target_id = None
+            self._progress_target_distance = None
+            return True
         progressed = self._progress_player is None
         if self._progress_player is not None:
             progressed = math.hypot(
@@ -442,17 +575,6 @@ class AppController:
         candidates = tuple(entity for entity in snapshot.entities
                            if entity.valid_monster
                            and entity.inside_zone is not False)
-        control = snapshot.raw.get("control", {})
-        stick = control.get("stick", ()) if isinstance(control, Mapping) else ()
-        try:
-            moving_command = bool(
-                isinstance(stick, (list, tuple)) and len(stick) >= 2
-                and (abs(float(stick[0])) > 0.05
-                     or abs(float(stick[1])) > 0.05))
-        except (TypeError, ValueError) as exc:
-            self.fail(FailureCode.MALFORMED_SNAPSHOT,
-                      SnapshotError(f"invalid control.stick: {exc}"))
-            return False
         if target_id is not None:
             reason = "progress watchdog: target/navigation made no progress"
         elif not candidates:
@@ -488,29 +610,13 @@ class AppController:
                 "through the configured total window")
             self.log("[Recovery abandoned] " + diagnostic)
             self.fail(FailureCode.RECOVERY_EXHAUSTED, RuntimeError(diagnostic))
-            return
-        if now < self._recovery_next_restart_at:
-            return
-        restart = getattr(self.runtime, "restart_current", None)
-        if restart is None:
-            self._recovery_next_restart_at = now + self._recovery_restart_s
-            self.log("[Recovery] Runtime has no exact-worker restart command; "
-                     "continuing bounded snapshot validation.")
-            return
-        attempt = 1 + sum(action.startswith("worker restart")
-                          for action in self._recovery_actions)
-        try:
-            restart(self._recovery_reason)
-        except Exception as exc:
-            action = f"worker restart {attempt} failed: {exc}"
-        else:
-            action = f"worker restart {attempt} requested"
-        self._recovery_actions.append(action)
-        delay = min(30.0, self._recovery_restart_s * (2 ** min(attempt, 3)))
-        self._recovery_next_restart_at = now + delay
-        self.log(f"[Recovery] {action}; next escalation in {delay:.1f}s.")
 
-    def _clear_recovery(self) -> None:
+    def _clear_recovery(self, reason: str = "recovery cleared") -> None:
+        if self._recovering:
+            duration_ms = int(max(
+                0.0, (self._clock() - self._recovery_started_at) * 1000.0))
+            self.log(f"[Downtime] end reason={reason} duration_ms={duration_ms}")
+            self._decision("recovery", "continue", reason)
         self._recovering = False
         self._recovery_reason = ""
         self._recovery_started_at = 0.0
@@ -519,12 +625,22 @@ class AppController:
         self._recovery_resume_requested = False
         self._recovery_start_sequence = 0
         self._recovery_resume_sequence = 0
-        self._recovery_next_restart_at = 0.0
+        self._recovery_start_scan_version = 0
+        self._recovery_start_player_read_version = 0
+        self._recovery_internal_memory = False
+        self._recovery_waits_for_scan = False
         self._recovery_actions = []
         self._progress_at = self._clock()
         self._progress_player = None
         self._progress_target_id = None
         self._progress_target_distance = None
+
+    def _decision(self, condition: str, action: str, reason: str) -> None:
+        decision = (str(condition), str(action), str(reason))
+        if decision == self._last_decision:
+            return
+        self._last_decision = decision
+        self.log(f"[Decision] condition={condition} action={action} reason={reason}")
 
     def monitor_status(self, state: ConnectionState, message: str) -> None:
         if self._emergency_latched:
@@ -649,7 +765,6 @@ class AppController:
         policy = FAILURE_POLICIES[code]
         transient = code in (
             FailureCode.MALFORMED_SNAPSHOT,
-            FailureCode.CONTROLLER_COMMAND,
             FailureCode.WORKER_STOPPED,
         )
         if transient:
@@ -671,6 +786,7 @@ class AppController:
                 self.log(f"[Monitor:{code.value}] {policy.user_message}: {error}; "
                          "next snapshot/reconnect will retry automatically.")
             return
+        self._decision(code.value, "stop", policy.user_message)
         self._emergency_latched = True
         try:
             self.runtime.emergency_stop()
