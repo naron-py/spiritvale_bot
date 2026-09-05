@@ -90,7 +90,7 @@ class CommandGate:
                 self._desired = True
             elif command == "pause":
                 self._memory_wait = False
-                self._internal_pending = None
+                self._internal_pending = "pause"
                 self._desired = False
             else:
                 base = self._observed if self._desired is None else self._desired

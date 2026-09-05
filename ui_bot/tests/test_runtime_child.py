@@ -71,6 +71,19 @@ class CommandGateTests(unittest.TestCase):
         gate.observe(True)
         self.assertFalse(gate.poll_toggle())
 
+    def test_explicit_pause_is_reported_during_internal_memory_wait(self):
+        gate = CommandGate()
+        gate.submit("resume")
+        self.assertTrue(gate.poll_toggle())
+        gate.observe(True)
+        gate.submit("memory_wait")
+        self.assertEqual(gate.poll_internal(), "wait")
+
+        gate.submit("pause")
+
+        self.assertEqual(gate.poll_internal(), "pause")
+        self.assertFalse(gate.poll_toggle())
+
     def test_physical_end_can_explicitly_override_wait_when_readiness_recovers(self):
         gate = CommandGate()
         gate.submit("resume")

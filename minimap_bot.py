@@ -90,10 +90,12 @@ PET_FORGET_FRAMES = 40   # remember a vanished confirmed pet for about two secon
 RECONNECT = True          # False disables the whole thing, clicks included
 RECONNECT_POLL_S = 2.0    # how often to look for a login screen while running
 RECONNECT_SETTLE_S = 1.5  # wait after each click; these screens animate
-RECONNECT_STAGE_TIMEOUT_S = 10.0  # unchanged screen before one bounded retry
-# A screen that will not advance is either stuck or was never there. Retry only
-# after RECONNECT_STAGE_TIMEOUT_S; this ceiling then stops clicks and automation.
-# It prevents a false/stuck match from clicking into the world forever.
+RECONNECT_STAGE_TIMEOUT_S = 10.0  # existing short retry wait before attempt 2
+RECONNECT_RETRY_MIN_S = 5.0
+RECONNECT_RETRY_MAX_S = 30.0
+# A screen that will not advance is either stuck or was never there. Attempt 2
+# uses the short settle wait; later attempts draw a fresh bounded random delay.
+# The existing ceiling then stops clicks and automation.
 RECONNECT_MAX_REPEAT = 5
 UI_BLUE = ((95, 90, 150), (112, 255, 255))    # the game's button blue, in HSV
 # (x, y, width) fractions. Width matters: Connect and Play sit only 0.033 apart
@@ -1135,14 +1137,80 @@ class ReconnectFlow:
     """Screen-confirmed reconnect episode with one click action per stage."""
 
     def __init__(self, stage_timeout=RECONNECT_STAGE_TIMEOUT_S,
-                 max_attempts=RECONNECT_MAX_REPEAT):
+                 max_attempts=RECONNECT_MAX_REPEAT, random_wait=None):
         self.stage_timeout = stage_timeout
         self.max_attempts = max_attempts
+        self.random_wait = random_wait or (
+            lambda: random.uniform(RECONNECT_RETRY_MIN_S, RECONNECT_RETRY_MAX_S))
         self.active = False
         self.failed = False
         self.stage = None
         self.attempts = 0
         self.deadline = 0.0
+
+    @staticmethod
+    def _screen_name(screen):
+        if screen in ("disconnected", "idle disconnected"):
+            return "disconnect popup"
+        if screen == "server":
+            return "server-selection screen"
+        if screen == "character":
+            return "character screen"
+        return "loading screen"
+
+    @staticmethod
+    def _action_name(screen):
+        if screen in ("disconnected", "idle disconnected"):
+            return "dismiss disconnect popup"
+        if screen == "server":
+            return "connect to Southeast Asia"
+        return "play character"
+
+    @staticmethod
+    def _failure_reason(screen):
+        if screen in ("disconnected", "idle disconnected"):
+            return "disconnect popup still visible"
+        if screen == "server":
+            return "server-selection screen still visible"
+        if screen == "character":
+            return "character screen still visible"
+        return "valid player data not ready"
+
+    def _arm_next(self, now, events, reason):
+        next_attempt = self.attempts + 1
+        if next_attempt == 2:
+            delay = self.stage_timeout
+        else:
+            delay = float(self.random_wait())
+        events.append(f"[Reconnect] Retry attempt {next_attempt} in "
+                      f"{delay:.1f}s: {reason}")
+        self.deadline = now + delay
+
+    def action_completed(self, observed_at, completed_at):
+        """Keep the full retry delay after blocking click/settle work."""
+        if self.active:
+            self.deadline += max(0.0, completed_at - observed_at)
+
+    def _after_attempt(self, now, events, reason):
+        if self.max_attempts is not None and self.attempts >= self.max_attempts:
+            self.deadline = now + self.stage_timeout
+        else:
+            self._arm_next(now, events, reason)
+
+    def _attempt_log(self, screen, events):
+        events.extend((f"[Reconnect] Current screen: {self._screen_name(screen)}",
+                       f"[Reconnect] Attempt {self.attempts}: "
+                       f"{self._action_name(screen)}"))
+
+    def cancel(self):
+        """Cancel one active episode and every pending retry deadline."""
+        if not self.active:
+            return False
+        self.active = False
+        self.stage = None
+        self.attempts = 0
+        self.deadline = 0.0
+        return True
 
     def _fail(self, events):
         stage = "player data" if self.stage == "player" else self.stage
@@ -1154,13 +1222,14 @@ class ReconnectFlow:
     def _enter(self, screen, now, previous, events):
         self.stage = screen
         self.attempts = 1
-        self.deadline = now + self.stage_timeout
         if previous == "idle disconnected" and screen != previous:
             events.append("[Reconnect] Idle popup dismissed")
         if screen == "idle disconnected":
             events.append("[Reconnect] Idle disconnection popup detected")
         elif screen == "server":
             events.append("[Reconnect] Server screen ready")
+        self._attempt_log(screen, events)
+        self._after_attempt(now, events, self._failure_reason(screen))
         return screen
 
     def observe(self, screen, now, player_valid=False):
@@ -1180,28 +1249,41 @@ class ReconnectFlow:
             if player_valid:
                 self.active = False
                 self.stage = None
+                self.attempts = 0
+                self.deadline = 0.0
                 events.append("[Reconnect] Recovery successful; automation resumed")
             elif now >= self.deadline:
-                self.attempts += 1
+                reason = self._failure_reason(None)
+                events.extend(("[Reconnect] Current screen: loading screen",
+                               f"[Reconnect] Attempt {self.attempts} failed: {reason}"))
                 if self.attempts >= self.max_attempts:
                     self._fail(events)
                 else:
-                    self.deadline = now + self.stage_timeout
+                    self.attempts += 1
+                    events.append(f"[Reconnect] Attempt {self.attempts}: "
+                                  "check valid player data")
+                    self._after_attempt(now, events, reason)
             return None, events, False
 
         if screen is None:
             if self.stage == "character":
                 self.stage = "player"
-                self.attempts = 0
-                self.deadline = now + self.stage_timeout
-                events.append("[Reconnect] Waiting for valid player data")
+                self.attempts = 1
+                events.extend(("[Reconnect] Current screen: loading screen",
+                               "[Reconnect] Attempt 1: check valid player data",
+                               "[Reconnect] Waiting for valid player data"))
+                self._after_attempt(now, events, self._failure_reason(None))
                 return None, events, True
             if now >= self.deadline:
-                self.attempts += 1
+                reason = "loading screen still visible"
+                events.extend(("[Reconnect] Current screen: loading screen",
+                               f"[Reconnect] Attempt {self.attempts} failed: {reason}"))
                 if self.attempts >= self.max_attempts:
                     self._fail(events)
                 else:
-                    self.deadline = now + self.stage_timeout
+                    self.attempts += 1
+                    events.append(f"[Reconnect] Attempt {self.attempts}: recheck screen")
+                    self._after_attempt(now, events, reason)
             return None, events, False
 
         popup = ("disconnected", "idle disconnected")
@@ -1217,11 +1299,15 @@ class ReconnectFlow:
 
         if now < self.deadline:
             return None, events, False
+        reason = self._failure_reason(screen)
+        events.extend((f"[Reconnect] Current screen: {self._screen_name(screen)}",
+                       f"[Reconnect] Attempt {self.attempts} failed: {reason}"))
         if self.attempts >= self.max_attempts:
             self._fail(events)
             return None, events, False
         self.attempts += 1
-        self.deadline = now + self.stage_timeout
+        events.append(f"[Reconnect] Attempt {self.attempts}: {self._action_name(screen)}")
+        self._after_attempt(now, events, reason)
         return screen, events, False
 
 
@@ -4697,7 +4783,10 @@ def main(port=None, area=None):
                     except ValueError as exc:
                         print(f"\n[Config] input settings rejected: {exc}")
                 request = automation_state_request()
-                if request == "wait" and not paused:
+                if request == "pause":
+                    if reconnect_flow.cancel():
+                        print("\n[Reconnect] Pending retry cancelled: automation stopped")
+                elif request == "wait" and not paused:
                     pad.stick(0.0, 0.0, False)
                     buffs.reset(time.time())
                     paused = True
@@ -4711,6 +4800,8 @@ def main(port=None, area=None):
                     print("\nRUNNING: fresh player read received")
                 if toggle_key_hit():
                     paused = toggle_running(paused, pad, pet_filter, area=zone)
+                    if paused and reconnect_flow.cancel():
+                        print("\n[Reconnect] Pending retry cancelled: automation stopped")
                     target_lock.reset()
                     target_blacklist.reset()
                     stuck_watchdog.reset()
@@ -4804,6 +4895,7 @@ def main(port=None, area=None):
                         # screen advances or this stage's retry timeout expires.
                         pad.stick(0.0, 0.0, False)
                         did = reconnect_step(full, win)
+                        reconnect_flow.action_completed(now, time.time())
                         if did == "server":
                             print("\n[Reconnect] Connecting to Southeast Asia")
                         elif did == "server: SEA row not found":
@@ -5126,6 +5218,9 @@ def demo():
         "retry exhaustion must remain visible instead of advertising End recovery")
     assert "did = reconnect_step(full, win)" in reconnect_source
     assert "SEA row not found; waiting to retry" in reconnect_source
+    assert 'if request == "pause":' in reconnect_source
+    assert reconnect_source.count("reconnect_flow.cancel()") == 2, (
+        "manual End/UI stop must cancel retries without treating scanner wait as a stop")
     assert "target_lock.current is not None" in inspect.getsource(main)
     assert "target_lock.target_id is not None" not in inspect.getsource(main), (
         "a historical target id is not current pixel evidence")
@@ -6349,7 +6444,8 @@ def demo():
     # popup or server screen is a wait, not permission to click every poll.
     flow = ReconnectFlow(stage_timeout=10.0, max_attempts=2)
     action, events, reset = flow.observe("disconnected", 0.0)
-    assert action == "disconnected" and flow.active and not reset and events == []
+    assert action == "disconnected" and flow.active and not reset
+    assert "[Reconnect] Attempt 1: dismiss disconnect popup" in events
     assert flow.observe("disconnected", 1.0)[0] is None
     assert flow.observe("server", 2.0)[0] == "server"
     assert flow.observe("character", 3.0)[0] == "character"
@@ -6368,13 +6464,13 @@ def demo():
     assert idle_flow.observe("idle disconnected", 10.0)[0] == "idle disconnected"
     action, events, _ = idle_flow.observe("server", 11.0)
     assert action == "server"
-    assert events == ["[Reconnect] Idle popup dismissed",
-                      "[Reconnect] Server screen ready"]
+    assert "[Reconnect] Idle popup dismissed" in events
+    assert "[Reconnect] Server screen ready" in events
     assert idle_flow.observe("server", 12.0)[0] is None
     assert idle_flow.observe("character", 13.0)[0] == "character"
     action, events, reset = idle_flow.observe(None, 14.0, player_valid=False)
     assert action is None and reset and idle_flow.active
-    assert events == ["[Reconnect] Waiting for valid player data"]
+    assert "[Reconnect] Waiting for valid player data" in events
     assert idle_flow.observe(None, 15.0, player_valid=False) == (None, [], False)
     action, events, reset = idle_flow.observe(None, 16.0, player_valid=True)
     assert action is None and not reset and not idle_flow.active
@@ -6395,20 +6491,23 @@ def demo():
 
     # Server and loading waits share the existing bounded retry ceiling. A stage
     # retries only after its timeout and remains neutral between attempts.
-    timeout_flow = ReconnectFlow(stage_timeout=5.0, max_attempts=2)
+    timeout_flow = ReconnectFlow(stage_timeout=5.0, max_attempts=2,
+                                 random_wait=lambda: 5.0)
     assert timeout_flow.observe("server", 0.0)[0] == "server"
     assert timeout_flow.observe("server", 4.9)[0] is None
     assert timeout_flow.observe("server", 5.0)[0] == "server"
     assert timeout_flow.observe("server", 10.0)[0] is None
     assert timeout_flow.failed and not timeout_flow.active
 
-    blank_server = ReconnectFlow(stage_timeout=5.0, max_attempts=2)
+    blank_server = ReconnectFlow(stage_timeout=5.0, max_attempts=2,
+                                 random_wait=lambda: 5.0)
     assert blank_server.observe("server", 0.0)[0] == "server"
     assert blank_server.observe(None, 5.0)[0] is None
     assert blank_server.observe(None, 10.0)[0] is None
     assert blank_server.failed and not blank_server.active
 
-    loading_flow = ReconnectFlow(stage_timeout=5.0, max_attempts=2)
+    loading_flow = ReconnectFlow(stage_timeout=5.0, max_attempts=2,
+                                 random_wait=lambda: 5.0)
     assert loading_flow.observe("character", 0.0)[0] == "character"
     assert loading_flow.observe(None, 1.0, player_valid=False)[2]
     assert loading_flow.observe(None, 6.0, player_valid=False)[0] is None
@@ -6420,6 +6519,95 @@ def demo():
     assert loading_retry.observe("character", 0.0)[0] == "character"
     assert loading_retry.observe(None, 1.0, player_valid=False)[2]
     assert loading_retry.observe("character", 2.0, player_valid=False)[0] == "character"
+
+    # Attempt 1 is immediate, attempt 2 follows the existing short wait, and
+    # every later retry gets a freshly drawn 5..30 second delay. Seeing the same
+    # popup during a pending wait must never create another action or timer.
+    retry_draws = iter((7.0, 23.0))
+    drawn = []
+    def retry_delay():
+        delay = next(retry_draws)
+        drawn.append(delay)
+        return delay
+
+    retry_flow = ReconnectFlow(stage_timeout=2.0, max_attempts=4,
+                               random_wait=retry_delay)
+    action, events, _ = retry_flow.observe("disconnected", 0.0)
+    assert action == "disconnected"
+    assert "[Reconnect] Current screen: disconnect popup" in events
+    assert "[Reconnect] Attempt 1: dismiss disconnect popup" in events
+    assert retry_flow.observe("disconnected", 1.0)[0] is None
+    action, events, _ = retry_flow.observe("disconnected", 2.0)
+    assert action == "disconnected" and drawn == [7.0]
+    assert "[Reconnect] Attempt 1 failed: disconnect popup still visible" in events
+    assert "[Reconnect] Attempt 2: dismiss disconnect popup" in events
+    assert any("[Reconnect] Retry attempt 3 in 7.0s" in e for e in events)
+    assert retry_flow.observe("disconnected", 8.9)[0] is None
+    action, events, _ = retry_flow.observe("disconnected", 9.0)
+    assert action == "disconnected" and drawn == [7.0, 23.0]
+    assert "[Reconnect] Attempt 2 failed: disconnect popup still visible" in events
+    assert "[Reconnect] Attempt 3: dismiss disconnect popup" in events
+    assert any("[Reconnect] Retry attempt 4 in 23.0s" in e for e in events)
+
+    failed_clicks = []
+    failed_click_flow = ReconnectFlow(stage_timeout=2.0, max_attempts=3,
+                                      random_wait=lambda: 5.0)
+    for retry_now in (0.0, 1.0, 2.0):
+        action = failed_click_flow.observe("disconnected", retry_now)[0]
+        if action is not None:
+            reconnect_step(disc, FakeWin,
+                           lambda x, y: failed_clicks.append((x, y)), settle=0)
+    assert len(failed_clicks) == 2, failed_clicks
+
+    completed_flow = ReconnectFlow(stage_timeout=2.0, max_attempts=4,
+                                   random_wait=lambda: 5.0)
+    assert completed_flow.observe("server", 0.0)[0] == "server"
+    completed_flow.action_completed(0.0, 3.0)
+    assert completed_flow.observe("server", 4.9)[0] is None
+    assert completed_flow.observe("server", 5.0)[0] == "server"
+    completed_flow.action_completed(5.0, 8.0)
+    assert completed_flow.observe("server", 12.9)[0] is None
+    assert completed_flow.observe("server", 13.0)[0] == "server"
+
+    # A Connect click is verified by screen progress, not by the click call.
+    # If server lag leaves the same screen up, retry it on the same schedule.
+    server_draws = iter((5.0,))
+    server_lag = ReconnectFlow(stage_timeout=2.0, max_attempts=3,
+                               random_wait=lambda: next(server_draws))
+    assert server_lag.observe("server", 0.0)[0] == "server"
+    assert server_lag.observe("server", 1.0)[0] is None
+    action, events, _ = server_lag.observe("server", 2.0)
+    assert action == "server"
+    assert "[Reconnect] Attempt 1 failed: server-selection screen still visible" in events
+    assert server_lag.observe("server", 6.9)[0] is None
+    assert server_lag.observe("server", 7.0)[0] == "server"
+
+    # Loading never authorizes a click. A valid player read succeeds immediately
+    # and cancels the pending randomized retry deadline.
+    valid_draws = iter((30.0,))
+    valid_flow = ReconnectFlow(stage_timeout=2.0, max_attempts=4,
+                               random_wait=lambda: next(valid_draws))
+    assert valid_flow.observe("character", 0.0)[0] == "character"
+    assert valid_flow.observe(None, 1.0, player_valid=False)[2]
+    action, events, _ = valid_flow.observe(None, 3.0, player_valid=False)
+    assert action is None
+    assert "[Reconnect] Attempt 1 failed: valid player data not ready" in events
+    assert any("[Reconnect] Retry attempt 3 in 30.0s" in e for e in events)
+    action, events, _ = valid_flow.observe(None, 4.0, player_valid=True)
+    assert action is None and events == [
+        "[Reconnect] Recovery successful; automation resumed"]
+    assert not valid_flow.active and valid_flow.deadline == 0.0
+
+    cancelled = ReconnectFlow(stage_timeout=2.0, max_attempts=4,
+                              random_wait=lambda: 5.0)
+    cancelled.observe("idle disconnected", 0.0)
+    assert cancelled.cancel()
+    assert not cancelled.active and cancelled.stage is None
+    assert cancelled.attempts == 0 and cancelled.deadline == 0.0
+    assert cancelled.observe(None, 99.0) == (None, [], False)
+    assert RECONNECT_RETRY_MIN_S == 5.0 and RECONNECT_RETRY_MAX_S == 30.0
+    assert all(RECONNECT_RETRY_MIN_S <= ReconnectFlow().random_wait()
+               <= RECONNECT_RETRY_MAX_S for _ in range(100))
 
     # ArduinoPad wire format, no board attached
     pad = ArduinoPad.__new__(ArduinoPad)
