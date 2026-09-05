@@ -90,12 +90,10 @@ PET_FORGET_FRAMES = 40   # remember a vanished confirmed pet for about two secon
 RECONNECT = True          # False disables the whole thing, clicks included
 RECONNECT_POLL_S = 2.0    # how often to look for a login screen while running
 RECONNECT_SETTLE_S = 1.5  # wait after each click; these screens animate
-# A screen that will not advance is either stuck or was never there. Measured
-# from a live freeze: login_screen() read "disconnected" during ordinary play and
-# the bot clicked (0.500, 0.144) into the world every poll for the rest of the
-# session, dropping the stick each time -- a bot that stands still forever. A
-# real flow walks disconnected -> server -> character within a poll or two, so
-# repeating the same screen this many times means stop clicking, not click again.
+RECONNECT_STAGE_TIMEOUT_S = 10.0  # unchanged screen before one bounded retry
+# A screen that will not advance is either stuck or was never there. Retry only
+# after RECONNECT_STAGE_TIMEOUT_S; this ceiling then stops clicks and automation.
+# It prevents a false/stuck match from clicking into the world forever.
 RECONNECT_MAX_REPEAT = 5
 UI_BLUE = ((95, 90, 150), (112, 255, 255))    # the game's button blue, in HSV
 # (x, y, width) fractions. Width matters: Connect and Play sit only 0.033 apart
@@ -112,6 +110,13 @@ PLAY_BTN = (0.500, 0.948, 0.147)     # "Play Character" on the character screen
 SEA_ICON = "sea_row.png"
 SEA_REF_W = 1920
 SEA_MATCH_MIN = 0.70
+# Stable two-line message crop from the 1911x1073 idle-disconnect reference.
+# The modal and Ok button are shared with ordinary disconnects, so only the text
+# can distinguish this trigger. Search only the top-centre modal area.
+IDLE_ICON = "idle_disconnect.png"
+IDLE_REF_W = 1911
+IDLE_MATCH_MIN = 0.72
+IDLE_SEARCH = (0.38, 0.055, 0.62, 0.14)
 # Dark modal body, sampled either side of the message text. Well clear of the Ok
 # button, which spans x 0.464-0.536: probing right beside its edge left 0.004 of
 # margin, which is no margin at all.
@@ -1032,6 +1037,7 @@ def find_blue_button(img, btn, tol=0.03, wtol=0.35):
 
 
 _sea_icon = False  # False = not looked for yet, None = missing
+_idle_icon = False
 
 
 def sea_icon():
@@ -1043,6 +1049,39 @@ def sea_icon():
         if _sea_icon is None:
             print(f"no {SEA_ICON} -- cannot pick the server row")
     return _sea_icon
+
+
+def idle_icon():
+    """The idle-disconnect message template, or None if the file is absent."""
+    global _idle_icon
+    if _idle_icon is False:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), IDLE_ICON)
+        _idle_icon = cv2.imread(path)
+        if _idle_icon is None:
+            print(f"no {IDLE_ICON} -- idle disconnect uses generic popup handling")
+    return _idle_icon
+
+
+def find_idle_popup(img, template=None):
+    """Whether the specific idle-disconnect message is visible in its modal."""
+    t = idle_icon() if template is None else template
+    if t is None:
+        return False
+    scale = img.shape[1] / IDLE_REF_W
+    if scale != 1:
+        t = cv2.resize(t, None, fx=scale, fy=scale,
+                       interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC)
+    h, w = img.shape[:2]
+    x0, y0, x1, y1 = (int(w * IDLE_SEARCH[0]), int(h * IDLE_SEARCH[1]),
+                      int(w * IDLE_SEARCH[2]), int(h * IDLE_SEARCH[3]))
+    roi = img[y0:y1, x0:x1]
+    if roi.shape[0] <= t.shape[0] or roi.shape[1] <= t.shape[1]:
+        return False
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    needle = cv2.cvtColor(t, cv2.COLOR_BGR2GRAY)
+    score = cv2.minMaxLoc(cv2.matchTemplate(
+        gray, needle, cv2.TM_CCOEFF_NORMED))[1]
+    return score >= IDLE_MATCH_MIN
 
 
 def find_sea_row(img, template=None):
@@ -1073,8 +1112,8 @@ def _probe(img, frac, dark):
     return int(px.max()) < 90 if dark else int(px.min()) > 200
 
 
-def login_screen(img):
-    """Which login screen is showing: 'disconnected', 'server', 'character', None.
+def login_screen(img, idle_template=None):
+    """Which login screen is showing, including the specific idle popup.
 
     Each test pairs a button with something only that screen has behind it, so
     ordinary gameplay -- blue sky above, blue skill icons below -- cannot match.
@@ -1082,13 +1121,125 @@ def login_screen(img):
     """
     if (find_blue_button(img, OK_BTN) and
             all(_probe(img, f, dark=True) for f in MODAL_DARK)):
-        return "disconnected"
+        return ("idle disconnected" if find_idle_popup(img, idle_template)
+                else "disconnected")
     if find_blue_button(img, CONNECT_BTN) and _probe(img, PANEL_WHITE, dark=False):
         return "server"
     if (find_blue_button(img, PLAY_BTN) and
             all(_probe(img, f, dark=True) for f in CHAR_BG)):
         return "character"
     return None
+
+
+class ReconnectFlow:
+    """Screen-confirmed reconnect episode with one click action per stage."""
+
+    def __init__(self, stage_timeout=RECONNECT_STAGE_TIMEOUT_S,
+                 max_attempts=RECONNECT_MAX_REPEAT):
+        self.stage_timeout = stage_timeout
+        self.max_attempts = max_attempts
+        self.active = False
+        self.failed = False
+        self.stage = None
+        self.attempts = 0
+        self.deadline = 0.0
+
+    def _fail(self, events):
+        stage = "player data" if self.stage == "player" else self.stage
+        events.append(f"[Reconnect] {stage} timed out after "
+                      f"{self.max_attempts} attempts; reconnect OFF for this run")
+        self.active = False
+        self.failed = True
+
+    def _enter(self, screen, now, previous, events):
+        self.stage = screen
+        self.attempts = 1
+        self.deadline = now + self.stage_timeout
+        if previous == "idle disconnected" and screen != previous:
+            events.append("[Reconnect] Idle popup dismissed")
+        if screen == "idle disconnected":
+            events.append("[Reconnect] Idle disconnection popup detected")
+        elif screen == "server":
+            events.append("[Reconnect] Server screen ready")
+        return screen
+
+    def observe(self, screen, now, player_valid=False):
+        """Return (permitted action, transition logs, reset-memory-now)."""
+        events = []
+        if self.failed:
+            return None, events, False
+        if not self.active:
+            if screen is None:
+                return None, events, False
+            self.active = True
+            return self._enter(screen, now, None, events), events, False
+
+        if self.stage == "player":
+            if screen is not None:
+                return self._enter(screen, now, "player", events), events, False
+            if player_valid:
+                self.active = False
+                self.stage = None
+                events.append("[Reconnect] Recovery successful; automation resumed")
+            elif now >= self.deadline:
+                self.attempts += 1
+                if self.attempts >= self.max_attempts:
+                    self._fail(events)
+                else:
+                    self.deadline = now + self.stage_timeout
+            return None, events, False
+
+        if screen is None:
+            if self.stage == "character":
+                self.stage = "player"
+                self.attempts = 0
+                self.deadline = now + self.stage_timeout
+                events.append("[Reconnect] Waiting for valid player data")
+                return None, events, True
+            if now >= self.deadline:
+                self.attempts += 1
+                if self.attempts >= self.max_attempts:
+                    self._fail(events)
+                else:
+                    self.deadline = now + self.stage_timeout
+            return None, events, False
+
+        popup = ("disconnected", "idle disconnected")
+        if self.stage in popup and screen in popup:
+            if self.stage != "idle disconnected" and screen == "idle disconnected":
+                self.stage = screen
+                events.append("[Reconnect] Idle disconnection popup detected")
+            screen = self.stage
+
+        if screen != self.stage:
+            previous = self.stage
+            return self._enter(screen, now, previous, events), events, False
+
+        if now < self.deadline:
+            return None, events, False
+        if self.attempts >= self.max_attempts:
+            self._fail(events)
+            return None, events, False
+        self.attempts += 1
+        self.deadline = now + self.stage_timeout
+        return screen, events, False
+
+
+def reconnect_player_valid(eyes):
+    """Fresh, generation-coherent player position after a memory session reset."""
+    if eyes is None:
+        return True
+    with eyes.lock:
+        generation, owner = eyes.generation, eyes.owner
+    if owner is None:
+        return False
+    try:
+        if owner not in eyes._positions([owner]):
+            return False
+    except Exception:
+        return False
+    with eyes.lock:
+        return generation == eyes.generation and owner == eyes.owner
 
 
 def click_at(x, y):
@@ -1102,13 +1253,13 @@ def click_at(x, y):
 
 
 def reconnect_step(img, win, click=click_at, settle=RECONNECT_SETTLE_S,
-                   sea_template=None):
+                   sea_template=None, idle_template=None):
     """Advance the login flow by one screen. Returns what it did, or None.
 
-    Driven by what is on screen rather than a fixed script, so a slow server or a
-    missed click just means the same screen is handled again next poll.
+    Driven by what is on screen rather than a fixed script. ReconnectFlow decides
+    when the current frame is authorized to click or retry.
     """
-    screen = login_screen(img)
+    screen = login_screen(img, idle_template)
     if screen is None:
         return None
     h, w = img.shape[:2]
@@ -1117,7 +1268,7 @@ def reconnect_step(img, win, click=click_at, settle=RECONNECT_SETTLE_S,
         click(win.left + w * frac[0], win.top + h * frac[1])
         time.sleep(settle)
 
-    if screen == "disconnected":
+    if screen in ("disconnected", "idle disconnected"):
         press(OK_BTN)
     elif screen == "server":
         sea = find_sea_row(img, sea_template)
@@ -4528,8 +4679,7 @@ def main(port=None, area=None):
     next_loot = 0.0   # LOOT_BUTTON while standing on a drop
     next_login_check = 0.0  # a whole-window grab, so kept to RECONNECT_POLL_S
     reconnecting = RECONNECT   # switched off if a screen refuses to advance
-    same_screen = (None, 0)    # what reconnect_step did last, and how many in a row
-    awaiting_game = False      # Play clicked; next non-login frame is a new session
+    reconnect_flow = ReconnectFlow()
     dashboard = TerminalDashboard(mode)
 
     pad.stick(0.0, 0.0, False)
@@ -4609,7 +4759,12 @@ def main(port=None, area=None):
                 if paused:
                     if eyes is not None:
                         eyes.account_pursuit_time(time.time(), "paused")
-                    dashboard.update(eyes, False, "press End to start")
+                    if reconnect_flow.failed:
+                        dashboard.update(
+                            eyes, False, "reconnect retry limit reached",
+                            memory_driving=False, status="RECONNECT OFF")
+                    else:
+                        dashboard.update(eyes, False, "press End to start")
                     time.sleep(0.05)
                     continue
 
@@ -4623,67 +4778,69 @@ def main(port=None, area=None):
                     print("\nmemory scanner stopped -- restarted; pixels until it lands")
 
                 if reconnecting and time.time() >= next_login_check:
-                    next_login_check = time.time() + RECONNECT_POLL_S
+                    login_now = time.time()
+                    next_login_check = login_now + RECONNECT_POLL_S
                     full = np.array(sct.grab(window_region(win)))[:, :, :3]
                     screen = login_screen(full)
-                    if not screen:
-                        same_screen = (None, 0)
-                        if awaiting_game:
-                            # Play Character returned us to gameplay. The process
-                            # stayed alive, but every heap object belongs to the
-                            # old login session. Force a full scan and let pixels
-                            # drive until the new unit list and basis are ready.
-                            awaiting_game = False
-                            had_unit = False
-                            next_cal = 0.0
-                            if eyes is not None:
-                                eyes.reset_session()
-                                print("\nreconnect complete -- rescanning memory; "
-                                      "reading pixels until it lands")
-                    else:
-                        # Drop the stick and attack before touching the mouse: the
-                        # character is gone, and a held button carries into the
-                        # next session.
+                    player_valid = bool(
+                        reconnect_flow.stage == "player" and
+                        reconnect_player_valid(eyes))
+                    action, events, reset_memory = reconnect_flow.observe(
+                        screen, login_now, player_valid)
+                    for event in events:
+                        print(f"\n{event}")
+                    if reset_memory:
+                        # Gameplay is visible again, but the process kept stale
+                        # heap addresses from the vanished session. Reset once,
+                        # then wait for a fresh owner and current position before
+                        # ordinary actions may resume.
+                        had_unit = False
+                        next_cal = 0.0
+                        if eyes is not None:
+                            eyes.reset_session()
+                    if action is not None:
+                        # Drop every controller channel before touching the mouse.
+                        # ReconnectFlow debounces this physical action until the
+                        # screen advances or this stage's retry timeout expires.
                         pad.stick(0.0, 0.0, False)
                         did = reconnect_step(full, win)
-                        print(f"\nreconnect: handled the {did} screen")
-                        if did == "character":
-                            awaiting_game = True
-                        seen, n = same_screen
-                        same_screen = (did, n + 1 if did == seen else 1)
-                        if same_screen[1] >= RECONNECT_MAX_REPEAT:
-                            # Either the click misses or the screen was never
-                            # there. Both end the same way -- pinned in this
-                            # branch, clicking into the game every poll with
-                            # the stick dropped, which is worse than no
-                            # reconnect at all.
-                            reconnecting = False
-                            print(f"\nreconnect: the {did} screen did not "
-                                  f"advance in {RECONNECT_MAX_REPEAT} tries -- "
-                                  f"reconnect OFF for this run. Restart to re-arm.")
-                        target_lock.reset()
-                        target_blacklist.reset()
-                        stuck_watchdog.reset()
-                        pet_filter.reset()
-                        last = None
-                        buffs.reset(time.time())
-                        next_spam = next_loot = 0.0
-                        if reconnecting:
-                            reconnect_state = (f"handling {did} screen "
-                                               f"({same_screen[1]}/"
-                                               f"{RECONNECT_MAX_REPEAT})")
-                            reconnect_status = "RECONNECTING"
-                        else:
-                            reconnect_state = (f"{did} screen stuck; reconnect "
-                                               "disabled until restart")
-                            reconnect_status = "RECONNECT OFF"
-                        dashboard.update(
-                            eyes, True, reconnect_state,
-                            memory_driving=False,
-                            status=reconnect_status, force=True)
-                        if eyes is not None:
-                            eyes.account_pursuit_time(time.time(), "reconnect")
-                        continue
+                        if did == "server":
+                            print("\n[Reconnect] Connecting to Southeast Asia")
+                        elif did == "server: SEA row not found":
+                            print("\n[Reconnect] SEA row not found; waiting to retry")
+                    if reconnect_flow.failed:
+                        reconnecting = False
+                        paused = True
+                        pad.stick(0.0, 0.0, False)
+
+                if reconnect_flow.failed:
+                    dashboard.update(
+                        eyes, False, "reconnect retry limit reached",
+                        memory_driving=False, status="RECONNECT OFF", force=True)
+                    if eyes is not None:
+                        eyes.account_pursuit_time(time.time(), "reconnect")
+                    time.sleep(0.05)
+                    continue
+
+                if reconnect_flow.active:
+                    # Keep normal targeting, buffs and attacks paused throughout
+                    # the episode, including frames between full-window polls.
+                    pad.stick(0.0, 0.0, False)
+                    target_lock.reset()
+                    target_blacklist.reset()
+                    stuck_watchdog.reset()
+                    pet_filter.reset()
+                    last = None
+                    buffs.reset(time.time())
+                    next_spam = next_loot = 0.0
+                    reconnect_state = f"waiting for {reconnect_flow.stage}"
+                    dashboard.update(
+                        eyes, True, reconnect_state, memory_driving=False,
+                        status="RECONNECTING", force=True)
+                    if eyes is not None:
+                        eyes.account_pursuit_time(time.time(), "reconnect")
+                    time.sleep(0.05)
+                    continue
 
                 reg = minimap_region(win)
                 img = np.array(sct.grab(reg))[:, :, :3]
@@ -4950,8 +5107,25 @@ def demo():
     assert SPAM_BUTTON is None or SPAM_BUTTON in ArduinoPad.FACE, SPAM_BUTTON
     assert "cv2.imwrite" not in inspect.getsource(main), (
         "automatic reconnect must not save screenshots")
-    assert "status=reconnect_status" in inspect.getsource(main), (
+    assert 'status="RECONNECTING"' in inspect.getsource(main), (
         "reconnect must replace stale dashboard controls before continuing")
+    reconnect_source = inspect.getsource(main)
+    action_gate = reconnect_source[reconnect_source.index("if action is not None:"):
+                                   reconnect_source.index(
+                                       "if reconnect_flow.failed:",
+                                       reconnect_source.index("if action is not None:"))]
+    assert action_gate.index("pad.stick(0.0, 0.0, False)") < \
+           action_gate.index("reconnect_step(full, win)"), (
+               "controller input must be released before every reconnect click")
+    assert reconnect_source.count("reconnect_flow = ReconnectFlow()") == 1
+    paused_gate = reconnect_source[reconnect_source.index("if paused:"):
+                                      reconnect_source.index(
+                                          "if (eyes is not None and",
+                                          reconnect_source.index("if paused:"))]
+    assert "reconnect_flow.failed" in paused_gate and "RECONNECT OFF" in paused_gate, (
+        "retry exhaustion must remain visible instead of advertising End recovery")
+    assert "did = reconnect_step(full, win)" in reconnect_source
+    assert "SEA row not found; waiting to retry" in reconnect_source
     assert "target_lock.current is not None" in inspect.getsource(main)
     assert "target_lock.target_id is not None" not in inspect.getsource(main), (
         "a historical target id is not current pixel evidence")
@@ -6088,6 +6262,21 @@ def demo():
     blue(disc, CONNECT_BTN)                        # both are on screen at once
     assert login_screen(disc) == "disconnected", "the modal must be handled first"
 
+    # The idle disconnect uses the same modal and Ok button as an ordinary
+    # disconnect, so its message is the only reliable discriminator. Match that
+    # stable text crop while leaving the generic reconnect trigger intact.
+    idle_text = np.zeros((38, 282, 3), np.uint8)
+    cv2.putText(idle_text, "idle disconnect", (4, 27), cv2.FONT_HERSHEY_SIMPLEX,
+                0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    idle = disc.copy()
+    idle_small = cv2.resize(idle_text, None, fx=768 / 1911, fy=768 / 1911,
+                            interpolation=cv2.INTER_AREA)
+    idle_y, idle_x = int(432 * 0.0885), int(768 * 0.425)
+    idle[idle_y:idle_y + idle_small.shape[0],
+         idle_x:idle_x + idle_small.shape[1]] = idle_small
+    assert login_screen(idle, idle_template=idle_text) == "idle disconnected"
+    assert login_screen(disc, idle_template=idle_text) == "disconnected"
+
     srv = np.zeros((432, 768, 3), np.uint8)
     srv[:] = (255, 255, 255)
     blue(srv, CONNECT_BTN)
@@ -6133,6 +6322,10 @@ def demo():
     assert reconnect_step(disc, FakeWin, rec, settle=0) == "disconnected"
     assert clicks == [(100 + 768 * OK_BTN[0], 50 + 432 * OK_BTN[1])], clicks
     clicks.clear()
+    assert reconnect_step(idle, FakeWin, rec, settle=0,
+                          idle_template=idle_text) == "idle disconnected"
+    assert clicks == [(100 + 768 * OK_BTN[0], 50 + 432 * OK_BTN[1])], clicks
+    clicks.clear()
     assert reconnect_step(srv, FakeWin, rec, settle=0, sea_template=label) == "server"
     assert clicks == [(100 + found[0], 50 + found[1]),
                       (100 + 768 * CONNECT_BTN[0], 50 + 432 * CONNECT_BTN[1])], clicks
@@ -6151,6 +6344,82 @@ def demo():
     clicks.clear()
     assert reconnect_step(sky, FakeWin, rec, settle=0) is None
     assert clicks == [], "gameplay must never move the mouse"
+
+    # Reconnect orchestration permits one action per observed stage. An unchanged
+    # popup or server screen is a wait, not permission to click every poll.
+    flow = ReconnectFlow(stage_timeout=10.0, max_attempts=2)
+    action, events, reset = flow.observe("disconnected", 0.0)
+    assert action == "disconnected" and flow.active and not reset and events == []
+    assert flow.observe("disconnected", 1.0)[0] is None
+    assert flow.observe("server", 2.0)[0] == "server"
+    assert flow.observe("character", 3.0)[0] == "character"
+    assert flow.observe(None, 4.0, player_valid=False)[2]
+    assert flow.observe(None, 5.0, player_valid=True)[1] == [
+        "[Reconnect] Recovery successful; automation resumed"]
+    assert not flow.active and not flow.failed
+
+    idle_flow = ReconnectFlow(stage_timeout=10.0, max_attempts=2)
+    action, events, reset = idle_flow.observe("idle disconnected", 0.0)
+    assert action == "idle disconnected" and not reset
+    assert "[Reconnect] Idle disconnection popup detected" in events
+    assert idle_flow.observe("idle disconnected", 1.0)[0] is None
+    assert idle_flow.observe("disconnected", 2.0)[0] is None
+    assert idle_flow.observe("idle disconnected", 9.9)[0] is None
+    assert idle_flow.observe("idle disconnected", 10.0)[0] == "idle disconnected"
+    action, events, _ = idle_flow.observe("server", 11.0)
+    assert action == "server"
+    assert events == ["[Reconnect] Idle popup dismissed",
+                      "[Reconnect] Server screen ready"]
+    assert idle_flow.observe("server", 12.0)[0] is None
+    assert idle_flow.observe("character", 13.0)[0] == "character"
+    action, events, reset = idle_flow.observe(None, 14.0, player_valid=False)
+    assert action is None and reset and idle_flow.active
+    assert events == ["[Reconnect] Waiting for valid player data"]
+    assert idle_flow.observe(None, 15.0, player_valid=False) == (None, [], False)
+    action, events, reset = idle_flow.observe(None, 16.0, player_valid=True)
+    assert action is None and not reset and not idle_flow.active
+    assert events == ["[Reconnect] Recovery successful; automation resumed"]
+
+    class _ReconnectEyes:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.generation, self.owner = 3, None
+
+        def _positions(self, addrs):
+            return {a: (4.0, 0.0, 5.0) for a in addrs}
+
+    ready_eyes = _ReconnectEyes()
+    assert not reconnect_player_valid(ready_eyes)
+    ready_eyes.owner = 0x1000
+    assert reconnect_player_valid(ready_eyes)
+
+    # Server and loading waits share the existing bounded retry ceiling. A stage
+    # retries only after its timeout and remains neutral between attempts.
+    timeout_flow = ReconnectFlow(stage_timeout=5.0, max_attempts=2)
+    assert timeout_flow.observe("server", 0.0)[0] == "server"
+    assert timeout_flow.observe("server", 4.9)[0] is None
+    assert timeout_flow.observe("server", 5.0)[0] == "server"
+    assert timeout_flow.observe("server", 10.0)[0] is None
+    assert timeout_flow.failed and not timeout_flow.active
+
+    blank_server = ReconnectFlow(stage_timeout=5.0, max_attempts=2)
+    assert blank_server.observe("server", 0.0)[0] == "server"
+    assert blank_server.observe(None, 5.0)[0] is None
+    assert blank_server.observe(None, 10.0)[0] is None
+    assert blank_server.failed and not blank_server.active
+
+    loading_flow = ReconnectFlow(stage_timeout=5.0, max_attempts=2)
+    assert loading_flow.observe("character", 0.0)[0] == "character"
+    assert loading_flow.observe(None, 1.0, player_valid=False)[2]
+    assert loading_flow.observe(None, 6.0, player_valid=False)[0] is None
+    assert loading_flow.active and not loading_flow.failed
+    assert loading_flow.observe(None, 11.0, player_valid=False)[0] is None
+    assert loading_flow.failed and not loading_flow.active
+
+    loading_retry = ReconnectFlow(stage_timeout=5.0, max_attempts=2)
+    assert loading_retry.observe("character", 0.0)[0] == "character"
+    assert loading_retry.observe(None, 1.0, player_valid=False)[2]
+    assert loading_retry.observe("character", 2.0, player_valid=False)[0] == "character"
 
     # ArduinoPad wire format, no board attached
     pad = ArduinoPad.__new__(ArduinoPad)

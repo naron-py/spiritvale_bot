@@ -39,6 +39,11 @@
       "sha256": "af95272e1820a878de071a608fc52bc9df028cb2ac72fb298379276438253d66"
     },
     {
+      "path": "idle_disconnect.png",
+      "size": 9045,
+      "sha256": "12f7685b4e84c95aa8c5b43c2d71653c80768d7c89cd001c0fb25e074f3e7a15"
+    },
+    {
       "path": "loot_names.txt",
       "size": 426,
       "sha256": "e1fdf10d3c325d5b0a57bd761c8e44cc5ce5a749fcaff72daa7c337e47bb7b0c"
@@ -50,8 +55,8 @@
     },
     {
       "path": "minimap_bot.py",
-      "size": 340203,
-      "sha256": "1bb6aab2107fa4abc395f59a3544e676cbfe4bbf8f7a84ec10374a8f906170e3"
+      "size": 352632,
+      "sha256": "56d5f3f4f29511187d10e94b1ae3e1c80453f75c2e942d3fdefecb9948294275"
     },
     {
       "path": "minimap_navigator.py",
