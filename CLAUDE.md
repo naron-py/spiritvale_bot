@@ -648,6 +648,14 @@ adjusting them over adding code paths.
   its nominal spot the whole time, so this looked like a missed click and was
   not one: no click was ever sent. The model, its pet and its weapon own the
   middle; probe (0.03, 0.50) and the other three edges instead.
+- **Reconnect can resume pixels before memory, but not from a blank frame.**
+  The user-approved cue is a target admitted by the existing minimap `pick_target`
+  (not a centre blob), with no known login screen visible. Memory is reset first;
+  the same pixel loop then runs while scanning/calibration recover, preserving the
+  selected area and applying its guard once coordinates and basis exist. Before
+  then pixels cannot enforce the area, an explicitly accepted limitation. This
+  clears only automatic memory-wait, never a manual pause. Without either a fresh
+  owned player or that red target, normal bounded reconnect retries still apply.
 - **Both halves still are not enough, and the reconnect flow must be able to give
   up.** Measured on a live session: `login_screen()` returned `"disconnected"`
   during ordinary play for the rest of the run. Nothing was on screen, and the

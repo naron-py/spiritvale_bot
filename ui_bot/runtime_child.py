@@ -86,7 +86,7 @@ class CommandGate:
                         self._internal_pending = "running"
             elif command == "resume":
                 self._memory_wait = False
-                self._internal_pending = None
+                self._internal_pending = "resume"
                 self._desired = True
             elif command == "pause":
                 self._memory_wait = False
@@ -163,8 +163,10 @@ class CommandGate:
     def allow_hotkey_toggle(self) -> bool:
         """Use the same readiness gate as UI START; stopping is always allowed."""
         with self._lock:
-            if self._observed:
+            if self._observed or (self._memory_wait and self._desired):
                 self._desired = False
+                self._memory_wait = False
+                self._internal_pending = None
                 self._physical_toggle_version += 1
                 return True
             allowed = self._can_start

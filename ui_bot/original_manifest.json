@@ -55,8 +55,8 @@
     },
     {
       "path": "minimap_bot.py",
-      "size": 362339,
-      "sha256": "af2a7f9d034eeb89dacebdfe497560a399ae2f09fb03d23d8fd3aadabdd2c271"
+      "size": 363886,
+      "sha256": "ad5c40f36c196d62374367a4141bbe45075d9b88903514c523636b28f9a26a19"
     },
     {
       "path": "minimap_navigator.py",

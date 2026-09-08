@@ -1147,6 +1147,7 @@ class ReconnectFlow:
         self.stage = None
         self.attempts = 0
         self.deadline = 0.0
+        self.player_requires_memory = False
 
     @staticmethod
     def _screen_name(screen):
@@ -1232,7 +1233,7 @@ class ReconnectFlow:
         self._after_attempt(now, events, self._failure_reason(screen))
         return screen
 
-    def observe(self, screen, now, player_valid=False):
+    def observe(self, screen, now, player_valid=False, pixel_ready=False):
         """Return (permitted action, transition logs, reset-memory-now)."""
         events = []
         if self.failed:
@@ -1246,12 +1247,14 @@ class ReconnectFlow:
         if self.stage == "player":
             if screen is not None:
                 return self._enter(screen, now, "player", events), events, False
-            if player_valid:
+            if player_valid or pixel_ready:
                 self.active = False
                 self.stage = None
                 self.attempts = 0
                 self.deadline = 0.0
-                events.append("[Reconnect] Recovery successful; automation resumed")
+                events.append("[Reconnect] Recovery successful; automation resumed"
+                              if player_valid else
+                              "[Reconnect] Minimap target visible; Pixel fallback resumed while memory recovers")
             elif now >= self.deadline:
                 reason = self._failure_reason(None)
                 events.extend(("[Reconnect] Current screen: loading screen",
@@ -1266,25 +1269,16 @@ class ReconnectFlow:
             return None, events, False
 
         if screen is None:
-            if self.stage == "character":
-                self.stage = "player"
-                self.attempts = 1
-                events.extend(("[Reconnect] Current screen: loading screen",
-                               "[Reconnect] Attempt 1: check valid player data",
-                               "[Reconnect] Waiting for valid player data"))
-                self._after_attempt(now, events, self._failure_reason(None))
-                return None, events, True
-            if now >= self.deadline:
-                reason = "loading screen still visible"
-                events.extend(("[Reconnect] Current screen: loading screen",
-                               f"[Reconnect] Attempt {self.attempts} failed: {reason}"))
-                if self.attempts >= self.max_attempts:
-                    self._fail(events)
-                else:
-                    self.attempts += 1
-                    events.append(f"[Reconnect] Attempt {self.attempts}: recheck screen")
-                    self._after_attempt(now, events, reason)
-            return None, events, False
+            # A whole character screen can pass between polls. Unknown is only
+            # a request to invalidate old memory, never evidence of success.
+            self.player_requires_memory = self.stage != "character"
+            self.stage = "player"
+            self.attempts = 1
+            events.extend(("[Reconnect] Current screen: loading screen",
+                           "[Reconnect] Attempt 1: check valid player data",
+                           "[Reconnect] Waiting for valid player data"))
+            self._after_attempt(now, events, self._failure_reason(None))
+            return None, events, True
 
         popup = ("disconnected", "idle disconnected")
         if self.stage in popup and screen in popup:
@@ -1309,6 +1303,21 @@ class ReconnectFlow:
         events.append(f"[Reconnect] Attempt {self.attempts}: {self._action_name(screen)}")
         self._after_attempt(now, events, reason)
         return screen, events, False
+
+
+def reconnect_pixel_ready(img):
+    """User-approved gameplay cue: a targetable dot in the configured minimap."""
+    if login_screen(img) is not None:
+        return False
+    h, w = img.shape[:2]
+    radius = int(w * MINIMAP["r"])
+    cx, cy = int(w * MINIMAP["cx"]), int(h * MINIMAP["cy"])
+    if radius <= 0 or not (0 <= cx - radius < cx + radius <= w
+                           and 0 <= cy - radius < cy + radius <= h):
+        return False
+    # Share target admission, including the concealed-centre exclusion. This is
+    # evidence only; the normal pixel loop owns tracking, movement and attack.
+    return pick_target(img[cy-radius:cy+radius, cx-radius:cx+radius])[2] is not None
 
 
 def reconnect_player_valid(eyes):
@@ -1351,7 +1360,12 @@ def reconnect_step(img, win, click=click_at, settle=RECONNECT_SETTLE_S,
     h, w = img.shape[:2]
 
     def press(frac):
-        click(win.left + w * frac[0], win.top + h * frac[1])
+        # Detection tolerates layout shifts; act on that same detected button,
+        # not its nominal location (idle Ok can move below the old click).
+        button = find_blue_button(img, frac)
+        if button is None:
+            return
+        click(win.left + button[0], win.top + button[1])
         time.sleep(settle)
 
     if screen in ("disconnected", "idle disconnected"):
@@ -4760,6 +4774,7 @@ def main(port=None, area=None):
     target_blacklist = TargetBlacklist()
     stuck_watchdog = StuckWatchdog()
     paused = START_PAUSED
+    memory_wait = False  # internal hold retains run intent, unlike manual stop
     buffs = BuffScheduler()
     next_spam = 0.0   # SPAM_BUTTON goes out on its own timer
     next_loot = 0.0   # LOOT_BUTTON while standing on a drop
@@ -4783,23 +4798,32 @@ def main(port=None, area=None):
                     except ValueError as exc:
                         print(f"\n[Config] input settings rejected: {exc}")
                 request = automation_state_request()
-                if request == "pause":
+                if request == "resume":
+                    memory_wait = False
+                elif request == "pause":
+                    memory_wait = False
                     if reconnect_flow.cancel():
                         print("\n[Reconnect] Pending retry cancelled: automation stopped")
                 elif request == "wait" and not paused:
                     pad.stick(0.0, 0.0, False)
                     buffs.reset(time.time())
                     paused = True
+                    memory_wait = True
                     print("\nWAITING: memory scan delayed")
-                elif request == "running" and paused:
+                elif request == "running" and memory_wait:
                     pad.stick(0.0, 0.0, False)
-                    if zone is None:
+                    if zone is None and not reconnect_flow.active:
                         wake_controller(pad)
                     buffs.reset(time.time())
                     paused = False
+                    memory_wait = False
                     print("\nRUNNING: fresh player read received")
                 if toggle_key_hit():
-                    paused = toggle_running(paused, pad, pet_filter, area=zone)
+                    paused = toggle_running(paused and not memory_wait, pad,
+                                            pet_filter, area=zone,
+                                            wake=(lambda _: None) if reconnect_flow.active
+                                            else wake_controller)
+                    memory_wait = False
                     if paused and reconnect_flow.cancel():
                         print("\n[Reconnect] Pending retry cancelled: automation stopped")
                     target_lock.reset()
@@ -4847,7 +4871,7 @@ def main(port=None, area=None):
                     #         paused = True
                     #     else:
                     #         print(f"camera check: {deg:+.0f} degrees, good")
-                if paused:
+                if paused and not memory_wait:
                     if eyes is not None:
                         eyes.account_pursuit_time(time.time(), "paused")
                     if reconnect_flow.failed:
@@ -4875,9 +4899,17 @@ def main(port=None, area=None):
                     screen = login_screen(full)
                     player_valid = bool(
                         reconnect_flow.stage == "player" and
+                        eyes is not None and
                         reconnect_player_valid(eyes))
+                    pixel_ready = bool(
+                        reconnect_flow.stage == "player" and screen is None
+                        and reconnect_pixel_ready(full))
                     action, events, reset_memory = reconnect_flow.observe(
-                        screen, login_now, player_valid)
+                        screen, login_now, player_valid, pixel_ready)
+                    if pixel_ready and not reconnect_flow.active:
+                        # Automatic wait preserves run intent. Manual pauses are
+                        # gated above and never reach this temporary fallback.
+                        paused = memory_wait = False
                     for event in events:
                         print(f"\n{event}")
                     if reset_memory:
@@ -4895,7 +4927,7 @@ def main(port=None, area=None):
                         # screen advances or this stage's retry timeout expires.
                         pad.stick(0.0, 0.0, False)
                         did = reconnect_step(full, win)
-                        reconnect_flow.action_completed(now, time.time())
+                        reconnect_flow.action_completed(login_now, time.time())
                         if did == "server":
                             print("\n[Reconnect] Connecting to Southeast Asia")
                         elif did == "server: SEA row not found":
@@ -4903,6 +4935,7 @@ def main(port=None, area=None):
                     if reconnect_flow.failed:
                         reconnecting = False
                         paused = True
+                        memory_wait = False
                         pad.stick(0.0, 0.0, False)
 
                 if reconnect_flow.failed:
@@ -4927,10 +4960,20 @@ def main(port=None, area=None):
                     next_spam = next_loot = 0.0
                     reconnect_state = f"waiting for {reconnect_flow.stage}"
                     dashboard.update(
-                        eyes, True, reconnect_state, memory_driving=False,
+                        eyes, not paused, reconnect_state, memory_driving=False,
                         status="RECONNECTING", force=True)
                     if eyes is not None:
                         eyes.account_pursuit_time(time.time(), "reconnect")
+                    time.sleep(0.05)
+                    continue
+
+                if memory_wait:
+                    # Unless reconnect saw a usable minimap target above, keep
+                    # waiting for fresh memory: a blank/loading frame is no cue.
+                    pad.stick(0.0, 0.0, False)
+                    if eyes is not None:
+                        eyes.account_pursuit_time(time.time(), "paused")
+                    dashboard.update(eyes, False, "waiting for fresh memory")
                     time.sleep(0.05)
                     continue
 
@@ -5210,10 +5253,10 @@ def demo():
            action_gate.index("reconnect_step(full, win)"), (
                "controller input must be released before every reconnect click")
     assert reconnect_source.count("reconnect_flow = ReconnectFlow()") == 1
-    paused_gate = reconnect_source[reconnect_source.index("if paused:"):
+    paused_gate = reconnect_source[reconnect_source.index("if paused and not memory_wait:"):
                                       reconnect_source.index(
                                           "if (eyes is not None and",
-                                          reconnect_source.index("if paused:"))]
+                                          reconnect_source.index("if paused and not memory_wait:"))]
     assert "reconnect_flow.failed" in paused_gate and "RECONNECT OFF" in paused_gate, (
         "retry exhaustion must remain visible instead of advertising End recovery")
     assert "did = reconnect_step(full, win)" in reconnect_source
@@ -6415,15 +6458,20 @@ def demo():
         clicks.append((x, y))
 
     assert reconnect_step(disc, FakeWin, rec, settle=0) == "disconnected"
-    assert clicks == [(100 + 768 * OK_BTN[0], 50 + 432 * OK_BTN[1])], clicks
+    assert clicks == [(484, 112)], clicks
     clicks.clear()
     assert reconnect_step(idle, FakeWin, rec, settle=0,
                           idle_template=idle_text) == "idle disconnected"
-    assert clicks == [(100 + 768 * OK_BTN[0], 50 + 432 * OK_BTN[1])], clicks
+    assert clicks == [(484, 112)], clicks
+    clicks.clear()
+    shifted_idle = np.roll(idle, 8, axis=0)
+    assert reconnect_step(shifted_idle, FakeWin, rec, settle=0,
+                          idle_template=idle_text) in ("disconnected", "idle disconnected")
+    assert clicks == [(484, 120)], "shifted popup must use detected Ok center"
     clicks.clear()
     assert reconnect_step(srv, FakeWin, rec, settle=0, sea_template=label) == "server"
     assert clicks == [(100 + found[0], 50 + found[1]),
-                      (100 + 768 * CONNECT_BTN[0], 50 + 432 * CONNECT_BTN[1])], clicks
+                      tuple(a + b for a, b in zip((100, 50), find_blue_button(srv, CONNECT_BTN)))], clicks
 
     # No SEA row means no click at all: joining whichever region happens to sit in
     # that row today is worse than sitting on the screen and saying so.
@@ -6435,7 +6483,7 @@ def demo():
     assert clicks == [], clicks
     clicks.clear()
     assert reconnect_step(chars, FakeWin, rec, settle=0) == "character"
-    assert clicks == [(100 + 768 * PLAY_BTN[0], 50 + 432 * PLAY_BTN[1])], clicks
+    assert clicks == [tuple(a + b for a, b in zip((100, 50), find_blue_button(chars, PLAY_BTN)))], clicks
     clicks.clear()
     assert reconnect_step(sky, FakeWin, rec, settle=0) is None
     assert clicks == [], "gameplay must never move the mouse"
@@ -6504,6 +6552,8 @@ def demo():
     assert blank_server.observe("server", 0.0)[0] == "server"
     assert blank_server.observe(None, 5.0)[0] is None
     assert blank_server.observe(None, 10.0)[0] is None
+    # Missing the character screen now starts its own fresh-player stage.
+    assert blank_server.observe(None, 15.0)[0] is None
     assert blank_server.failed and not blank_server.active
 
     loading_flow = ReconnectFlow(stage_timeout=5.0, max_attempts=2,

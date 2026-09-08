@@ -84,7 +84,7 @@ class CommandGateTests(unittest.TestCase):
         self.assertEqual(gate.poll_internal(), "pause")
         self.assertFalse(gate.poll_toggle())
 
-    def test_physical_end_can_explicitly_override_wait_when_readiness_recovers(self):
+    def test_physical_end_stops_wait_even_when_readiness_recovers(self):
         gate = CommandGate()
         gate.submit("resume")
         self.assertTrue(gate.poll_toggle())
@@ -95,8 +95,10 @@ class CommandGateTests(unittest.TestCase):
 
         self.assertTrue(gate.allow_hotkey_toggle())
         self.assertIsNone(gate.poll_internal())
-        gate.observe(True)
+        gate.observe(False)
         self.assertFalse(gate.poll_toggle())
+        gate.submit("memory_recovered")
+        self.assertIsNone(gate.poll_internal())
 
     def test_one_physical_end_edge_produces_exactly_one_user_toggle(self):
         gate = CommandGate()
