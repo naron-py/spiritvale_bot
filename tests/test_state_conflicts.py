@@ -363,6 +363,71 @@ class MovementOwnershipTests(unittest.TestCase):
         self.assertTrue(eyes.area.safe(*eyes.home_goal))
         self.assertLess(result[0], 0.0)
 
+    def test_polygon_return_retries_stopped_boundary_goal_and_resumes_on_fresh_read(self):
+        eyes = _TargetEyes({0x2000: (10.0, 0.0, 10.0)})
+        eyes.area = Area("yard", polygon=((0, 0), (20, 0), (20, 20), (0, 20)))
+        eyes.positions[eyes.me] = (20.1, 0.0, 10.0)
+        eyes.returning = True
+        eyes.returning_since = 1.0
+        eyes.home_goal = (20.0, 10.0)  # old boundary goal, already within arrival range
+        eyes.boundary_log_at = 1000.0
+        route = eyes.route_to
+        calls = []
+
+        def stopped_waypoint_once(now, px, pz, tx, tz):
+            calls.append((tx, tz))
+            return (px, pz) if len(calls) == 1 else route(now, px, pz, tx, tz)
+
+        with patch.object(eyes, "route_to", side_effect=stopped_waypoint_once):
+            sx, sy, _ = eyes.target(2.0)
+        self.assertIsNotNone(sx, "outside recovery must retry a stopped waypoint")
+        self.assertGreater(abs(sx) + abs(sy), 0.1)
+        self.assertTrue(eyes.area.safe(*eyes.home_goal, margin=6.0))
+        self.assertTrue(eyes.returning)
+        sx, sy, _ = eyes.guard_area_step(sx, sy, now=2.0)
+        self.assertLess(sx, 0.0)
+
+        # A cached inside coordinate is not permission to finish recovery.
+        del eyes.positions[eyes.me]
+        eyes.last_pos = eyes.home_goal
+        self.assertEqual(eyes.target(2.1), (None, None, None))
+        self.assertTrue(eyes.returning)
+
+        # Drive the real target/guard pair until a fresh position completes it.
+        eyes.positions[eyes.me] = (20.1, 0.0, 10.0)
+        eyes.fight_ok[0x2000] = (1000.0, False, False)
+        for frame in range(40):
+            now = 3.0 + frame * 0.1
+            sx, sy, _ = eyes.target(now)
+            if not eyes.returning:
+                break
+            sx, sy, _ = eyes.guard_area_step(sx, sy, now=now)
+            self.assertGreater(abs(sx) + abs(sy), 0.1)
+            px, py, pz = eyes.positions[eyes.me]
+            eyes.positions[eyes.me] = (px + sx * 0.5, py, pz + sy * 0.5)
+        self.assertFalse(eyes.returning, "polygon return must not remain latched")
+        self.assertTrue(eyes.area.safe(*eyes.last_pos))
+        self.assertIsNone(eyes.home_goal)
+        self.assertEqual(eyes.chasing, 0x2000)
+        self.assertIn(eyes.mode, ("chasing", "on it"))
+
+    def test_stopped_polygon_guard_retargets_deeper_without_releasing_return(self):
+        eyes = _TargetEyes({})
+        eyes.area = Area("yard", polygon=((0, 0), (20, 0), (20, 20), (0, 20)))
+        eyes.last_pos = (20.1, 10.0)
+        eyes.returning = True
+        eyes.home_goal = (17.0, 10.0)
+        eyes.mode = "going back"
+        eyes.boundary_log_at = 1000.0
+        # A final-output stop must retry too, not just a stopped route waypoint.
+        with patch("minimap_bot.stick_for", return_value=None):
+            self.assertEqual(eyes.guard_area_step(-1.0, 0.0, now=2.0)[:2], (0.0, 0.0))
+        self.assertTrue(eyes.area.safe(*eyes.home_goal, margin=6.0))
+        self.assertTrue(eyes.returning)
+        eyes.positions[eyes.me] = (20.1, 0.0, 10.0)
+        sx, sy, _ = eyes.target(2.1)
+        self.assertLess(eyes.guard_area_step(sx, sy, now=2.1)[0], 0.0)
+
     def test_wrong_map_area_failure_holds_instead_of_disabling_fence(self):
         eyes = _TargetEyes({})
         eyes.area = Area("pen", circle=(0.0, 0.0, 10.0))

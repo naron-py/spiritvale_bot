@@ -55,8 +55,8 @@
     },
     {
       "path": "minimap_bot.py",
-      "size": 363886,
-      "sha256": "ad5c40f36c196d62374367a4141bbe45075d9b88903514c523636b28f9a26a19"
+      "size": 367800,
+      "sha256": "f36cd1068a9c72a712df55f3fce11728d1c514cb1197a84ea464e91b6e2533e2"
     },
     {
       "path": "minimap_navigator.py",
@@ -115,8 +115,8 @@
     },
     {
       "path": "tests/test_state_conflicts.py",
-      "size": 27688,
-      "sha256": "7f28788b6c70df91564363c4ca92cb6880d2240e81d7f9ae6cca124b2ed67636"
+      "size": 30837,
+      "sha256": "c3cf2812110182c7ff13b9b75a67644d5733b6ff7b1c3822468292430ec86b63"
     },
     {
       "path": "tests/test_zone_recorder.py",

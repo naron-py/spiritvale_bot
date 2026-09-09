@@ -3614,8 +3614,18 @@ class MemoryEyes:
         self.mode = "wander"
         return s[0], s[1], math.hypot(self.wander[0] - px, self.wander[1] - pz)
 
+    def _return_point(self, px, pz, margin=AREA_SAFETY + AREA_LOOKAHEAD):
+        """Leave room beyond the polygon's safe edge for return arrival."""
+        if self.area.polygon:
+            point = self.area._polygon_zone.nearest_safe((px, pz), margin)
+            # nearest_safe falls back to the exact boundary if the requested
+            # inset cannot fit. Never use that fallback as a recovery goal.
+            if self.area.safe(*point, margin=margin):
+                return point
+        return self.area.home(px, pz)
+
     def _go_home(self, now, px, pz):
-        """Walk back inside the area, or give the fence up saying why.
+        """Walk back inside the area without giving up the fence.
 
         Routed, never a straight line: the leash steered raw at its anchor and
         so leaned into rock for as long as it took someone to notice. The
@@ -3639,19 +3649,33 @@ class MemoryEyes:
             self.mode = "no area"
             return 0.0, 0.0, away
         self.area_failed = None
-        if now - self.returning_since > AREA_RETURN_MAX_S:
+        if (now - self.returning_since > AREA_RETURN_MAX_S
+                or (self.area.polygon and not self.area.safe(px, pz)
+                    and (not self.area.safe(hx, hz) or away <= MEM_ARRIVE))):
             # The walk back is not working. Do not drop the fence: unfencing
             # lets the bot roam outside and chase monsters that are not in the
             # area, which is the one failure that looks like a bot that "walks
             # to the wrong place". Recompute the nearest inset-safe home point
             # and restart the timer; targeting the exact boundary deadlocks the
             # final movement guard at its safety margin.
-            self.home_goal = self.area.home(px, pz)
+            self.home_goal = self._return_point(px, pz)
+            self.path = None
             self.returning_since = now
             hx, hz = self.home_goal
             away = math.hypot(hx - px, hz - pz)
         gx, gz = self.route_to(now, px, pz, hx, hz)
         s = stick_for(self.basis, gx - px, gz - pz)
+        if not s and self.area.polygon and not self.area.safe(px, pz):
+            # A zero-length waypoint is not arrival while the fresh player
+            # position is still outside. Discard the route and retry deeper.
+            self.home_goal = self._return_point(
+                px, pz, AREA_SAFETY + 2 * AREA_LOOKAHEAD)
+            self.path = None
+            self.returning_since = now
+            hx, hz = self.home_goal
+            away = math.hypot(hx - px, hz - pz)
+            gx, gz = self.route_to(now, px, pz, hx, hz)
+            s = stick_for(self.basis, gx - px, gz - pz)
         if not s:
             self.mode = "no area"
             return None, None, None
@@ -3766,6 +3790,9 @@ class MemoryEyes:
             # "inside" when home is farther away than that, so fail-closed must
             # mean measurable progress toward home, not a zero stick forever.
             hx, hz = self.area.home(px, pz)
+            if (self.area.polygon and self.returning and self.home_goal
+                    and self.area.safe(*self.home_goal)):
+                hx, hz = self.home_goal
             ix, iz = hx - px, hz - pz
             inward = math.hypot(ix, iz)
             if inward > 1e-9:
@@ -3807,6 +3834,14 @@ class MemoryEyes:
             if self.area.guard_step((px, pz), issued)[0]:
                 redirected, endpoint = candidate, issued
                 break
+        if (redirected is None and self.area.polygon and self.returning
+                and not self.area.safe(px, pz)):
+            # The final guard can stop a valid route too. Keep recovery active
+            # and retry a deeper goal next frame, using a new player read.
+            self.home_goal = self._return_point(
+                px, pz, AREA_SAFETY + 2 * AREA_LOOKAHEAD)
+            self.path = None
+            self.returning_since = now
         if now >= getattr(self, "boundary_log_at", 0.0):
             print(f"\nzone boundary: blocked step at {proposed[0]:.1f},"
                   f"{proposed[1]:.1f}; redirecting inside")
@@ -4152,9 +4187,19 @@ class MemoryEyes:
                         and math.hypot(px - self.home_goal[0],
                                        pz - self.home_goal[1]) <= MEM_ARRIVE):
                     self.returning, self.home_goal = False, None
+                    if self.area.polygon:
+                        self.returning_since = 0.0
+                        self.path = self.wander = None
+                        self.chasing = self.chasing_id = self.engaged_since = None
+                        self.spacing_state = None
+                        self.fight_ok.clear()
+                        self.seen_at.clear()
+                        # Re-evaluate targets now, not from pre-return position
+                        # or liveness caches. The owner above was read this frame.
+                        live = self._live_positions([u for _, u, *_ in cached])
             elif not self.area.safe(px, pz):
                 self.returning, self.returning_since = True, now
-                self.home_goal = self.area.home(px, pz)
+                self.home_goal = self._return_point(px, pz)
                 self.chasing = self.engaged_since = None
                 self.chasing_id = None
                 self.spacing_state = None
