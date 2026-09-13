@@ -9,8 +9,9 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
                                QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-                               QLineEdit, QPushButton, QScrollArea, QSizePolicy, QSpinBox,
-                               QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+                               QLineEdit, QPlainTextEdit, QPushButton, QScrollArea,
+                               QSizePolicy, QSpinBox, QTableWidget, QTableWidgetItem,
+                               QVBoxLayout, QWidget)
 
 from .config import (BUTTON_LABELS, CONTROLLER_BUTTONS, AttackSlot, BuffSlot,
                      UiSettings, default_attack_slots, default_buff_slots)
@@ -65,36 +66,32 @@ class SnapshotPage(QWidget):
 
 
 class DashboardPage(SnapshotPage):
-    record_requested = Signal()
-    add_position_requested = Signal()
-    undo_requested = Signal()
-    save_requested = Signal()
-    clear_requested = Signal()
+    zone_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(7)
+        root.setSpacing(12)
         cards = QHBoxLayout()
-        cards.setSpacing(6)
-        self.state_card = StatCard("Bot state", "♞", "cyan")
-        self.player_card = StatCard("Player", "●", "cyan")
-        self.target_card = StatCard("Target", "◎", "green")
-        self.zone_card = StatCard("In zone", "♣", "green")
+        cards.setSpacing(10)
+        self.state_card = StatCard("Automation", "●", "green")
+        self.player_card = StatCard("Player position", "+", "cyan")
+        self.target_card = StatCard("Current target", "◎", "green")
+        self.zone_card = StatCard("Zone", "◇", "cyan")
         for card in (self.state_card, self.player_card, self.target_card, self.zone_card):
             cards.addWidget(card, 1)
         root.addLayout(cards)
 
         body = QHBoxLayout()
-        body.setSpacing(7)
+        body.setSpacing(12)
         world_panel = panel()
         world_layout = QVBoxLayout(world_panel)
-        world_layout.setContentsMargins(9, 7, 9, 8)
-        world_layout.setSpacing(5)
+        world_layout.setContentsMargins(14, 12, 14, 12)
+        world_layout.setSpacing(8)
         world_layout.addWidget(section("LIVE WORLD VIEW"))
         self.world_view = WorldView()
-        self.world_view.setMinimumHeight(275)
+        self.world_view.setMinimumHeight(330)
         world_layout.addWidget(self.world_view, 1)
         controls = QHBoxLayout()
         self.legend = QLabel(
@@ -120,55 +117,40 @@ class DashboardPage(SnapshotPage):
         body.addWidget(world_panel, 1)
 
         right = panel()
-        right.setFixedWidth(230)
+        right.setFixedWidth(292)
         right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(10, 8, 10, 8)
-        right_layout.setSpacing(3)
-        right_layout.addWidget(section("ZONE & TARGET"))
+        right_layout.setContentsMargins(16, 13, 16, 13)
+        right_layout.setSpacing(0)
+        right_layout.addWidget(section("RUN SUMMARY"))
         self.zone_status = QLabel("NO ZONE")
         self.zone_status.setObjectName("pillGreen")
         self.zone_status.setWordWrap(True)
         self.zone_status.setMinimumHeight(28)
         self.zone_status.setAlignment(Qt.AlignCenter)
+        right_layout.addSpacing(12)
+        self.targeting_summary = self._summary("TARGETING")
+        self.combat_summary = self._summary("COMBAT")
+        self.zone_summary = self._summary("FARMING ZONE")
+        self.navigation_summary = self._summary("NAVIGATION")
+        for item in (self.targeting_summary, self.combat_summary,
+                     self.zone_summary, self.navigation_summary):
+            right_layout.addWidget(item)
+        right_layout.addSpacing(12)
         right_layout.addWidget(self.zone_status)
-        self.zone_name = QLineEdit()
-        self.zone_name.setPlaceholderText("Zone name")
-        right_layout.addWidget(self.zone_name)
-        self.record_button = QPushButton("◉  RECORD ZONE  (F6)")
-        self.add_button = QPushButton("◆  ADD POSITION  (F7)")
-        self.undo_button = QPushButton("↶  UNDO")
-        self.save_button = QPushButton("▣  FINISH & SAVE  (F8)")
-        self.save_button.setObjectName("save")
-        self.clear_button = QPushButton("▥  CLEAR ZONE")
-        self.clear_button.setObjectName("danger")
-        for button in (self.record_button, self.add_button, self.undo_button,
-                       self.save_button, self.clear_button):
-            right_layout.addWidget(button)
-        self.recorder_status = QLabel("")
-        self.recorder_status.setObjectName("red")
-        self.recorder_status.setWordWrap(True)
-        right_layout.addWidget(self.recorder_status)
-        self.record_button.clicked.connect(self.record_requested)
-        self.add_button.clicked.connect(self.add_position_requested)
-        self.undo_button.clicked.connect(self.undo_requested)
-        self.save_button.clicked.connect(self.save_requested)
-        self.clear_button.clicked.connect(self.clear_requested)
-        self.zone_detail = QLabel("Points: 0\nSafety Margin: —\nAuto Return: ON")
-        self.zone_detail.setStyleSheet("line-height:1.5")
-        right_layout.addWidget(self.zone_detail)
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setStyleSheet("color:#21455d")
-        right_layout.addWidget(line)
-        target_group = QGroupBox("CURRENT TARGET")
-        target_layout = QVBoxLayout(target_group)
-        self.current_target = QLabel("None")
-        self.current_target.setWordWrap(True)
-        target_layout.addWidget(self.current_target)
-        right_layout.addWidget(target_group)
+        self.open_zone_button = QPushButton("Open Farming Zone")
+        self.open_zone_button.clicked.connect(self.zone_requested)
+        right_layout.addWidget(self.open_zone_button)
         right_layout.addStretch(1)
         body.addWidget(right)
         root.addLayout(body, 1)
+
+    @staticmethod
+    def _summary(title):
+        label = QLabel(f"<b>{title}</b><br><span style='color:#8298a8'>—</span>")
+        label.setObjectName("summaryRow")
+        label.setWordWrap(True)
+        label.setMinimumHeight(58)
+        return label
 
     def apply_snapshot(self, snapshot):
         super().apply_snapshot(snapshot)
@@ -180,23 +162,16 @@ class DashboardPage(SnapshotPage):
             self.player_card.value.setText("POSITION UNAVAILABLE")
         if not snapshot.player_valid or not snapshot.player_fresh:
             self.target_card.value.setText("DIST —")
-            self.current_target.setText("Distance: —")
         elif snapshot.target:
             self.target_card.value.setText(snapshot.target.name or f"#{snapshot.target.entity_id}")
-            distance = "—" if snapshot.target.distance is None else f"{snapshot.target.distance:.1f}"
-            self.current_target.setText(
-                f"<b style='color:#66e234'>{snapshot.target.name or 'Monster'}</b><br>"
-                f"Distance: <span style='color:#16d9f4'>{distance}</span><br>"
-                f"Status: {'Valid in zone' if snapshot.target.valid_monster else 'Rejected/outside'}")
         else:
             self.target_card.value.setText("NONE")
-            self.current_target.setText("None")
         if snapshot.zone.valid:
             valid = len(snapshot.monsters_in_zone)
-            self.zone_card.value.setText(
-                f"{valid} MONSTER{'S' if valid != 1 else ''}")
+            self.zone_card.value.setText(snapshot.zone.name or "ACTIVE")
         else:
             self.zone_card.value.setText("—")
+            valid = 0
         zone_text = {
             ZoneDisplayState.NO_SAVED_ZONE: "NO SAVED ZONE",
             ZoneDisplayState.LOADED_DISCONNECTED:
@@ -206,30 +181,47 @@ class DashboardPage(SnapshotPage):
         }[snapshot.zone_display_state]
         self.zone_status.setText(zone_text)
         self.zone_status.setToolTip(zone_text)
-        if snapshot.zone.name and not self.zone_name.hasFocus():
-            self.zone_name.setText(snapshot.zone.name)
-        self.zone_detail.setText(
-            f"Points: {len(snapshot.zone.points)}\n"
-            f"Safety Margin: {snapshot.zone.safety_margin:g}\n"
-            f"Auto Return: {'ON' if snapshot.zone.auto_return else 'OFF'}")
+        target = snapshot.target.name if snapshot.target else "No held target"
+        source = (snapshot.source or "waiting").upper()
+        control = snapshot.raw.get("control", {})
+        attack = "HELD" if control.get("attack") else "RELEASED"
+        dashboard = snapshot.raw.get("dashboard", {})
+        action = str(dashboard.get("action") or "Idle")
+        routing = str(dashboard.get("navigation") or dashboard.get("route") or "Direct path")
+        zone_name = snapshot.zone.name or "No saved zone"
+        count = f"{valid} valid monster{'s' if valid != 1 else ''} inside"
+        self.targeting_summary.setText(
+            f"<b>TARGETING</b><br><span style='color:#8298a8'>{source} · {target}</span>")
+        self.combat_summary.setText(
+            f"<b>COMBAT</b><br><span style='color:#8298a8'>Attack {attack} · {action}</span>")
+        self.zone_summary.setText(
+            f"<b>FARMING ZONE</b><br><span style='color:#8298a8'>{zone_name} · {count}</span>")
+        self.navigation_summary.setText(
+            f"<b>NAVIGATION</b><br><span style='color:#8298a8'>{routing}</span>")
 
     def set_draft(self, points, recording):
         self.world_view.set_draft(points)
-        self.record_button.setText(
-            "●  RECORDING  (F7 add, F8 save)" if recording
-            else "◉  RECORD ZONE  (F6)")
-        self.record_button.setChecked(recording)
-        if recording or points:
-            self.zone_detail.setText(f"Draft Points: {len(points)}\nAdd current player position\nFinish requires 3+ points")
 
-    def set_recording_availability(self, available, recording, has_points,
-                                   finish_ready=False, message=""):
-        self.record_button.setEnabled(bool(available and not recording))
-        self.add_button.setEnabled(bool(available and recording))
-        self.undo_button.setEnabled(bool(has_points))
-        self.save_button.setEnabled(bool(recording and finish_ready))
-        self.clear_button.setEnabled(bool(recording or has_points))
-        self.recorder_status.setText(str(message))
+
+class ActivityLogPage(SnapshotPage):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        heading = QHBoxLayout()
+        heading.addWidget(section("ACTIVITY LOG"))
+        heading.addStretch(1)
+        self.rate_label = QLabel("UI 15 FPS    │    BOT 20 Hz")
+        self.rate_label.setObjectName("cyan")
+        heading.addWidget(self.rate_label)
+        layout.addLayout(heading)
+        self.editor = QPlainTextEdit()
+        self.editor.setReadOnly(True)
+        self.editor.setMaximumBlockCount(1000)
+        layout.addWidget(self.editor, 1)
+
+    def apply_snapshot(self, snapshot):
+        super().apply_snapshot(snapshot)
 
 
 class TargetingPage(SnapshotPage):
@@ -489,7 +481,7 @@ class SettingsPage(SnapshotPage):
         self.validation.setWordWrap(True)
         form_wrap.addWidget(self.validation)
         self.notice = QLabel(
-            "Buff and attack changes apply safely while running after Save. "
+            "Buff, attack and combat distance changes apply live after Save. "
             "Other runtime changes apply on the next worker start.")
         self.notice.setWordWrap(True)
         self.notice.setObjectName("muted")
@@ -504,6 +496,34 @@ class SettingsPage(SnapshotPage):
         controls_host = QWidget()
         controls_layout = QVBoxLayout(controls_host)
         controls_layout.setContentsMargins(0, 0, 0, 0)
+
+        spacing_box = panel()
+        spacing_layout = QVBoxLayout(spacing_box)
+        spacing_layout.addWidget(section("COMBAT DISTANCE · MEMORY-ONLY"))
+        spacing_form = QFormLayout()
+        for name, label in (("combat_min_distance", "Retreat below"),
+                            ("combat_resume_distance", "Preferred distance"),
+                            ("combat_max_distance", "Approach above")):
+            control = QDoubleSpinBox()
+            control.setDecimals(2)
+            control.setRange(0.01, 100.0)
+            control.setSingleStep(0.1)
+            control.setSuffix(" world units")
+            control.setValue(getattr(UiSettings(), name))
+            setattr(self, name, control)
+            spacing_form.addRow(label, control)
+        spacing_layout.addLayout(spacing_form)
+        spacing_help = QLabel(
+            "Memory-only, in world units. Retreat below the minimum; keep "
+            "retreating until Preferred distance. Approach above the maximum; "
+            "keep approaching until Preferred distance. This hysteresis avoids "
+            "rapid direction changes near a threshold. Orbit in range. "
+            "Saved distances apply live; Pixel targeting and polygon arrival "
+            "are unchanged.")
+        spacing_help.setWordWrap(True)
+        spacing_help.setObjectName("muted")
+        spacing_layout.addWidget(spacing_help)
+        controls_layout.addWidget(spacing_box)
 
         attack_box = panel()
         attack_layout = QVBoxLayout(attack_box)
@@ -635,6 +655,9 @@ class SettingsPage(SnapshotPage):
         self.trail.setValue(settings.trail_length)
         self.entities.setValue(settings.max_entities)
         self.log_level.setCurrentText(settings.log_level)
+        self.combat_min_distance.setValue(settings.combat_min_distance)
+        self.combat_resume_distance.setValue(settings.combat_resume_distance)
+        self.combat_max_distance.setValue(settings.combat_max_distance)
         self._load_controller_rows(settings.buff_slots, settings.attack_slots)
 
     def settings(self, demo_mode=False):
@@ -651,6 +674,9 @@ class SettingsPage(SnapshotPage):
                 trail_length=self.trail.value(),
                 max_entities=self.entities.value(),
                 log_level=self.log_level.currentText(), demo_mode=demo_mode,
+                combat_min_distance=self.combat_min_distance.value(),
+                combat_resume_distance=self.combat_resume_distance.value(),
+                combat_max_distance=self.combat_max_distance.value(),
                 buff_slots=buffs, attack_slots=attacks).validated()
         except Exception as exc:
             self.validation.setText(str(exc))
@@ -662,4 +688,4 @@ class SettingsPage(SnapshotPage):
         super().apply_snapshot(snapshot)
         self.notice.setText(
             f"Worker: {snapshot.state.value} | Source: {snapshot.source.upper()} | "
-            "saved input changes apply live.")
+            "saved input and combat distance changes apply live.")

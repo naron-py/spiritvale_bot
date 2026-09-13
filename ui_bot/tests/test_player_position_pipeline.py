@@ -655,19 +655,20 @@ class PlayerLossUiTests(unittest.TestCase):
         window._test_directory = directory
         window.show()
         QTest.qWait(50)
-        page = window.pages["Dashboard"]
+        dashboard = window.pages["Overview"]
+        recorder = window.pages["Farming Zone"]
 
         lost = BotSnapshot.from_mapping(_raw_snapshot(
             sequence=50, player=None, player_valid=False))
         window._snapshot_received(lost)
-        self.assertFalse(page.add_button.isEnabled())
-        self.assertEqual(page.target_card.value.text(), "DIST —")
-        self.assertEqual(page.world_view.marker_states.count("target-ring"), 0)
+        self.assertFalse(recorder.add_button.isEnabled())
+        self.assertEqual(dashboard.target_card.value.text(), "DIST —")
+        self.assertEqual(dashboard.world_view.marker_states.count("target-ring"), 0)
 
         recovered = BotSnapshot.from_mapping(_raw_snapshot(
             sequence=51, running=False))
         window._snapshot_received(recovered)
-        self.assertTrue(page.record_button.isEnabled())
+        self.assertTrue(recorder.record_button.isEnabled())
         self.assertNotEqual(window.controller.automation_state,
                             AutomationState.RUNNING)
         self.assertFalse(runtime.running)

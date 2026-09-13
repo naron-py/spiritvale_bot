@@ -78,14 +78,29 @@ class MainWindowTests(unittest.TestCase):
         window.show()
         _APP.processEvents()
 
-        self.assertEqual(set(window.nav_buttons),
-                         {"Dashboard", "Targeting", "Farming Zone", "Combat", "Settings"})
+        self.assertEqual(tuple(window.nav_buttons),
+                         ("Overview", "Farming Zone", "Settings", "Activity Log"))
+        self.assertIs(window.pages["Overview"], window.pages["Dashboard"])
         self.assertTrue(window.start_button.isVisible())
         self.assertTrue(window.pause_button.isVisible())
         self.assertTrue(window.stop_button.isVisible())
         self.assertTrue(window.emergency_button.isVisible())
         self.assertGreaterEqual(window.minimumWidth(), 1000)
         self.assertGreaterEqual(window.minimumHeight(), 600)
+        window.close()
+
+    def test_overview_is_read_only_and_combines_run_status(self):
+        window, runtime = self.make_window()
+        window.show()
+        QTest.qWait(100)
+        page = window.pages["Overview"]
+
+        self.assertFalse(hasattr(page, "record_button"))
+        self.assertFalse(hasattr(page, "zone_name"))
+        self.assertIn("MEMORY", page.targeting_summary.text().upper())
+        self.assertIn("ATTACK", page.combat_summary.text().upper())
+        self.assertTrue(runtime.monitoring)
+        self.assertFalse(runtime.running)
         window.close()
 
     def test_default_follow_mode_keeps_a_fitted_world_scale(self):
@@ -127,13 +142,13 @@ class MainWindowTests(unittest.TestCase):
     def test_only_visible_page_receives_snapshot_updates(self):
         window, _ = self.make_window()
         snapshot = DemoEngine().next_snapshot(True)
-        window.show_page("Combat")
+        window.show_page("Activity Log")
         before = {name: page.update_count for name, page in window.pages.items()}
         window.apply_snapshot(snapshot)
 
-        self.assertEqual(window.pages["Combat"].update_count,
-                         before["Combat"] + 1)
-        for name in ("Targeting", "Farming Zone", "Settings"):
+        self.assertEqual(window.pages["Activity Log"].update_count,
+                         before["Activity Log"] + 1)
+        for name in ("Overview", "Farming Zone", "Settings"):
             self.assertEqual(window.pages[name].update_count, before[name])
         window.close()
 

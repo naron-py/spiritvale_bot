@@ -739,7 +739,7 @@ class ScannerRecoveryTests(unittest.TestCase):
         eyes.generation = 0
         eyes.loot = {0x90000: (10.0, 0.0, 0.0, "Flax")}
         eyes.loot_ignored = {key: 100.0}
-        eyes.ms.world_loot = lambda mem, cls, regions=None: []
+        eyes.ms.world_loot = lambda mem, cls, regions=None, slots=None: []
         mem = type("Mem", (), {"regions": lambda self: []})()
 
         eyes._sweep_loot(mem)

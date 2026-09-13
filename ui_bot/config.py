@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, fields, replace
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -87,6 +88,9 @@ class UiSettings:
     max_entities: int = 250
     log_level: str = "INFO"
     demo_mode: bool = False
+    combat_min_distance: float = 1.8
+    combat_resume_distance: float = 2.5
+    combat_max_distance: float = 3.2
     buff_slots: tuple[BuffSlot, ...] = field(default_factory=default_buff_slots)
     attack_slots: tuple[AttackSlot, ...] = field(default_factory=default_attack_slots)
 
@@ -103,6 +107,14 @@ class UiSettings:
             raise ConfigError("max entities must be between 10 and 2000")
         if self.log_level not in ("DEBUG", "INFO", "WARNING", "ERROR"):
             raise ConfigError("invalid log level")
+        distances = (self.combat_min_distance, self.combat_resume_distance,
+                     self.combat_max_distance)
+        if (any(type(value) not in (int, float) or not 0 < value <= 100
+                or not math.isfinite(value) for value in distances)
+                or not distances[0] < distances[1] < distances[2]):
+            raise ConfigError(
+                "combat distances must be finite numbers: "
+                "0 < Retreat below < Preferred distance < Approach above <= 100")
         if not self.buff_slots:
             raise ConfigError("at least one buff slot is required")
         all_slots = tuple(self.buff_slots) + tuple(self.attack_slots)
@@ -132,9 +144,13 @@ class UiSettings:
             owner[slot.button] = slot
         return self
 
-    def control_config(self) -> dict[str, list[dict[str, object]]]:
+    def control_config(self) -> dict[str, object]:
         return {"buff_slots": [asdict(slot) for slot in self.buff_slots],
-                "attack_slots": [asdict(slot) for slot in self.attack_slots]}
+                "attack_slots": [asdict(slot) for slot in self.attack_slots],
+                "combat_spacing": {
+                    "min_distance": self.combat_min_distance,
+                    "resume_distance": self.combat_resume_distance,
+                    "max_distance": self.combat_max_distance}}
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "UiSettings":

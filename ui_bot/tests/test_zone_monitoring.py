@@ -72,7 +72,8 @@ class CanonicalZoneEntityTests(unittest.TestCase):
         view.update_snapshot(snapshot)
 
         self.assertEqual(len(snapshot.monsters_in_zone), 5)
-        self.assertEqual(page.zone_card.value.text(), "5 MONSTERS")
+        self.assertEqual(page.zone_card.value.text(), "farm-circle")
+        self.assertIn("5 valid monsters inside", page.zone_summary.text())
         self.assertEqual(view.marker_states.count("green"), 5)
         self.assertEqual(view.marker_states.count("target-ring"), 1)
         page.close()

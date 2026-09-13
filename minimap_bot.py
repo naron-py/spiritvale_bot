@@ -166,13 +166,14 @@ TARGET_SWITCH = 0.7      # only swap targets for one this much nearer
 # spot. Inside this, stop steering and just hit it.
 MEM_ARRIVE = 2.5         # world units
 # Memory hit-and-run is movement-only. Attack stays on while a valid target
-# exists; this band only decides whether the left stick approaches, stops, or
-# backs out.
-# ponytail: these two are the calibration knobs -- the range the game actually
+# exists; this band only decides whether the left stick approaches, orbits, or
+# backs out. MEM_ARRIVE remains exclusively a navigation arrival tolerance.
+# ponytail: these are calibration knobs -- the range the game actually
 # swings at is unmeasured, and --fightlog is what measures it.
 min_distance = 1.8            # closer than this, move directly away
 resume_distance = 2.5         # keep backing out until this much space exists
-assert resume_distance > min_distance
+max_distance = 3.2            # approach above this, until preferred distance
+assert 0 < min_distance < resume_distance < max_distance
 # Backward-compatible names for older tests/probes that tune the same band.
 too_close_distance = min_distance
 retreat_stop_distance = resume_distance
@@ -217,6 +218,9 @@ LIVE_TTL_S = 0.4
 # Picking loot up. Only worth doing between kills, so it runs when the monster
 # path has nothing: walking off to an item mid-fight is how a bot dies.
 LOOT_PICKUP = True
+LOOT_REFRESH_S = 0.05   # one bounded cached-slot slice per combat frame
+LOOT_REFRESH_MAX = 32
+LOOT_REFRESH_BUDGET_S = 0.001  # stop between slots; a syscall cannot be preempted
 LOOT_RANGE = 40.0        # world units; do not cross the map for a drop
 # Nearest-wins alone left items on the ground: on a busy map a monster is
 # almost always the nearer of the two, so a drop a few steps away lost every
@@ -683,9 +687,22 @@ def complete_buff_tick(buffs, pad, now, attack):
 
 
 def apply_controller_config(buffs, pad, config, now):
-    """Validate then hand live buff/attack bindings to the controller loop."""
+    """Validate then hand bindings and Memory spacing to the controller loop."""
+    global min_distance, resume_distance, max_distance
     if not isinstance(config, dict):
         raise ValueError("controller configuration must be an object")
+    distances = (min_distance, resume_distance, max_distance)
+    if "combat_spacing" in config:
+        band = config["combat_spacing"]
+        keys = ("min_distance", "resume_distance", "max_distance")
+        if not isinstance(band, dict) or set(band) != set(keys):
+            raise ValueError("combat spacing requires all three distances")
+        distances = tuple(band[key] for key in keys)
+        if (any(type(value) not in (int, float) or not 0 < value <= 100
+                or not math.isfinite(value)
+                for value in distances)
+                or not 0 < distances[0] < distances[1] < distances[2] <= 100):
+            raise ValueError("combat distances must be finite: 0 < min < preferred < max <= 100")
     buff_slots = config.get("buff_slots")
     attack_slots = config.get("attack_slots")
     if not isinstance(buff_slots, list) or not isinstance(attack_slots, list):
@@ -724,6 +741,7 @@ def apply_controller_config(buffs, pad, config, now):
         raise ValueError("at least one enabled attack skill is required")
     buffs.configure(buff_slots, now, pad)
     pad.configure_attack(attack_keys)
+    min_distance, resume_distance, max_distance = distances
 
 
 def dashboard_text(info, color=True):
@@ -2745,7 +2763,12 @@ class MemoryEyes:
         self.hot_at = None        # (x, z) where the character was when hot was built
         self.owner = None         # our unit, from the local connection
         self.loot = {}            # drop -> (x, y, z, name)
+        self.loot_slots = ()      # (wrapper, verified classes), including empty pool
+        self.loot_slots_generation = 0
+        self.loot_cursor = 0
+        self.loot_refresh_at = 0.0
         self.loot_name = ""       # what we are walking to, for the status line
+        self.loot_read_at = {}    # per-slot publication order, not scan readiness
         self.loot_target = None   # drop held between frames
         self.loot_since = None    # when we started walking to it
         self.loot_ignored = {}    # spawn key -> time it becomes fair game again
@@ -2860,7 +2883,12 @@ class MemoryEyes:
             self.generation += 1
             self.units = []
             self.loot = {}
+            self.loot_slots = ()
+            self.loot_slots_generation = self.generation
+            self.loot_cursor = 0
+            self.loot_refresh_at = 0.0
             self.me = self.basis = self.owner = self.hot = self.hot_loot = None
+            self.loot_read_at = {}
             self.hot_at = self.hot_loot_at = None
             self.chasing = self.engaged_since = self.approach = None
             self.chasing_id = None
@@ -3188,23 +3216,44 @@ class MemoryEyes:
         # Capture the region set once and use it for both the sweep and the
         # narrowing decision: a movement reset that clears hot_loot mid-sweep
         # must not turn this narrowed pass into a re-narrow to the old regions.
-        regions = self.hot_loot
+        with self.lock:
+            generation = self.generation if generation is None else generation
+            if generation != self.generation:
+                return
+            regions = self.hot_loot
+        started = time.monotonic()
         # Same backstop as the unit sweep: a full pass every HOT_SELF_HEAL_S so
         # a stale loot cache self-heals even when the character never walks
         # far enough to trip the movement re-narrow.
         if regions is not None and time.time() - self.hot_loot_full_at >= HOT_SELF_HEAL_S:
             regions = None
+        slots = {}
         found = self.ms.world_loot(mem, self.classes.get("loot"),
-                                   regions=regions)
-        if regions is None:
-            with self.lock:
-                self.hot_loot_full_at = time.time()
+                                   regions=regions, slots=slots)
         with self.lock:
-            if generation is not None and generation != self.generation:
+            if generation != self.generation:
                 return
+            if regions is None:
+                self.hot_loot_full_at = time.time()
+            inventory = tuple(slots.items())
+            if inventory != getattr(self, "loot_slots", ()):
+                self.loot_cursor = 0
+            self.loot_slots = inventory
+            self.loot_slots_generation = self.generation
             old_keys = {self._loot_key(d, x, z, n)
                         for d, (x, _y, z, n) in self.loot.items()}
-            self.loot = {d: (x, y, z, n) for d, x, y, z, n in found}
+            fresh = {d: (x, y, z, n) for d, x, y, z, n in found}
+            self.loot_read_at = {d: stamp for d, stamp in
+                                 getattr(self, "loot_read_at", {}).items() if d in slots}
+            # A heap pass may finish after a newer activation/pickup read.
+            # Preserve that newer observation, including unknown/empty absence.
+            for d, stamp in self.loot_read_at.items():
+                if stamp >= started:
+                    if d in self.loot:
+                        fresh[d] = self.loot[d]
+                    else:
+                        fresh.pop(d, None)
+            self.loot = fresh
             new_keys = {self._loot_key(d, x, z, n)
                         for d, (x, _y, z, n) in self.loot.items()}
             # Observing an occupancy disappear proves its give-up state belongs
@@ -3215,16 +3264,53 @@ class MemoryEyes:
             # Narrow only after a full pass (regions was None when the sweep
             # ran), so an in-flight narrowed sweep cannot re-narrow to the old
             # regions after a movement reset cleared them.
-            narrow = regions is None and bool(found)
+            narrow = regions is None and bool(slots)
         if narrow:
             spans = mem.regions()
-            live = {d for d, *_rest in found}
+            live = set(slots)
             hot = [(b, s) for b, s in spans
                    if any(b <= d < b + s for d in live)]
             with self.lock:
                 if generation is None or generation == self.generation:
                     self.hot_loot = hot
                     self.hot_loot_at = self.last_pos
+
+    def _refresh_loot(self, now=None):
+        """Refresh a fair, time-bounded slice; never search the heap here."""
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            slots = getattr(self, "loot_slots", ())
+            if (not LOOT_PICKUP or not slots
+                    or self.loot_slots_generation != self.generation
+                    or now < getattr(self, "loot_refresh_at", 0.0)):
+                return
+            self.loot_refresh_at = now + LOOT_REFRESH_S
+            generation, cursor = self.generation, self.loot_cursor
+        started = time.perf_counter()
+        updates = {}
+        for step in range(min(LOOT_REFRESH_MAX, len(slots))):
+            drop, classes = slots[(cursor + step) % len(slots)]
+            updates[drop] = self.ms.loot_slot(self.mem, drop, *classes)
+            if time.perf_counter() - started >= LOOT_REFRESH_BUDGET_S:
+                break
+        with self.lock:
+            if generation != self.generation or slots is not self.loot_slots:
+                return
+            self.loot_cursor = (cursor + len(updates)) % len(slots)
+            stamp = time.monotonic()
+            for drop, row in updates.items():
+                self.loot_read_at[drop] = stamp
+                if row:
+                    self.loot[drop] = row
+                else:
+                    self.loot.pop(drop, None)
+                if row is not None:
+                    key = self._loot_key(drop, row[0], row[2], row[3]) if row else None
+                    # Failed reads suppress a row but never forgive its timeout.
+                    # Confirmed empty/reused slots retire only the old occupancy.
+                    for old in list(self.loot_ignored):
+                        if old[0] == drop and old != key:
+                            self.loot_ignored.pop(old, None)
 
     def loot_here(self):
         """Is a wanted item lying under us right now? Sets loot_name if so.
@@ -3241,6 +3327,7 @@ class MemoryEyes:
         if not here:
             return False
         px, _, pz = here
+        self._refresh_loot()
         with self.lock:
             drops = list(self.loot.values())
         for x, _, z, name in drops:
@@ -3299,6 +3386,7 @@ class MemoryEyes:
             return None, None, None
         px, _, pz = here
         self.last_pos = (px, pz)
+        self._refresh_loot()
         with self.lock:
             drops = list(self.loot.items())
         ranked = sorted((((x - px) ** 2 + (z - pz) ** 2) ** 0.5,
@@ -3927,7 +4015,14 @@ class MemoryEyes:
         ax, az = px - tx, pz - tz
         length = math.hypot(ax, az)
         if length < 1e-9:
-            return None
+            # At exact overlap every direction creates space. Prefer backing
+            # out along the last approach, otherwise use a stable world axis.
+            approach = getattr(self, "approach", None)
+            ax, az = world_for(self.basis, *approach) if approach else (-1.0, 0.0)
+            ax, az = -ax, -az
+            length = math.hypot(ax, az)
+            if length < 1e-9:
+                ax, az, length = 1.0, 0.0, 1.0
         direct = stick_for(self.basis, ax, az)
         if not self.area:
             return direct
@@ -4136,6 +4231,11 @@ class MemoryEyes:
             self.hot_loot_at = None
             with self.lock:
                 self.loot = {}
+                self.loot_slots = ()
+                self.loot_slots_generation = self.generation
+                self.loot_cursor = 0
+                self.loot_refresh_at = 0.0
+                self.loot_read_at = {}
             self.loot_target = self.loot_since = None
             self.chasing = self.engaged_since = None
             self.chasing_id = None
@@ -4321,6 +4421,8 @@ class MemoryEyes:
             # pack behind one wall cycles through its members. Resetting on
             # every switch is what let the bot unwedge and chase the same wall
             # forever. It clears on its own once we are far from the wedge.
+            if self.chasing is not None:
+                self.spacing_state = None
             self.chasing, self.chasing_id, self.engaged_since = hit[0], hit_id, now
             report = getattr(self, "scan_summary", {})
             self.target_name = report.get("monster_names", {}).get(hit[0],
@@ -4353,8 +4455,6 @@ class MemoryEyes:
             # is what the distance says anyway.
             hp = self.ms.unit_health(self.mem, hit[0])
             print(f"\nfightlog {hit[0]:012X} dist {dist:5.2f} hp {hp}")
-        if dist > MEM_ARRIVE:
-            self._set_spacing_state("APPROACH", dist)
         boundary_standoff = False
         if (self.area is not None and self.area.inside(hit[1], hit[3])
                 and not self.area.safe(hit[1], hit[3])):
@@ -4368,16 +4468,25 @@ class MemoryEyes:
             boundary_standoff = (self.area.safe(px, pz)
                                   and math.hypot(px - fight_x, pz - fight_z)
                                   <= MEM_ARRIVE)
-        if dist <= MEM_ARRIVE or boundary_standoff:
-            # Arrived: hit-and-run owns only the left stick. Attack stays held by
-            # the independent combat path while we stop or back straight out.
+        previous = getattr(self, "spacing_state", None)
+        if dist < min_distance:
+            state = "RETREAT"
+        elif dist > max_distance:
+            state = "APPROACH"
+        elif previous == "RETREAT" and dist < resume_distance:
+            state = "RETREAT"
+        elif previous == "APPROACH" and dist > resume_distance:
+            state = "APPROACH"
+        else:
+            state = "ATTACK"
+        # Navigation's inset fighting point still wins over an impossible
+        # outward approach; changing combat range must not deadlock the fence.
+        if boundary_standoff and state == "APPROACH":
+            state = "ATTACK"
+        self._set_spacing_state(state, dist)
+        if state != "APPROACH":
+            # Spacing owns only movement. Both attack bindings remain held.
             self.mode = "on it"
-            retreating = getattr(self, "spacing_state", None) == "RETREAT"
-            if retreating:
-                state = "RETREAT" if dist < resume_distance else "ATTACK"
-            else:
-                state = "RETREAT" if dist < min_distance else "ATTACK"
-            self._set_spacing_state(state, dist)
             move = (self._attack_spacing(now, px, pz, hit[1], hit[3], dist)
                     if state == "ATTACK"
                     else self._retreat_spacing(px, pz, hit[1], hit[3], dist))

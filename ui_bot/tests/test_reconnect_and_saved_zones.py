@@ -199,9 +199,9 @@ class SavedZoneStartupTests(unittest.TestCase):
         self.assertFalse(window.pause_button.isEnabled())
         self.assertFalse(window.stop_button.isEnabled())
         self.assertIn("QPushButton#start:disabled", window.styleSheet())
-        dashboard = window.pages["Dashboard"]
-        self.assertFalse(dashboard.record_button.isEnabled())
-        self.assertFalse(dashboard.add_button.isEnabled())
+        recorder = window.pages["Farming Zone"]
+        self.assertFalse(recorder.record_button.isEnabled())
+        self.assertFalse(recorder.add_button.isEnabled())
         self.assertTrue(window.pages["Settings"].isEnabled())
 
     def test_saved_zone_selection_and_coordinates_survive_restart(self):
@@ -288,7 +288,7 @@ class SavedZoneStartupTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         window = MainWindow(root, runtime=RuntimePort())
         self.addCleanup(window.close)
-        page = window.pages["Dashboard"]
+        page = window.pages["Farming Zone"]
         window._recording = True
         window.draft.points = [(0.0, 0.0), (1.0, 0.0), (0.0, 0.0)]
         window._refresh_recorder_controls()

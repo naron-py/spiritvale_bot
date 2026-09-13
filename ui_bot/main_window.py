@@ -10,24 +10,22 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QCloseEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
-                               QMainWindow, QMessageBox, QPlainTextEdit,
-                               QPushButton, QSizePolicy, QStackedWidget,
-                               QVBoxLayout, QWidget)
+                               QMainWindow, QMessageBox, QPushButton, QSizePolicy,
+                               QStackedWidget, QVBoxLayout, QWidget)
 
 from .app_controller import AppController
 from .config import AtomicConfigStore, ConfigError, UiSettings
 from .model import (AutomationState, BotSnapshot, BotState, ConnectionState,
                     FailureCode, ZoneDisplayState, ZoneRecordingState,
                     ZoneSnapshot)
-from .pages import (CombatPage, DashboardPage, FarmingZonePage, SettingsPage,
-                    TargetingPage)
+from .pages import ActivityLogPage, DashboardPage, FarmingZonePage, SettingsPage
 from .readiness import evaluate_start_readiness, normalize_mode
 from .theme import STYLESHEET
 from .zone_editor import ZoneDraft, ZoneError, ZoneStore
 
 
 class MainWindow(QMainWindow):
-    PAGE_NAMES = ("Dashboard", "Targeting", "Farming Zone", "Combat", "Settings")
+    PAGE_NAMES = ("Overview", "Farming Zone", "Settings", "Activity Log")
 
     def __init__(self, project_root: str | Path, runtime,
                  demo_mode: bool = False, parent=None):
@@ -73,7 +71,7 @@ class MainWindow(QMainWindow):
         self._load_settings()
         self.apply_snapshot(self.latest_snapshot)
         self._attach_monitor()
-        self.show_page("Dashboard")
+        self.show_page("Overview")
         if self.config_store.last_warning:
             self.append_log("[Config] " + self.config_store.last_warning)
         if demo_mode:
@@ -104,12 +102,12 @@ class MainWindow(QMainWindow):
 
         topbar = QFrame()
         topbar.setObjectName("topbar")
-        topbar.setFixedHeight(48)
+        topbar.setFixedHeight(54)
         top = QHBoxLayout(topbar)
-        top.setContentsMargins(12, 5, 12, 5)
-        logo = QLabel("◎")
-        logo.setStyleSheet("font-size:27px;color:#16d9f4")
-        title = QLabel("FARM BOT")
+        top.setContentsMargins(18, 7, 18, 7)
+        logo = QLabel("SV")
+        logo.setStyleSheet("font-size:17px;font-weight:800;color:#61b5ff")
+        title = QLabel("SpiritVale Bot")
         title.setObjectName("title")
         self.connection_badge = QLabel("● GAME DISCONNECTED")
         self.connection_badge.setObjectName("pillGreen")
@@ -118,16 +116,14 @@ class MainWindow(QMainWindow):
         self.mode_badge = QLabel("MODE: WAITING")
         self.mode_badge.setObjectName("pillCyan")
         self.mode_reason = QLabel("Game is not connected.")
-        self.mode_reason.setObjectName("muted")
-        self.mode_reason.setFixedHeight(25)
-        self.mode_reason.setStyleSheet(
-            "padding:3px 12px;background:#071724;border-bottom:1px solid #17384d")
+        self.mode_reason.setObjectName("modeReason")
+        self.mode_reason.setFixedHeight(27)
         self.demo_badge = QLabel("")
         self.demo_badge.setObjectName("amber")
         self.demo_badge.hide()
         top.addWidget(logo)
         top.addWidget(title)
-        top.addSpacing(24)
+        top.addSpacing(18)
         top.addWidget(self.connection_badge)
         top.addWidget(self.memory_badge)
         top.addWidget(self.mode_badge)
@@ -151,21 +147,25 @@ class MainWindow(QMainWindow):
         middle.setSpacing(0)
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(150)
+        sidebar.setFixedWidth(190)
         nav = QVBoxLayout(sidebar)
-        nav.setContentsMargins(5, 9, 5, 9)
-        nav.setSpacing(3)
-        icons = ("⌂", "◎", "⬡", "⚔", "⚙")
+        nav.setContentsMargins(12, 18, 12, 16)
+        nav.setSpacing(6)
         self.nav_buttons = {}
-        for name, icon in zip(self.PAGE_NAMES, icons):
-            button = QPushButton(f"{icon}   {name}")
+        for name in self.PAGE_NAMES:
+            if name == "Activity Log":
+                status_caption = QLabel("STATUS")
+                status_caption.setObjectName("navSection")
+                nav.addSpacing(14)
+                nav.addWidget(status_caption)
+            button = QPushButton(name)
             button.setObjectName("nav")
             button.setCheckable(True)
             button.clicked.connect(lambda _checked=False, n=name: self.show_page(n))
             nav.addWidget(button)
             self.nav_buttons[name] = button
         nav.addStretch(1)
-        self.version_label = QLabel("UI v1.0\nRead-only memory adapter")
+        self.version_label = QLabel("Ctrl+Shift+F12 — E-stop\nRead-only memory adapter")
         self.version_label.setObjectName("muted")
         self.version_label.setAlignment(Qt.AlignCenter)
         nav.addWidget(self.version_label)
@@ -173,72 +173,35 @@ class MainWindow(QMainWindow):
 
         content = QWidget()
         content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(10, 8, 8, 8)
-        content_layout.setSpacing(7)
+        content_layout.setContentsMargins(22, 18, 22, 18)
+        content_layout.setSpacing(10)
         self.stack = QStackedWidget()
+        overview = DashboardPage()
+        activity = ActivityLogPage()
         self.pages = {
-            "Dashboard": DashboardPage(),
-            "Targeting": TargetingPage(),
+            "Overview": overview,
             "Farming Zone": FarmingZonePage(),
-            "Combat": CombatPage(),
             "Settings": SettingsPage(),
+            "Activity Log": activity,
+            "Dashboard": overview,
         }
-        for page in self.pages.values():
+        for name in self.PAGE_NAMES:
+            page = self.pages[name]
             self.stack.addWidget(page)
         content_layout.addWidget(self.stack, 1)
-
-        log_frame = QFrame()
-        log_frame.setObjectName("panel")
-        log_frame.setFixedHeight(118)
-        log_layout = QVBoxLayout(log_frame)
-        log_layout.setContentsMargins(9, 5, 9, 6)
-        log_title = QHBoxLayout()
-        caption = QLabel("ACTIVITY LOG")
-        caption.setObjectName("section")
-        self.rate_label = QLabel("UI 15 FPS    │    BOT 20 Hz")
-        self.rate_label.setObjectName("cyan")
-        log_title.addWidget(caption)
-        log_title.addStretch(1)
-        log_title.addWidget(self.rate_label)
-        log_layout.addLayout(log_title)
-        self.activity_log = QPlainTextEdit()
-        self.activity_log.setReadOnly(True)
-        self.activity_log.setMaximumBlockCount(1000)
-        self.activity_log.setFrameShape(QFrame.NoFrame)
-        log_layout.addWidget(self.activity_log)
-        content_layout.addWidget(log_frame)
+        self.activity_log = activity.editor
+        self.rate_label = activity.rate_label
         middle.addWidget(content, 1)
         outer.addLayout(middle, 1)
-
-        footer = QFrame()
-        footer.setObjectName("footer")
-        footer.setFixedHeight(56)
-        flow = QHBoxLayout(footer)
-        flow.setContentsMargins(55, 6, 55, 6)
-        steps = ("CONNECT GAME", "RECORD ZONE", "CONFIGURE", "START BOT", "MONITOR")
         self.step_labels = []
-        for index, text in enumerate(steps, 1):
-            badge = QLabel(str(index))
-            badge.setAlignment(Qt.AlignCenter)
-            badge.setFixedSize(24, 24)
-            badge.setStyleSheet("background:#123752;border:1px solid #38a9e6;border-radius:12px;color:white;font-weight:700")
-            label = QLabel(text)
-            label.setStyleSheet("font-weight:600;color:#bdcbd5")
-            flow.addWidget(badge)
-            flow.addWidget(label)
-            self.step_labels.append((badge, label))
-            if index != len(steps):
-                arrow = QLabel("⟶")
-                arrow.setAlignment(Qt.AlignCenter)
-                arrow.setStyleSheet("font-size:20px;color:#718594")
-                flow.addWidget(arrow, 1)
-        outer.addWidget(footer)
 
         self.start_button.clicked.connect(self.start_bot)
         self.pause_button.clicked.connect(self.pause_bot)
         self.stop_button.clicked.connect(self.stop_bot)
         self.emergency_button.clicked.connect(self._emergency_clicked)
         self.pages["Settings"].save_requested.connect(self.save_settings)
+        self.pages["Overview"].zone_requested.connect(
+            lambda: self.show_page("Farming Zone"))
         shortcut = QShortcut(QKeySequence("Ctrl+Shift+F12"), self)
         shortcut.activated.connect(lambda: self.emergency_stop("Emergency hotkey"))
         self.emergency_shortcut = shortcut
@@ -291,12 +254,12 @@ class MainWindow(QMainWindow):
             signals.exited.connect(self._runtime_exited)
 
     def _connect_zone_controls(self):
-        for page in (self.pages["Dashboard"], self.pages["Farming Zone"]):
-            page.record_requested.connect(self.start_recording)
-            page.add_position_requested.connect(self.add_position)
-            page.undo_requested.connect(self.undo_position)
-            page.save_requested.connect(self.finish_zone)
-            page.clear_requested.connect(self.clear_zone)
+        page = self.pages["Farming Zone"]
+        page.record_requested.connect(self.start_recording)
+        page.add_position_requested.connect(self.add_position)
+        page.undo_requested.connect(self.undo_position)
+        page.save_requested.connect(self.finish_zone)
+        page.clear_requested.connect(self.clear_zone)
 
     def _area_names(self):
         try:
@@ -341,8 +304,6 @@ class MainWindow(QMainWindow):
     def _load_settings(self):
         self.pages["Settings"].load_settings(self.settings_value,
                                               self._area_names())
-        self.pages["Dashboard"].zone_name.setText(
-            self.settings_value.selected_area)
         self.pages["Farming Zone"].zone_name.setText(
             self.settings_value.selected_area)
         self.pages["Dashboard"].world_view.set_follow_player(
@@ -351,12 +312,14 @@ class MainWindow(QMainWindow):
             self.settings_value.follow_player)
 
     def show_page(self, name):
+        if name == "Dashboard":
+            name = "Overview"
         page = self.pages[name]
         self.stack.setCurrentWidget(page)
         for key, button in self.nav_buttons.items():
             button.setChecked(key == name)
         page.apply_snapshot(self.latest_snapshot)
-        if name in ("Dashboard", "Farming Zone"):
+        if name in ("Overview", "Farming Zone"):
             page.set_draft(self.draft.points, self._recording)
 
     def start_bot(self):
@@ -481,7 +444,7 @@ class MainWindow(QMainWindow):
         current = self.stack.currentWidget()
         if current is not None:
             current.apply_snapshot(snapshot)
-            if current in (self.pages["Dashboard"], self.pages["Farming Zone"]):
+            if current in (self.pages["Overview"], self.pages["Farming Zone"]):
                 current.set_draft(self.draft.points, self._recording)
         for line in snapshot.logs:
             self.append_log(line)
@@ -640,10 +603,7 @@ class MainWindow(QMainWindow):
         self._refresh_controls()
 
     def _zone_name(self):
-        active = self.stack.currentWidget()
-        if active is self.pages["Farming Zone"]:
-            return active.zone_name.text().strip()
-        return self.pages["Dashboard"].zone_name.text().strip()
+        return self.pages["Farming Zone"].zone_name.text().strip()
 
     def start_recording(self):
         if not self._player_position_available():
@@ -745,7 +705,7 @@ class MainWindow(QMainWindow):
         self._refresh_draft()
 
     def _refresh_draft(self):
-        for page in (self.pages["Dashboard"], self.pages["Farming Zone"]):
+        for page in (self.pages["Overview"], self.pages["Farming Zone"]):
             page.set_draft(self.draft.points, self._recording)
         self._refresh_recorder_controls()
 
@@ -765,9 +725,8 @@ class MainWindow(QMainWindow):
         message = "" if available else self.recorder_message
         has_points = bool(self.draft.points)
         finish_ready = len(set(self.draft.points)) >= 3
-        for page in (self.pages["Dashboard"], self.pages["Farming Zone"]):
-            page.set_recording_availability(
-                available, self._recording, has_points, finish_ready, message)
+        self.pages["Farming Zone"].set_recording_availability(
+            available, self._recording, has_points, finish_ready, message)
 
     def closeEvent(self, event: QCloseEvent):
         if self._closing:

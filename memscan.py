@@ -1602,7 +1602,58 @@ def loot_name(mem, drop):
     return name, cs_string(mem, read_ptr(mem, sync + LOOT_KEY) or 0) or ""
 
 
-def world_loot(mem, cls=None, regions=None):
+def loot_slot(mem, drop, cls, go_cls=None):
+    """Fresh (x, y, z, name), () for empty, None for an unverified read.
+
+    Only the wrapper/class are cached. Sync payloads and transform chains can
+    change when Unity reuses a slot, so walk them again and close the identity
+    witness before publishing. Unknown must not retire a spawn's give-up state.
+    """
+    def exact(address, size):
+        blob = mem.read(address, size)
+        if blob is None or len(blob) != size:
+            raise ValueError("short loot read")
+        return blob
+
+    try:
+        if struct.unpack("<Q", exact(drop, 8))[0] != cls:
+            return None
+        # Adjacent fields: one bounded read instead of two pointer syscalls.
+        header = exact(drop + LOOT_SYNC, 16)
+        sync, go = struct.unpack("<QQ", header)
+        if not sync or not go:
+            return None
+        actual_go_cls = struct.unpack("<Q", exact(go, 8))[0]
+        if (actual_go_cls != go_cls if go_cls is not None
+                else class_name(mem, actual_go_cls) != "GameObject"):
+            return None
+        name_bytes = exact(sync + LOOT_NAME, 8)
+        name_ptr = struct.unpack("<Q", name_bytes)[0]
+        length = struct.unpack("<i", exact(name_ptr + 0x10, 4))[0] if name_ptr else 0
+        if length:
+            if not 1 < length < 48:
+                return None
+            name = exact(name_ptr + 0x14, length * 2).decode("utf-16-le", "replace")
+            if not name.isprintable():
+                return None
+            pos = loot_pos(mem, drop)
+            if pos is None or cs_string(mem, name_ptr) != name:
+                return None
+            row = (*pos, name)
+        else:
+            row = ()
+            if name_ptr and exact(name_ptr + 0x10, 4) != b"\0\0\0\0":
+                return None
+        if (exact(drop, 8) != struct.pack("<Q", cls)
+                or exact(drop + LOOT_SYNC, 16) != header
+                or exact(sync + LOOT_NAME, 8) != name_bytes):
+            return None
+        return row
+    except (OSError, ValueError, struct.error):
+        return None
+
+
+def world_loot(mem, cls=None, regions=None, slots=None):
     """[(drop, x, y, z, name)] for every item lying on the ground.
 
     instances_of() also returns slots in IL2CPP's own class table, which have no
@@ -1616,8 +1667,13 @@ def world_loot(mem, cls=None, regions=None):
     out = []
     for a in instances_of(mem, cls, limit=8000, regions=regions):
         go = read_ptr(mem, a + LOOT_GO)
-        if not go or class_name(mem, read_ptr(mem, go) or 0) != "GameObject":
+        go_cls = read_ptr(mem, go) if go else 0
+        if not go_cls or class_name(mem, go_cls) != "GameObject":
             continue
+        # Retain validated empty pool slots for cheap activation checks. They
+        # are candidates, never ground loot until the synced name is populated.
+        if slots is not None:
+            slots[a] = (cls, go_cls)
         named = loot_name(mem, a)
         t = loot_pos(mem, a) if named else None
         if t:

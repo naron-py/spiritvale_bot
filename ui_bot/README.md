@@ -75,13 +75,14 @@ normal monitor exit returns to discovery. Non-zero and crash exits latch SAFE_ST
 
 ## Pages
 
-- **Dashboard:** status cards, live world view, target/zone panel, activity log.
-- **Targeting:** source, scan state, classification, and selection explanation.
-- **Farming Zone:** live polygon recorder using fresh cached player positions,
+- **Overview:** read-only status cards, live world view, and one combined run summary
+  for targeting, combat, zone, and navigation.
+- **Farming Zone:** the only zone-editing screen; its polygon recorder uses fresh
+  cached player positions,
   including before Start and while automation is stopped or paused.
-- **Combat:** neutral/held input monitor and cleanup contract.
 - **Settings:** target mode, area, reconnect, world limits, rotating logs, and a
   table proving every enumerated failure has a safe state.
+- **Activity Log:** the bounded runtime log and UI/bot update-rate status.
 
 ## Generated state
 

@@ -50,13 +50,13 @@
     },
     {
       "path": "memscan.py",
-      "size": 98967,
-      "sha256": "893a057426afa52bbf9b8705e9ec40eb9cb2377c59e29f39d51bc4fad0a5f0fa"
+      "size": 101374,
+      "sha256": "5eb3bce2b8e23ea5983504e6db8364b659087182ed7ef41213050793f8c944c5"
     },
     {
       "path": "minimap_bot.py",
-      "size": 367800,
-      "sha256": "f36cd1068a9c72a712df55f3fce11728d1c514cb1197a84ea464e91b6e2533e2"
+      "size": 373365,
+      "sha256": "afbef5e05fa7ee6c0909ae44e3e7ac3ededc763cd2555773e7ef60689f04bd88"
     },
     {
       "path": "minimap_navigator.py",
@@ -115,8 +115,8 @@
     },
     {
       "path": "tests/test_state_conflicts.py",
-      "size": 30837,
-      "sha256": "c3cf2812110182c7ff13b9b75a67644d5733b6ff7b1c3822468292430ec86b63"
+      "size": 30849,
+      "sha256": "18cb89bcaf9980c4fa2baba3b8fee22fd6695f7fa8f96c1e8ccc065969997f4f"
     },
     {
       "path": "tests/test_zone_recorder.py",
