@@ -627,6 +627,12 @@ class SettingsPage(SnapshotPage):
         self._load_controller_rows(default_buff_slots(), default_attack_slots())
         self.validation.clear()
 
+    def set_save_status(self, message, error=False):
+        self.validation.setObjectName("red" if error else "green")
+        self.validation.setText(message)
+        self.validation.style().unpolish(self.validation)
+        self.validation.style().polish(self.validation)
+
     def update_preview(self, *_args):
         active = [BUTTON_LABELS[row.button.currentData()]
                   for row in self.buff_rows if row.enabled.isChecked()]
@@ -679,7 +685,7 @@ class SettingsPage(SnapshotPage):
                 combat_max_distance=self.combat_max_distance.value(),
                 buff_slots=buffs, attack_slots=attacks).validated()
         except Exception as exc:
-            self.validation.setText(str(exc))
+            self.set_save_status(str(exc), error=True)
             raise
         self.validation.clear()
         return settings

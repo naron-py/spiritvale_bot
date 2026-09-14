@@ -579,8 +579,9 @@ class MainWindow(QMainWindow):
         self.logger.info(message)
 
     def save_settings(self):
+        page = self.pages["Settings"]
         try:
-            settings = self.pages["Settings"].settings(self.demo_mode)
+            settings = page.settings(self.demo_mode)
         except ConfigError as exc:
             self.append_log(f"[Config] Save rejected: {exc}")
             self._refresh_controls()
@@ -594,11 +595,13 @@ class MainWindow(QMainWindow):
                 settings.selected_area)
             self.zone_load_error = ""
             self.append_log("[Config] UI settings saved atomically.")
+            page.set_save_status("Settings saved.")
             self.pages["Dashboard"].world_view.set_follow_player(
                 settings.follow_player)
             self.pages["Dashboard"].follow_button.setChecked(
                 settings.follow_player)
         except (ConfigError, ZoneError) as exc:
+            page.set_save_status(f"Save failed: {exc}", error=True)
             self.controller.fail(FailureCode.CONFIG_READ_ONLY, exc)
         self._refresh_controls()
 

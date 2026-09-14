@@ -8,7 +8,7 @@ import unittest
 
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QPushButton
 
 from ui_bot.config import ConfigError
 from ui_bot.main_window import MainWindow
@@ -285,6 +285,20 @@ class MainWindowTests(unittest.TestCase):
         self.assertTrue(runtime.running)
         self.assertFalse(runtime.control_config["buff_slots"][2]["enabled"])
         window.emergency_stop("test complete")
+        window.close()
+
+    def test_save_button_confirms_settings_were_persisted_on_settings_page(self):
+        window, _ = self.make_window()
+        window.show_page("Settings")
+        window.show()
+        page = window.pages["Settings"]
+        page.trail.setValue(321)
+
+        QTest.mouseClick(page.findChild(QPushButton, "save"), Qt.LeftButton)
+
+        self.assertEqual(window.config_store.load().trail_length, 321)
+        self.assertEqual(page.validation.text(), "Settings saved.")
+        self.assertEqual(page.validation.objectName(), "green")
         window.close()
 
     def test_invalid_save_keeps_last_file_and_does_not_emergency_stop(self):
